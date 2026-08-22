@@ -24,6 +24,7 @@ import (
 	"github.com/magnomp/balancedb/internal/lease"
 	"github.com/magnomp/balancedb/internal/migrate"
 	"github.com/magnomp/balancedb/internal/notify"
+	"github.com/magnomp/balancedb/internal/obs"
 	"github.com/magnomp/balancedb/internal/processor"
 )
 
@@ -89,20 +90,39 @@ func run() error {
 		return nil
 	}
 
-	pool, err := db.Connect(ctx, cfg.DatabaseURL, cfg.Schema, cfg.PoolMaxConns)
+	// The slow-query tracer is attached to every pooled connection (plan §M9). It is
+	// created before Connect (the tracer must exist when connections are built) and
+	// its metrics sink is set once the registry exists — IncSlowQuery is nil-safe, so
+	// the boot ping traced before then simply counts nothing.
+	tracer := obs.NewSlowQueryTracer(logger, nil)
+	pool, err := db.Connect(ctx, cfg.DatabaseURL, cfg.Schema, cfg.PoolMaxConns, db.WithTracer(tracer))
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
 	logger.Info("database connected", "schema", cfg.Schema)
 
+	// One metric registry per process (spec §13); the pgxpool collector reads the
+	// live pool on each scrape (plan §M9).
+	metrics := obs.NewMetrics(pool)
+	tracer.Metrics = metrics
+
 	if role == config.RoleProcessor {
 		l, err := lease.New(pool)
 		if err != nil {
 			return fmt.Errorf("processor: init lease: %w", err)
 		}
+		proc := processor.New(pool, l, logger)
+		proc.SetMetrics(metrics)
+
+		// /readyz includes lease state as information only — a standby is still ready
+		// (plan §M9). proc.IsLeader is the goroutine-safe view.
+		serveMetrics(ctx, logger, cfg.MetricsAddr, obs.HealthConfig{
+			Registry: metrics.Registry(), DB: pool, Role: string(role), Leader: proc.IsLeader,
+		})
+
 		logger.Info("running processor loop", "owner", l.Owner())
-		if err := processor.New(pool, l, logger).Run(ctx); err != nil {
+		if err := proc.Run(ctx); err != nil {
 			return fmt.Errorf("processor: %w", err)
 		}
 		logger.Info("shutting down", "role", string(role))
@@ -110,11 +130,40 @@ func run() error {
 	}
 
 	// api role: serve the Huma-backed HTTP API (spec §10, ADR-0003).
-	return runAPI(ctx, logger, cfg, pool)
+	return runAPI(ctx, logger, cfg, pool, metrics)
+}
+
+// serveMetrics starts the operational HTTP surface (/metrics, /healthz, /readyz)
+// on BALANCEDB_METRICS_ADDR (plan §0, both roles) and shuts it down when ctx is
+// cancelled. It is best-effort: a bind failure is logged, never fatal, so a metrics
+// port clash never takes down the ledger.
+func serveMetrics(ctx context.Context, logger *slog.Logger, addr string, hc obs.HealthConfig) {
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           obs.WithRecovery(logger, obs.NewHealthHandler(hc)),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+	go func() {
+		logger.Info("metrics server listening", "addr", addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("metrics server", "err", err)
+		}
+	}()
 }
 
 // runAPI serves the HTTP API and shuts it down gracefully when ctx is cancelled.
-func runAPI(ctx context.Context, logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) error {
+func runAPI(ctx context.Context, logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool, metrics *obs.Metrics) error {
+	// The operational surface (/metrics, /healthz, /readyz) on its own port (plan §0).
+	serveMetrics(ctx, logger, cfg.MetricsAddr, obs.HealthConfig{
+		Registry: metrics.Registry(), DB: pool, Role: string(config.RoleAPI),
+	})
+
 	// One dedicated LISTEN outcomes connection per API process (ADR-0002); it feeds
 	// the synchronous wait path (wait_ms > 0). Run in its own goroutine so it
 	// reconnects independently of request handling; it stops when ctx is cancelled.
@@ -125,9 +174,15 @@ func runAPI(ctx context.Context, logger *slog.Logger, cfg config.Config, pool *p
 		}
 	}()
 
+	apiServer := api.NewServer(pool, nil, notifier)
+	apiServer.SetWaitObserver(metrics)
+
+	// Panic-recovery + request logging wrap the whole API handler (plan §M9).
+	handler := obs.WithRecovery(logger, obs.WithRequestLog(logger, apiServer.Handler()))
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           api.NewServer(pool, nil, notifier).Handler(),
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

@@ -7,7 +7,7 @@ GOFUMPT ?= gofumpt
 # Package list, computed once.
 PKGS := ./...
 
-.PHONY: all lint test itest simtest tools fmt check-docs openapi openapi-gen
+.PHONY: all lint test itest simtest tools fmt check-docs openapi openapi-gen loadgen
 
 all: lint test
 
@@ -96,6 +96,12 @@ openapi: openapi-gen
 	else \
 		echo "openapi: oasdiff not installed — skipping breaking-change check (runs in CI)."; \
 	fi
+
+## loadgen: run the local load generator against a running api node (plan §M9),
+## to watch loop utilization rho, queue depth, and batching on :9090/metrics.
+## Pass flags via ARGS, e.g. make loadgen ARGS="-rate 200 -duration 1m".
+loadgen:
+	$(GO) run ./cmd/loadgen $(ARGS)
 
 ## tools: install pinned dev tooling into GOBIN.
 tools:

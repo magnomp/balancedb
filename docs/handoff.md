@@ -578,3 +578,97 @@ Notes for next agents (M9 observability):
   the natural place to time register→resolve, and `notify.Run` for reconnect counts.
 - The wait path reads `api_max_wait_ms` once per waiting request (`selectAPIMaxWait`);
   if M9 adds a cached/observed config read, route it through there too.
+
+## M9 — 2026-08-22
+
+Built:
+- `internal/obs` (now **built**): the cell's observability surface (spec §13).
+  - `metrics.go` — `Metrics` on a private `prometheus.Registry` (Go runtime +
+    process collectors included). All record methods are **nil-safe**, so a
+    component with metrics unwired (tests, the spec exporter) runs unchanged. Metric
+    set: `queue_depth`, `oldest_pending_age_seconds`, `loop_busy_seconds_total` +
+    `loop_wall_seconds_total` (ρ = rate/rate), `snapshot_rows_touched` (histogram),
+    `leadership_changes_total`, `leader`, `decisions_total{kind,outcome}`,
+    `doorbell_wakeup_lag_seconds`, `api_wait_seconds{source,result}`,
+    `slow_queries_total`.
+  - `pool.go` — a custom `prometheus.Collector` reading `pool.Stat()` live on each
+    scrape (`balancedb_pool_*`), so pgxpool stats never go stale and need no sampler.
+  - `http.go` — `NewHealthHandler` (`/metrics`, `/healthz`, `/readyz`) + `WithRecovery`
+    and `WithRequestLog` net/http middleware. `/readyz` pings the DB (2 s timeout →
+    503 on failure); for the processor it reports `leader` as info only — a standby is
+    ready (plan §M9).
+  - `tracer.go` — `SlowQueryTracer` (a `pgx.QueryTracer`) logs + counts any query over
+    `DefaultSlowQueryThreshold` (200 ms). Carries the SQL text through the trace ctx,
+    never the arg values.
+- Instrumentation wired into existing packages (metrics are pure observation; **no
+  guard, ordering, validation, or decision logic changed**):
+  - `internal/processor` — `SetMetrics(*obs.Metrics)` setter (kept New unchanged to
+    avoid test churn). Loop samples `queue_depth`/`oldest_pending_age` each cycle
+    (`selectQueueStats`, both age endpoints on the DB clock); counts leadership
+    transitions; measures loop busy/wall for ρ. `fetchPendingWork` now also selects
+    `registered_at, now()` and observes doorbell wakeup lag per op (both ends DB
+    clock). Decision + snapshot-rows metrics buffer in a per-batch `batchAccum` and
+    flush **only on a committed batch** (`withBatchTx`), so a guard-miss rollback
+    counts nothing. `IsLeader()` exposes leadership via an `atomic.Bool` for the
+    cross-goroutine `/readyz` handler (the lease itself stays single-threaded).
+  - `internal/snapshot` — `Apply` now returns `(rowsTouched int64, err error)` = 1 +
+    cascade rowcount, feeding `snapshot_rows_touched`. All call sites updated.
+  - `internal/api` — `WaitObserver` interface + `SetWaitObserver` (mirrors the M8
+    `outcomeWaiter` decoupling; api does not hard-depend on obs for the field). The
+    wait path times register→return and labels the resolution `source`
+    (immediate|notify|poll|timeout) and `result`.
+  - `internal/db` — `Connect` gained variadic `Option`s (`WithTracer`); existing
+    callers unchanged.
+  - `cmd/balancedb` — both roles start the metrics/health server on
+    `BALANCEDB_METRICS_ADDR` via `serveMetrics` (best-effort: a bind clash is logged,
+    never fatal). The API handler is wrapped in recovery + request logging. The
+    slow-query tracer is attached to the pool and its metrics sink set after the
+    registry exists.
+- `cmd/loadgen` + `make loadgen` — a small load generator (configurable rate,
+  accounts, group size, concurrency) that POSTs inserts with a per-request UUID
+  `Idempotency-Key`. Developer tool only.
+- `README.md` — new; documents every metric with its §13 / ADR-0002 rationale, the
+  health endpoints, middleware, clock discipline, and `make loadgen`.
+
+Decisions:
+- **No ADR for Prometheus.** `prometheus/client_golang` is pre-sanctioned by plan §0
+  ("`prometheus/client_golang` for metrics (§13)"), so it needed no ADR. `go mod tidy`
+  pulled its transitive deps; it is now a direct require.
+- **NOTIFY→outcome lag interpreted as synchronous-wait latency** (`api_wait_seconds`)
+  with a `source` label separating the ADR-0002 notify fast path from the poll
+  fallback. A stricter "decision-commit → delivery" measurement was rejected: only
+  CONFIRMED singles and decided groups carry a decision timestamp (INVALID singles
+  have none), so a DB-clock decision→delivery lag can't be measured uniformly across
+  outcomes. The register→return latency, labeled by source, is the honest,
+  cheap "API wait health" signal §13 asks for.
+- **Slow-query threshold is a fixed 200 ms constant, not an env/config knob.** It is a
+  diagnostic aid, not a behavioral surface; adding a `BALANCEDB_*` var was out of M9
+  scope. `SlowQueryTracer.Threshold` is settable in code if a future milestone wants it.
+- **Metrics via setters (`SetMetrics`, `SetWaitObserver`), not constructor params.**
+  Minimizes churn to M5–M8 tests and keeps a metric-less run/test a first-class path
+  (nil = no-op). Wiring lives in `cmd/balancedb`.
+
+Deferred/known issues:
+- Both roles default `BALANCEDB_METRICS_ADDR` to `:9090`; running an api and a
+  processor on the same host needs one overridden (`serveMetrics` logs the bind
+  failure and continues, so the ledger still runs). In the smoke test I used `:9091`
+  for the processor. Compose/devcontainer (M12) should set distinct ports.
+- Raw `DB row-writes/s` / WAL / fsync (§13) are Postgres-server metrics, left to a
+  Postgres exporter (documented in the README), not emitted by the app — matches the
+  plan §M9 scope (app metrics + pgxpool stats).
+- No simulation-model change: M9 adds only observation, so the decision engine the
+  reference model mirrors is byte-identical. `make simtest` stays green.
+
+Notes for next agents:
+- CLAUDE.md package map: `obs` → **built**.
+- Every processing path already flows through `withBatchTx`; if you add a new decision
+  outcome, record it via `p.recordDecision(...)` inside the tx so it flushes on commit
+  (never `p.metrics.RecordDecision` directly from a tx body — that would count a
+  rolled-back batch).
+- Verified end-to-end (plan §M9 "Done when"): api + processor booted, `make loadgen`
+  drove 1,200 singles + 320 groups, and `:9090`/`:9091` `/metrics` showed
+  `decisions_total`, `doorbell_wakeup_lag_seconds` (2,156 ops = 1,199 singles +
+  319×3 legs), `snapshot_rows_touched`, ρ counters, pool stats, and a notify-sourced
+  `api_wait_seconds` (~8 ms) from a synchronous insert. `/readyz` reported the
+  processor's leader state.
+- Gates green: `make lint`, `make test`, `make itest`, and `make simtest` (~24 s).

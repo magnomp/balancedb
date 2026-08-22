@@ -7,8 +7,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/magnomp/balancedb/internal/db"
 	"github.com/magnomp/balancedb/internal/model"
+	"github.com/magnomp/balancedb/internal/obs"
 	"github.com/magnomp/balancedb/internal/snapshot"
 )
 
@@ -49,7 +49,7 @@ const (
 // the batching path (spec §8.5) calls processSingleTx directly inside a shared
 // batch transaction. Both wrap the same guarded body.
 func (p *Processor) processSingle(ctx context.Context, op pendingOp) error {
-	return db.WithTx(ctx, p.pool, func(tx pgx.Tx) error {
+	return p.withBatchTx(ctx, func(tx pgx.Tx) error {
 		return p.processSingleTx(ctx, tx, op)
 	})
 }
@@ -119,9 +119,12 @@ func (p *Processor) accept(ctx context.Context, tx pgx.Tx, op pendingOp, version
 	}
 
 	// Snapshots (spec §8.4), in the same commit as the balance change.
-	if err := snapshot.Apply(ctx, tx, op.AccountID, op.EffectiveAt, op.Amount); err != nil {
+	rows, err := snapshot.Apply(ctx, tx, op.AccountID, op.EffectiveAt, op.Amount)
+	if err != nil {
 		return err
 	}
+	p.recordSnapshotRows(rows)
+	p.recordDecision(obs.KindSingle, obs.OutcomeConfirmed)
 
 	return notifyOp(ctx, tx, op.ID)
 }
@@ -147,6 +150,7 @@ func (p *Processor) reject(ctx context.Context, tx pgx.Tx, op pendingOp, externa
 	if tag.RowsAffected() != 1 {
 		return errGuardMiss
 	}
+	p.recordDecision(obs.KindSingle, obs.OutcomeInvalid)
 
 	return notifyOp(ctx, tx, op.ID)
 }

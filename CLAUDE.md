@@ -90,7 +90,7 @@ Packages marked *(Mn)* are not built yet — the map is the stable target.
 - `snapshot` — snapshot upsert + cascade update (spec §8.4). **built**
 - `api` — insertion core (`Insert` over a `pgx.Tx`, spec §10.1) + Huma/chi HTTP handlers for every §10 endpoint (ADR-0003), incl. synchronous waiting (spec §10.1, ADR-0002). **built**
 - `notify` — LISTEN/NOTIFY: work doorbell (api/processor) + outcome fan-out (spec §11, ADR-0002). **built**
-- `obs` — metrics registry, health endpoints (spec §13). *(M9)*
+- `obs` — metrics registry, health endpoints, HTTP middleware, slow-query tracer (spec §13). **built**
 
 ---
 

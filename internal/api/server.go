@@ -21,6 +21,15 @@ type outcomeWaiter interface {
 	Register(key string) (<-chan struct{}, func())
 }
 
+// WaitObserver records synchronous-wait latency for the §13 "NOTIFY→outcome lag"
+// metric (API wait health, ADR-0002). source is how the wait resolved
+// (obs.WaitSource*) and result is decided|pending (obs.WaitResult*). Kept an
+// interface so the api package does not depend on internal/obs; *obs.Metrics
+// satisfies it. A nil observer disables the measurement.
+type WaitObserver interface {
+	ObserveWait(seconds float64, source, result string)
+}
+
 // apiTitle/apiVersion identify the generated contract. apiVersion is deliberately
 // held stable and hand-bumped: it appears in api/openapi.yaml, so letting it drift
 // automatically would make the committed spec churn on every build (ADR-0003).
@@ -41,6 +50,7 @@ type Server struct {
 	pool     *pgxpool.Pool
 	resolver OwnerResolver
 	notifier outcomeWaiter
+	waitObs  WaitObserver
 	api      huma.API
 	mux      *chi.Mux
 
@@ -80,6 +90,12 @@ func NewServer(pool *pgxpool.Pool, resolver OwnerResolver, notifier outcomeWaite
 	s.register()
 	return s
 }
+
+// SetWaitObserver wires the synchronous-wait latency metric (spec §13, ADR-0002).
+// Call it before serving; nil (the default) leaves the wait path unmeasured. Kept
+// a setter rather than a constructor parameter so existing NewServer callers and
+// tests are unaffected.
+func (s *Server) SetWaitObserver(o WaitObserver) { s.waitObs = o }
 
 // Handler returns the http.Handler serving the API, /docs, and /openapi.*.
 func (s *Server) Handler() http.Handler { return s.mux }

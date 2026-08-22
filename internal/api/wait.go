@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/magnomp/balancedb/internal/model"
+	"github.com/magnomp/balancedb/internal/obs"
 )
 
 // defaultPollInterval is the status-poll cadence of the synchronous wait path — the
@@ -36,6 +37,9 @@ WHERE o.id = $1 AND a.owner_id = $2`
 // notification, a status-poll ticker (durability fallback), and the wait deadline.
 // The decision → 200; expiry (capped by api_max_wait_ms) → 202 with current state.
 func (s *Server) waitForOutcome(ctx context.Context, ownerID int64, res *InsertResult, waitMs int) (*CreateTransactionOutput, error) {
+	// Time the whole wait (register to return); the source label separates the
+	// ADR-0002 NOTIFY fast path from the durability poll fallback (§13 wait health).
+	waitStart := time.Now()
 	// One key and one loader per unit: a group waits on 'tx:<id>' and reads the
 	// transaction row; a single waits on 'op:<id>' and reads the operation row. Both
 	// notification keys match exactly what the processor emits inside its commit.
@@ -80,6 +84,7 @@ func (s *Server) waitForOutcome(ctx context.Context, ownerID int64, res *InsertR
 	}
 	if terminal {
 		out.Status = http.StatusOK
+		s.observeWait(waitStart, obs.WaitSourceImmediate, obs.WaitResultDecided)
 		return out, nil
 	}
 
@@ -104,6 +109,7 @@ func (s *Server) waitForOutcome(ctx context.Context, ownerID int64, res *InsertR
 				return nil, huma.Error500InternalServerError("read outcome", err)
 			}
 			out.Status = http.StatusAccepted
+			s.observeWait(waitStart, obs.WaitSourceTimeout, obs.WaitResultPending)
 			return out, nil
 		case <-signal:
 			out, terminal, err := load(ctx)
@@ -112,6 +118,7 @@ func (s *Server) waitForOutcome(ctx context.Context, ownerID int64, res *InsertR
 			}
 			if terminal {
 				out.Status = http.StatusOK
+				s.observeWait(waitStart, obs.WaitSourceNotify, obs.WaitResultDecided)
 				return out, nil
 			}
 		case <-ticker.C:
@@ -121,9 +128,18 @@ func (s *Server) waitForOutcome(ctx context.Context, ownerID int64, res *InsertR
 			}
 			if terminal {
 				out.Status = http.StatusOK
+				s.observeWait(waitStart, obs.WaitSourcePoll, obs.WaitResultDecided)
 				return out, nil
 			}
 		}
+	}
+}
+
+// observeWait records one synchronous-wait latency into the wait-health metric,
+// if an observer is wired (§13, ADR-0002). No-op when unmeasured.
+func (s *Server) observeWait(start time.Time, source, result string) {
+	if s.waitObs != nil {
+		s.waitObs.ObserveWait(time.Since(start).Seconds(), source, result)
 	}
 }
 

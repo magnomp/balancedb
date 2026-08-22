@@ -9,8 +9,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/magnomp/balancedb/internal/db"
 	"github.com/magnomp/balancedb/internal/model"
+	"github.com/magnomp/balancedb/internal/obs"
 	"github.com/magnomp/balancedb/internal/snapshot"
 )
 
@@ -70,7 +70,7 @@ type groupAccount struct {
 // entry point used outside batching (and by the internal tests); the batching path
 // (spec §8.5) calls processGroupTx directly inside a shared batch transaction.
 func (p *Processor) processGroup(ctx context.Context, txID int64) error {
-	return db.WithTx(ctx, p.pool, func(tx pgx.Tx) error {
+	return p.withBatchTx(ctx, func(tx pgx.Tx) error {
 		return p.processGroupTx(ctx, tx, txID)
 	})
 }
@@ -242,10 +242,13 @@ func (p *Processor) commitGroup(ctx context.Context, tx pgx.Tx, txID int64, legs
 	// Snapshots (spec §8.4): one per leg, with the leg's own amount and day, so the
 	// snapshot deltas on an account sum to the net applied above.
 	for _, l := range legs {
-		if err := snapshot.Apply(ctx, tx, l.AccountID, l.EffectiveAt, l.Amount); err != nil {
+		rows, err := snapshot.Apply(ctx, tx, l.AccountID, l.EffectiveAt, l.Amount)
+		if err != nil {
 			return err
 		}
+		p.recordSnapshotRows(rows)
 	}
+	p.recordDecision(obs.KindGroup, obs.OutcomeCommitted)
 
 	return notifyTx(ctx, tx, txID)
 }
@@ -282,6 +285,7 @@ func (p *Processor) rejectGroup(ctx context.Context, tx pgx.Tx, txID int64, nLeg
 	if tag.RowsAffected() != 1 {
 		return errGuardMiss
 	}
+	p.recordDecision(obs.KindGroup, obs.OutcomeRejected)
 
 	return notifyTx(ctx, tx, txID)
 }
