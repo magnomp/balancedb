@@ -1,7 +1,3 @@
-// Package config parses and validates BalanceDB's deployment configuration
-// from BALANCEDB_* environment variables (plan §0). Behavioral knobs live in
-// the DB config table, not here. The process refuses to start on any invalid
-// value.
 package config
 
 import (
