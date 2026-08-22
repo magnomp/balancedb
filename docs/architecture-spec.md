@@ -1,0 +1,507 @@
+# BalanceDB — Architecture Specification
+
+**Final revision — 2026-08-19**
+
+---
+
+## 1. Purpose
+
+BalanceDB is a balance-maintenance engine. Its single job is to keep account balances correctly computed over time, given an immutable stream of operations — including **backdated** and future-dated operations, its distinguishing requirement. Target uses: ledgers, banking systems, budgeting/financial assistants (including envelope systems), ERP inventory.
+
+It is **asynchronous and eventually consistent**: insertion is decoupled from processing; an operation is typically decided within about one polling cycle (~1 s by default).
+
+Out of scope: scheduling, currency conversion, authentication.
+
+## 2. Architecture Overview
+
+The deployment unit is a **cell**. A cell serves a disjoint set of owners (users/tenants) and is fully independent of every other cell.
+
+```
+
+                        ┌─ directory: owner → cell ─┐
+
+ clients ──► API nodes ─┤                           │
+
+             (N, stateless)                         ▼
+
+                        ┌───────────── cell ─────────────┐
+
+                        │  PostgreSQL  ◄── Processor      │
+
+                        │  (sole store &   (1 active +    │
+
+                        │   coordinator)    standby)      │
+
+                        └────────────────────────────────┘
+
+                          ... more cells, added linearly ...
+
+```
+
+- **API nodes** — any number, stateless. Insert operations, answer queries, wait on outcomes. Route each request to the owner's cell via the directory.
+
+- **Processor** — exactly one active per cell (leader lease, §7), plus standby instances for failover. Processes pending work sequentially in registration order.
+
+- **PostgreSQL** — one per cell; the sole authoritative store *and* the coordination medium. The per-cell throughput ceiling.
+
+- **Directory** — a small `owner → cell` mapping (a table; cacheable). Using an explicit directory (not hashing) makes moving an owner between cells an ordinary per-owner data migration plus a directory update.
+
+**The sharding invariant (load-bearing):** *all operations of a group belong to accounts of one owner.* Enforced at the API. Because no group ever crosses a cell, cells share nothing — no distributed transactions, no cross-cell reads — and system capacity scales linearly by adding cells. Any future feature that would atomically span two owners (e.g., user-to-user transfers) violates this invariant and requires a deliberate design decision (application-level sagas, or a cross-cell commit protocol); it must not be improvised.
+
+## 3. Design Principles
+
+1. **The database is the serialization point.** All authoritative state and all coordination (leader lease, outcomes) live in the cell's ACID database. Processes around it are stateless and disposable.
+
+2. **Single writer per cell.** One processor performs all balance writes, making all cross-account logic — including atomic groups — plain sequential arithmetic inside ordinary DB transactions.
+
+3. **Correctness never depends on coordination.** The leader lease makes double-processing *rare*; conditional (optimistic) writes make it *harmless*. Coordination failures degrade latency, never correctness.
+
+4. **Facts are written once; derivations are computed on read.** No back-pointers, no flags on existing rows, no stored values a query can derive.
+
+5. **Immutability.** Operations are never mutated after their facts are set. Cancellation is a new opposite operation.
+
+## 4. Consistency Contract
+
+Publish to client teams verbatim.
+
+### 4.1 Guarantees
+
+- **G1 — Final-balance invariant.** An account's *final balance* (sum of all CONFIRMED operations regardless of effective timestamp — the balance at the end of the timeline) never violates its configured `min_balance` / `max_balance`.
+
+- **G2 — Group atomicity.** All operations of a group are confirmed together in one database transaction, or all are rejected together. Partial application is impossible, even transiently.
+
+- **G3 — Deterministic acceptance.** Outcomes are a deterministic function of registration order: an operation is validated only after every earlier-registered operation has been decided. A group is decided at the registration position of its first leg. Replaying the same inserts in the same order yields the same outcomes.
+
+- **G4 — Deterministic, immutable ordering.** Timeline order is `(effective_at, registration id)` — total, unique, fixed at insert.
+
+- **G5 — Eventual decision, no timeouts.** Every operation is eventually CONFIRMED or INVALID; nothing is ever aborted for taking too long.
+
+- **G6 — Idempotent insertion.** Re-sending a request with the same idempotency key never duplicates operations.
+
+### 4.2 Explicit non-guarantees
+
+- **N1 — No decision deadline.** Typical latency is ~one polling cycle; it is unbounded under backlog.
+
+- **N2 — Point-in-time balances may violate limits.** A backdated debit may permanently make history show a below-minimum balance at a past instant. With future-dated operations, "now" is just another timeline point with the same property. Only the **final** balance is protected.
+
+- **N3 — Reversals may be refused.** A reversal is an ordinary operation validated against limits; reversing a spent credit is a debit without funds.
+
+- **N4 — Intra-timestamp adjacency is not guaranteed** for reversals sharing the original's timestamp; end-of-instant balances are identical regardless.
+
+- **N5 — Future-dated operations enter the final balance immediately upon confirmation** (and are invisible to point-in-time reads at "now"). BalanceDB does not schedule; the client inserts when the date arrives if scheduling semantics are wanted.
+
+## 5. Data Model
+
+### 5.1 Conventions
+
+- All amounts are **`BIGINT` in minor units**; floating point is forbidden everywhere. `amount > 0` credit, `< 0` debit.
+
+- Groups are **not required to be zero-sum**: a group is an atomic *set* of operations, not a double-entry pair. (An envelope system's "debit physical account + debit envelope" group is a supported first-class case.)
+
+- Accounts have an internal `id` (sequence) and a client-defined `external_id` (unique per owner). The API speaks external ids; the mapping is immutable and cacheable forever.
+
+- Accounts are created explicitly (with limits) or on demand (upserted at insertion; `NULL` limits = unbounded).
+
+### 5.2 Schema (PostgreSQL; per cell)
+
+```sql
+
+CREATE TABLE accounts (
+
+  id                BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+
+  owner_id          BIGINT NOT NULL,           -- sharding key; all group legs share one owner
+
+  external_id       TEXT   NOT NULL,
+
+  min_balance       BIGINT NULL,               -- NULL = unbounded
+
+  max_balance       BIGINT NULL,
+
+  confirmed_balance BIGINT NOT NULL DEFAULT 0, -- FINAL balance (sum of all CONFIRMED ops)
+
+  version           BIGINT NOT NULL DEFAULT 0, -- optimistic lock (processor vs API races)
+
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  UNIQUE (owner_id, external_id)
+
+);
+
+CREATE TABLE transactions (          -- group records; ONLY for groups (>= 2 operations)
+
+  id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+
+  idempotency_key UUID  NOT NULL UNIQUE,
+
+  payload_hash    BYTEA NOT NULL,
+
+  op_count        INT   NOT NULL,
+
+  status          TEXT  NOT NULL DEFAULT 'PENDING',  -- PENDING | COMMITTED | REJECTED
+
+  reject_reason   TEXT  NULL,                        -- LIMIT_VIOLATED + detail
+
+  registered_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  decided_at      TIMESTAMPTZ NULL
+
+);
+
+CREATE TABLE operations (
+
+  id                  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+
+                      -- registration id: global insertion order; ordering tiebreaker
+
+  account_id          BIGINT NOT NULL REFERENCES accounts(id),
+
+  amount              BIGINT NOT NULL CHECK (amount <> 0),
+
+  effective_at        TIMESTAMPTZ NOT NULL,   -- client-supplied; past AND future allowed
+
+  transaction_id      BIGINT NULL REFERENCES transactions(id),  -- NULL for singles
+
+  reversal_of         BIGINT NULL REFERENCES operations(id),
+
+  status              TEXT NOT NULL DEFAULT 'PENDING',
+
+                      -- PENDING | CONFIRMED | INVALID   (no intermediate states)
+
+  invalidation_reason TEXT NULL,              -- LIMIT_VIOLATED + offending account/limit
+
+  idempotency_key     UUID  NULL,             -- singles only (groups: on transactions)
+
+  payload_hash        BYTEA NULL,             -- singles only
+
+  registered_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  confirmed_at        TIMESTAMPTZ NULL
+
+);
+
+CREATE INDEX idx_ops_work     ON operations (id) WHERE status = 'PENDING';   -- work queue
+
+CREATE INDEX idx_ops_timeline ON operations (account_id, effective_at, id);  -- reads
+
+CREATE INDEX idx_ops_tx       ON operations (transaction_id) WHERE transaction_id IS NOT NULL;
+
+CREATE UNIQUE INDEX idx_ops_reversal ON operations (reversal_of)
+
+  WHERE reversal_of IS NOT NULL AND status <> 'INVALID';  -- one live reversal per op;
+
+                                                          -- a rejected reversal allows retry
+
+CREATE UNIQUE INDEX idx_ops_idem ON operations (idempotency_key)
+
+  WHERE idempotency_key IS NOT NULL;
+
+CREATE TABLE balance_snapshots (
+
+  account_id BIGINT NOT NULL,
+
+  day        DATE   NOT NULL,     -- UTC bucket of effective_at (timezone fixed forever)
+
+  balance    BIGINT NOT NULL,     -- CUMULATIVE balance at end of that day
+
+  PRIMARY KEY (account_id, day)
+
+);
+
+CREATE TABLE leader_lease (       -- single row, created at cell setup
+
+  singleton   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+
+  owner       UUID NULL,          -- processor instance UUID (generated at boot)
+
+  lease_until TIMESTAMPTZ NULL
+
+);
+
+CREATE TABLE config (             -- single row; hot-reloaded every cycle
+
+  singleton         BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+
+  lease_ttl_ms      INT NOT NULL DEFAULT 15000,
+
+  loop_interval_ms  INT NOT NULL DEFAULT 1000,
+
+  batch_size        INT NOT NULL DEFAULT 200,   -- decisions per DB commit (§8.4)
+
+  max_group_size    INT NOT NULL DEFAULT 10,
+
+  api_max_wait_ms   INT NOT NULL DEFAULT 30000
+
+);
+
+```
+
+### 5.3 Status state machines
+
+```
+
+Operation:    PENDING ──► CONFIRMED            Transaction: PENDING ──► COMMITTED
+
+                      └─► INVALID  (terminal)                       └─► REJECTED (terminal)
+
+```
+
+`INVALID` / `REJECTED` are terminal; recovery is client re-submission. All operations of a group flip together with their transaction row, in one DB transaction.
+
+### 5.4 Ordering and reversals
+
+Timeline order is the composite key `(effective_at, id)` — deterministic, unique, free (the registration id already exists at insert). There is no rank generation, no linked list, and **no per-operation running-balance column**: running balances are derived on read (§9), which is what makes backdating cheap (§8.4).
+
+A reversal is an ordinary operation with the opposite amount, typically the original's `effective_at`, and `reversal_of` set at insertion — immutable metadata, unused by the engine. Nothing is ever written to the reversed operation; "was it reversed?" is derived by querying the index. The partial unique index blocks double reversal while allowing a retry after a *rejected* reversal.
+
+## 6. Balances & Validation
+
+Because a cell has a single processor and groups apply atomically, **there are never in-flight groups during validation**. Two balance notions exist:
+
+- **Final balance** — `accounts.confirmed_balance`, O(1); the object of G1.
+
+- **Balance at instant T** — derived on read (§9); a projection, not covered by G1 (N2).
+
+**Validation is binary.** For a candidate with net amount `v` on an account with limits `[min, max]`:
+
+```
+
+ACCEPT  iff  min <= confirmed_balance + v <= max      (unbounded sides skipped)
+
+```
+
+For a group: compute the **net per account** (sum of the group's legs on that account) and test every involved account. All pass → the whole group commits; any fail → the whole group rejects with `LIMIT_VIOLATED` plus the offending account and shortfall. Per-account netting is sound precisely because all legs apply in one DB transaction (G2).
+
+`effective_at` plays no role in validation: an operation's effect on the *final* balance is its amount, wherever it lands on the timeline — so the current-balance check is exactly G1. This is also why backdated inserts need no special validation.
+
+**Limit changes** (mutable account configuration, written directly by the API): a new `min` is accepted only if `min <= confirmed_balance`; a new `max` only if `confirmed_balance <= max`. Optimistically guarded: `UPDATE ... WHERE version = :read_version`, retry on conflict — the same `version` the processor bumps, so API-vs-processor races are detected on either side. Pending operations are validated later against whatever limits hold at their processing time (consistent with G3).
+
+## 7. Leader Election & Safety Guards
+
+### 7.1 Leader lease
+
+Every processor instance generates a UUID at boot and runs the same loop:
+
+```sql
+
+UPDATE leader_lease SET owner = :me, lease_until = now() + :ttl
+
+ WHERE owner = :me OR owner IS NULL OR lease_until < now();
+
+```
+
+Row updated → leader this cycle: process work. Not updated → standby: sleep one interval, retry. Graceful shutdown sets `owner = NULL`; crash is covered by TTL expiry (failover ≈ `lease_ttl`, default 15 s). All time comparisons use the **database clock** — node clocks are never trusted. Do not tune the TTL below several loop intervals, or a long GC pause costs leadership needlessly.
+
+### 7.2 Safety guards
+
+The lease makes double-processing *rare*; the guards make it *harmless*. Residual scenario: a leader checks its lease, stalls past expiry (GC/VM pause), and writes after a standby took over — without guards, a silent lost update on a balance, the one unforgivable failure in a ledger. Every processing transaction carries three guards; any guard matching 0 rows ⇒ `ROLLBACK`, re-acquire lease, continue:
+
+```sql
+
+BEGIN;
+
+-- Guard 1: lease fence (DB clock)
+
+SELECT 1 FROM leader_lease WHERE owner = :me AND lease_until > now();   -- empty? rollback
+
+-- Guard 2: conditional status flips (idempotent retry & crash recovery)
+
+UPDATE operations SET status = 'CONFIRMED', confirmed_at = now()
+
+ WHERE id = ANY(:ops) AND status = 'PENDING';         -- rowcount mismatch? rollback
+
+-- Guard 3: account version (closes the fence-to-commit window; arbitrates API races)
+
+UPDATE accounts SET confirmed_balance = confirmed_balance + :net, version = version + 1
+
+ WHERE id = :acct AND version = :version_read;         -- 0 rows? rollback
+
+-- ... snapshot updates ...
+
+COMMIT;
+
+```
+
+## 8. Processing Algorithm
+
+### 8.1 Main loop (leader only)
+
+```
+
+every loop_interval:
+
+  re-read config; renew lease
+
+  work = SELECT * FROM operations WHERE status = 'PENDING' ORDER BY id LIMIT :chunk
+
+  for op in work:
+
+    if op.transaction_id IS NULL: process_single(op)
+
+    else:                         process_group(op.transaction_id)
+
+                                  -- processed at its FIRST leg by registration order;
+
+                                  -- remaining legs of a decided group are skipped by status
+
+  emit NOTIFY for each outcome (inside its commit)
+
+```
+
+Strict registration order is what makes acceptance deterministic (G3): when an operation is validated, every earlier-registered operation has been decided.
+
+### 8.2 Single operation
+
+One DB transaction: read account (balance, version, limits) → binary validation → ACCEPT: apply (§8.4) and flip to CONFIRMED; REJECT: flip to INVALID with reason. No other states exist.
+
+### 8.3 Group
+
+One DB transaction for the entire group: load all legs by `transaction_id` (the universe is complete — groups are inserted atomically, §10.1; cross-check `op_count`) → compute net per account → read and validate every involved account → all pass: apply every account's net (each under Guard 3), update snapshots for every leg, flip all legs to CONFIRMED and the transaction to COMMITTED; any fail: flip all legs to INVALID and the transaction to REJECTED with reason. **Group atomicity is simply the DB transaction** — there is no distributed protocol.
+
+### 8.4 Applying amounts — snapshots
+
+For each confirmed leg: upsert the cumulative snapshot for the leg's `effective_at` UTC day, then:
+
+```sql
+
+UPDATE balance_snapshots SET balance = balance + :v
+
+ WHERE account_id = :a AND day > :op_day;    -- sparse: only days that exist are touched
+
+```
+
+Cost: O(existing snapshot-days after the operation's day). The newest-timestamp common case touches zero rows (O(1)); a 30-day backdate touches ≤ 30 rows. Backdated and future-dated operations need no special code — the day arithmetic places them.
+
+### 8.5 Batching
+
+Commit fsync (~2–5 ms) dominates service time. The leader packs up to `batch_size` decisions into one DB transaction (guards evaluated per decision). Safe because decisions are independent and idempotent under reprocessing: a crash loses the whole batch, which is simply reprocessed. 10–50× throughput.
+
+## 9. Read Paths
+
+- **Final balance**: `accounts.confirmed_balance`. O(1).
+
+- **Balance at instant T**: last snapshot with `day < T::date` + sum of CONFIRMED operations of T's day with `(effective_at, id) ≤ T`. May violate limits (N2), including T = now() when future-dated operations exist (N5).
+
+- **Statement with running balance**: page over `idx_ops_timeline` (CONFIRMED only), seeded by the snapshot preceding the page, prefix-summed within the page.
+
+- **Retention**: full history kept in the database indefinitely — no archival tier. If volume ever demands it, native time-based table partitioning applies without design changes.
+
+## 10. HTTP API
+
+API nodes are stateless; any node serves any request after directory lookup (`owner → cell`).
+
+### 10.1 Insertion
+
+```
+
+POST /transactions
+
+Idempotency-Key: <client-generated UUID>          (required)
+
+{ "operations": [ { "account": "<external_id>", "amount": -1500,
+
+                    "effective_at": "...", "reversal_of": <op_id>? }, ... ],
+
+  "wait_ms": 0 }
+
+```
+
+- One request = one atomic unit. 1 operation → **single** (no transaction row; key stored on the operation). 2..`max_group_size` → **group** (transaction row + legs, one ACID insert). All legs must belong to **one owner** (the sharding invariant, §2) — enforced here.
+
+- Accounts are resolved/upserted by `(owner, external_id)` in the same insert transaction. `effective_at` may be past or future. Amounts are bigint minor units. Groups need not be zero-sum.
+
+- **Idempotency (Stripe model).** Retry reuses the key; a new business action uses a new key. The unique index arbitrates concurrent retries atomically; a replay returns the original's current state (probe `transactions`, then `operations`, by key) — never an error, never a duplicate. Same key with a different `payload_hash` → `422`. Keys are retained forever.
+
+- **Waiting.** `wait_ms = 0` → immediate `202` (fire-and-forget). Otherwise the API waits via `LISTEN/NOTIFY` (`NOTIFY outcomes, 'tx:<id>' | 'op:<id>'`, emitted inside the deciding commit), with a 1–2 s status poll as durability fallback. Outcome → `200`; expiry (capped by `api_max_wait_ms`) → `202` with current state. **Sync mode means "wait up to T", never "guaranteed outcome".**
+
+### 10.2 Queries & account management
+
+```
+
+GET /transactions/{id}      → group status + per-leg statuses
+
+GET /operations/{id}        → status; if INVALID: reason + offending account/limit detail
+
+GET /accounts/{ext}/balance             → final balance
+
+GET /accounts/{ext}/balance?at=T        → point-in-time projection (N2 applies)
+
+GET /accounts/{ext}/statement?...       → paged timeline with derived running balance
+
+POST /accounts                          → explicit creation with limits
+
+PUT  /accounts/{ext}/limits             → §6 rules, version-guarded
+
+```
+
+Rejections always carry a machine-readable reason and detail — a budgeting UI can render "envelope short by 12.00" directly from the API.
+
+## 11. Scaling Model
+
+**Per-cell ceiling.** The cell's database bounds throughput: WAL/fsync and row-write volume. Each decided operation costs a handful of row writes (status flip, account update, 1+ snapshot touches; groups: × legs + transaction row). With batching, a cell sustains thousands of decisions/second — on solid hardware, roughly **hundreds of thousands to ~1M active users per cell** for a budgeting-class workload (tens of group-operations per user per day). Loop utilization ρ and DB write metrics (§13) tell you where a cell actually stands; capacity planning is arithmetic, not faith.
+
+**Horizontal scale = more cells.** Because of the sharding invariant (no group crosses owners), cells share nothing and capacity grows linearly with cell count. Adding a cell requires no migration of existing cells. Moving an owner between cells is a per-owner copy (accounts, operations, snapshots) plus a directory flip.
+
+**Latency is flat across scale**: ~one polling cycle (~1 s default; p99 a small multiple) at any number of cells, provided each cell is run within its ceiling. For lower latency, shrink `loop_interval` (the idle poll is one cheap indexed query) or wake the leader with a NOTIFY from the insert path — tens of milliseconds are reachable without architectural change.
+
+**What would break the model** — and must trigger a design pass, never an improvisation: any feature requiring atomicity across owners (e.g., user-to-user transfers). Options then: application-level sagas (two groups + compensation), or a cross-cell commit protocol. The invariant exists so that day is a conversation, not an incident.
+
+## 12. Failure Matrix
+
+| Failure | Consequence | Recovery |
+
+|---|---|---|
+
+| Leader crash | Cell processing pauses ≤ lease TTL | Standby claims; PENDING work resumes; no state lost (all state in DB) |
+
+| Crash mid-transaction | DB rollback | Work re-selected next cycle; idempotent by guards |
+
+| Zombie leader (stall past lease expiry) | Guards hit 0 rows | Rollback; instance re-acquires or becomes standby |
+
+| API crash mid-insert | ACID rollback of the insert | Client retries with the same idempotency key |
+
+| Cell DB down | That cell pauses entirely (others unaffected) | Resumes with DB; no split-brain possible — the DB *is* the coordinator |
+
+| Clock skew | None — all time comparisons use the DB clock | — |
+
+| Lost NOTIFY | A waiting API request | Covered by the polling fallback |
+
+## 13. Observability (per cell, from day one)
+
+| Metric | Why |
+
+|---|---|
+
+| Oldest PENDING age & queue depth | The system's only latency promise is "~cycle when healthy"; this is its health |
+
+| Loop utilization ρ (busy time / cycle) | Queue-latency predictor; the cell-splitting trigger |
+
+| Snapshot rows touched per confirmation | Measures the backdating workload in production |
+
+| Leadership changes/hour | Flapping lease = tuning or infrastructure problem |
+
+| DB row-writes/s, WAL throughput, fsync latency | Distance to the cell ceiling |
+
+| NOTIFY→outcome lag | API wait health |
+
+## 14. Key Rationale (why it is this way)
+
+- **Ordering by `(effective_at, id)`** instead of ranks/linked lists: deterministic, unique, zero maintenance; viable because no per-row running balance is stored.
+
+- **Snapshots (daily/cumulative/sparse)** instead of per-row balances: turns backdating from O(all subsequent rows) into O(days spanned), and reads stay O(1)/O(page).
+
+- **Validation against the final balance only**: an operation's effect on the final balance is its amount regardless of timeline position, so the check is exactly the guarantee (G1) — and point-in-time guarantees are explicitly not offered (N2).
+
+- **Single processor per cell + atomic group transactions**: with one owner of all the cell's accounts, a group commits in one DB transaction — eliminating any need for two-phase commit, reservations, deferred states, or timeouts, and strengthening the contract (G2 absolute, G5 timeout-free).
+
+- **Leader lease + optimistic guards**: the lease provides availability; the guards provide safety. Safety never rests on the lease (Principle 3).
+
+- **One-way reversal link**: a back-pointer would mutate the original and is derivable from an index (Principles 4–5).
+
+- **Non-zero-sum groups**: a group is an atomic set, not a double-entry constraint — required by allocation-style accounting (envelopes) where one real movement legitimately hits two balances the same way.
+
+- **Cells sharded by owner**: the workload's natural boundary; zero cross-cell coordination makes scaling linear and keeps every cell as simple as a single-node system.
+
+## 15. Implementation Notes
+
+First investment: **deterministic simulation testing** — seeded generators of operations, groups, aggressive backdating (crossing snapshot days, tying timestamps), leader failover, and zombie leaders, checking G1–G6 against a sequential reference model. Also: authorization/tenancy plumbing around `owner_id`, pagination details, config tuning, and the directory service (a table + cache is sufficient initially).
