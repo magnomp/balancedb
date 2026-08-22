@@ -82,7 +82,7 @@ Packages marked *(Mn)* are not built yet — the map is the stable target.
 - `migrate` — embedded migrations + purpose-built runner (spec §5.2, ADR-0001). **built**
 - `model` — row types, status enums, reason codes, the one amount helper, payload hashing (spec §5). **built**
 - `lease` — leader lease acquire/renew/release (spec §7.1). **built**
-- `processor` — main loop, single-op processing, the three guards (spec §7–§8; groups + batching *(M6)*). **built (M5)**
+- `processor` — main loop, single/group processing, the three guards, batching (spec §7–§8). **built**
 - `snapshot` — snapshot upsert + cascade update (spec §8.4). **built**
 - `api` — insertion core (`Insert` over a `pgx.Tx`, spec §10.1) **built (M3)**; HTTP handlers: waiting, queries (Huma, spec §10, ADR-0003) *(M7–M8)*.
 - `notify` — LISTEN/NOTIFY: work doorbell + outcome fan-out (spec §11, ADR-0002). *(M3/M5/M8)*
