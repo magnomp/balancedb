@@ -1,0 +1,16 @@
+# Binaries
+/balancedb
+/bin/
+*.exe
+
+# Test / coverage artifacts
+*.out
+coverage.*
+
+# Local env overrides
+.env
+.env.local
+
+# Editor / OS cruft
+.DS_Store
+*.swp
