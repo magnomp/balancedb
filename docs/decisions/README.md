@@ -23,3 +23,5 @@ explains it, that is a bug in either the code or the log.
   doorbell + outcome fan-out as the sanctioned low-latency path.
 - [0003 — Code-first OpenAPI via Huma v2](0003-code-first-openapi-huma.md) — the
   server is the authority; the committed spec is derived from real types.
+- [0004 — Advisory lock before CREATE SCHEMA](0004-advisory-lock-before-create-schema.md)
+  — reorder plan §M2 steps 2/3 so schema creation is inside the boot lock.
