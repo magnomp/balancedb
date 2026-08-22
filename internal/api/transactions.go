@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"net/http"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -31,7 +32,7 @@ type CreateTransactionInput struct {
 	IdempotencyKey string `header:"Idempotency-Key" required:"true" doc:"Client-generated UUID. Retrying with the same key never duplicates operations (G6); reusing it with a different payload is rejected with 422."`
 	Body           struct {
 		Operations []OperationInput `json:"operations" minItems:"1" doc:"One operation is a single; 2..max_group_size operations form an atomic group (§10.1)."`
-		WaitMs     int              `json:"wait_ms,omitempty" minimum:"0" doc:"Optional synchronous wait budget in milliseconds. 0 or omitted returns 202 immediately (fire-and-forget); query the outcome later. NOTE: synchronous waiting is not yet implemented (milestone M8) — any wait_ms > 0 currently behaves as 0 and still returns 202."`
+		WaitMs     int              `json:"wait_ms,omitempty" minimum:"0" doc:"Optional synchronous wait budget in milliseconds. 0 or omitted returns 202 immediately (fire-and-forget); query the outcome later. When > 0 the call waits up to this many ms (capped by api_max_wait_ms) for the decision — 200 with the decided status if it lands in time, otherwise 202 with the current (still PENDING) state. Waiting is best-effort, never a guaranteed outcome."`
 	}
 }
 
@@ -42,11 +43,17 @@ type OperationOutcome struct {
 	Status string `json:"status" doc:"Operation status: PENDING | CONFIRMED | INVALID."`
 }
 
-// CreateTransactionOutput is the 202 body. TransactionID/TransactionStatus are set
-// only for groups; a single leaves them empty. Replayed is true when an
+// CreateTransactionOutput is the insertion response. TransactionID/TransactionStatus
+// are set only for groups; a single leaves them empty. Replayed is true when an
 // idempotency key matched an existing record and no new rows were written.
+//
+// Status is the HTTP status code (Huma reads this special field): 202 for the
+// fire-and-forget path and on a synchronous-wait expiry (still PENDING); 200 when a
+// synchronous wait resolved to a decided outcome. It is not part of the response
+// body — the OpenAPI contract advertises 202 as the operation's declared response.
 type CreateTransactionOutput struct {
-	Body struct {
+	Status int
+	Body   struct {
 		TransactionID     *int64             `json:"transaction_id,omitempty" doc:"Group transaction id; absent for a single operation."`
 		TransactionStatus string             `json:"transaction_status,omitempty" doc:"Group status: PENDING | COMMITTED | REJECTED; absent for a single operation."`
 		Operations        []OperationOutcome `json:"operations"`
@@ -72,8 +79,6 @@ func (s *Server) createTransaction(ctx context.Context, in *CreateTransactionInp
 	}
 	req := InsertRequest{IdempotencyKey: in.IdempotencyKey, Operations: ops}
 
-	// wait_ms > 0 is intentionally ignored in M7 — synchronous waiting lands in M8
-	// (documented on the field). Every insert is fire-and-forget → 202.
 	var res *InsertResult
 	err = db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		r, e := Insert(ctx, tx, req)
@@ -87,6 +92,22 @@ func (s *Server) createTransaction(ctx context.Context, in *CreateTransactionInp
 		return nil, mapInsertErr(err)
 	}
 
+	// wait_ms <= 0 (or omitted): fire-and-forget, 202 immediately. This path never
+	// touches the notify machinery (ADR-0002: waiting is strictly opt-in).
+	if in.Body.WaitMs <= 0 {
+		out := insertOutput(res)
+		out.Status = http.StatusAccepted
+		return out, nil
+	}
+
+	// wait_ms > 0: wait up to the (capped) budget for the decision — 200 on outcome,
+	// 202 with the current state on expiry (spec §10.1).
+	return s.waitForOutcome(ctx, ownerID, res, in.Body.WaitMs)
+}
+
+// insertOutput builds the response body directly from the insert result (the
+// fire-and-forget path, before any decision is awaited).
+func insertOutput(res *InsertResult) *CreateTransactionOutput {
 	out := &CreateTransactionOutput{}
 	out.Body.TransactionID = res.TransactionID
 	out.Body.TransactionStatus = res.TransactionStatus
@@ -95,7 +116,7 @@ func (s *Server) createTransaction(ctx context.Context, in *CreateTransactionInp
 	for i, o := range res.Operations {
 		out.Body.Operations[i] = OperationOutcome{ID: o.ID, Status: o.Status}
 	}
-	return out, nil
+	return out
 }
 
 // --- GET /transactions/{id} -------------------------------------------------

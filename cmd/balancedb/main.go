@@ -23,6 +23,7 @@ import (
 	"github.com/magnomp/balancedb/internal/db"
 	"github.com/magnomp/balancedb/internal/lease"
 	"github.com/magnomp/balancedb/internal/migrate"
+	"github.com/magnomp/balancedb/internal/notify"
 	"github.com/magnomp/balancedb/internal/processor"
 )
 
@@ -114,9 +115,19 @@ func run() error {
 
 // runAPI serves the HTTP API and shuts it down gracefully when ctx is cancelled.
 func runAPI(ctx context.Context, logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) error {
+	// One dedicated LISTEN outcomes connection per API process (ADR-0002); it feeds
+	// the synchronous wait path (wait_ms > 0). Run in its own goroutine so it
+	// reconnects independently of request handling; it stops when ctx is cancelled.
+	notifier := notify.New(pool, logger)
+	go func() {
+		if err := notifier.Run(ctx); err != nil {
+			logger.Warn("outcomes notifier stopped", "err", err)
+		}
+	}()
+
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           api.NewServer(pool, nil).Handler(),
+		Handler:           api.NewServer(pool, nil, notifier).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

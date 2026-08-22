@@ -3,12 +3,23 @@ package api
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humachi"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// outcomeWaiter is the slice of internal/notify the wait path (createTransaction,
+// wait_ms > 0) depends on: register a waiter for an outcome key and get a signal
+// channel plus an unregister func. Kept as an interface so the API package does not
+// hard-depend on the concrete Notifier and tests can substitute a fake. A nil
+// notifier disables the NOTIFY fast path; waiting then resolves purely by status
+// poll (the durability fallback is always the correctness path, ADR-0002).
+type outcomeWaiter interface {
+	Register(key string) (<-chan struct{}, func())
+}
 
 // apiTitle/apiVersion identify the generated contract. apiVersion is deliberately
 // held stable and hand-bumped: it appears in api/openapi.yaml, so letting it drift
@@ -29,8 +40,14 @@ const (
 type Server struct {
 	pool     *pgxpool.Pool
 	resolver OwnerResolver
+	notifier outcomeWaiter
 	api      huma.API
 	mux      *chi.Mux
+
+	// pollInterval is the wait path's status-poll cadence — the durability fallback
+	// that resolves a synchronous wait even when the outcome NOTIFY is dropped
+	// (spec §10.1 names 1–2 s). Zero means defaultPollInterval. Tests set it small.
+	pollInterval time.Duration
 
 	// afterLimitsRead, when non-nil, runs between the version read and the
 	// version-guarded UPDATE in updateAccountLimits. Production leaves it nil; tests
@@ -42,8 +59,10 @@ type Server struct {
 
 // NewServer builds the router, registers every §10 operation, and wires Huma's
 // /docs (interactive, request-executing) and /openapi.{yaml,json} endpoints. A nil
-// resolver defaults to the single-header implementation.
-func NewServer(pool *pgxpool.Pool, resolver OwnerResolver) *Server {
+// resolver defaults to the single-header implementation. A nil notifier is allowed
+// (spec export and poll-only deployments): the wait path then relies solely on its
+// status poll.
+func NewServer(pool *pgxpool.Pool, resolver OwnerResolver, notifier outcomeWaiter) *Server {
 	if resolver == nil {
 		resolver = HeaderOwnerResolver{}
 	}
@@ -57,7 +76,7 @@ func NewServer(pool *pgxpool.Pool, resolver OwnerResolver) *Server {
 		"POST /transactions returns 202 and outcomes are queried later."
 
 	api := humachi.New(mux, cfg)
-	s := &Server{pool: pool, resolver: resolver, api: api, mux: mux}
+	s := &Server{pool: pool, resolver: resolver, notifier: notifier, api: api, mux: mux}
 	s.register()
 	return s
 }
@@ -73,7 +92,7 @@ func (s *Server) OpenAPIYAML() ([]byte, error) { return s.api.OpenAPI().YAML() }
 // their schemas are fixed at registration, independent of the pool. cmd/openapigen
 // uses this so spec export never touches Postgres.
 func OpenAPIYAML() ([]byte, error) {
-	return NewServer(nil, nil).OpenAPIYAML()
+	return NewServer(nil, nil, nil).OpenAPIYAML()
 }
 
 // register declares every §10 endpoint as a typed Huma operation. Kept in one
@@ -84,7 +103,7 @@ func (s *Server) register() {
 		Method:        http.MethodPost,
 		Path:          "/transactions",
 		Summary:       "Insert an operation or atomic group",
-		Description:   "Registers one atomic unit: a single operation (no transaction row) or a group of 2..max_group_size legs, all belonging to one owner (§2). Returns 202 immediately; the outcome is decided asynchronously and read back via GET /transactions/{id} or GET /operations/{id}.",
+		Description:   "Registers one atomic unit: a single operation (no transaction row) or a group of 2..max_group_size legs, all belonging to one owner (§2). By default returns 202 immediately (fire-and-forget); the outcome is decided asynchronously and read back via GET /transactions/{id} or GET /operations/{id}. With wait_ms > 0 the call waits up to that budget (capped by api_max_wait_ms) for the decision via LISTEN/NOTIFY with a status-poll fallback: if the outcome is decided in time it returns 200 with the decided status, otherwise 202 with the current (still PENDING) state. Waiting is strictly optional and never guaranteed to return a final outcome.",
 		Tags:          []string{"Insertion"},
 		DefaultStatus: http.StatusAccepted,
 	}, s.createTransaction)

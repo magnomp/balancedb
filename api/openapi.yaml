@@ -80,7 +80,7 @@ components:
             - array
             - "null"
         wait_ms:
-          description: "Optional synchronous wait budget in milliseconds. 0 or omitted returns 202 immediately (fire-and-forget); query the outcome later. NOTE: synchronous waiting is not yet implemented (milestone M8) — any wait_ms > 0 currently behaves as 0 and still returns 202."
+          description: Optional synchronous wait budget in milliseconds. 0 or omitted returns 202 immediately (fire-and-forget); query the outcome later. When > 0 the call waits up to this many ms (capped by api_max_wait_ms) for the decision — 200 with the decided status if it lands in time, otherwise 202 with the current (still PENDING) state. Waiting is best-effort, never a guaranteed outcome.
           format: int64
           minimum: 0
           type: integer
@@ -620,7 +620,7 @@ paths:
         - Queries
   /transactions:
     post:
-      description: "Registers one atomic unit: a single operation (no transaction row) or a group of 2..max_group_size legs, all belonging to one owner (§2). Returns 202 immediately; the outcome is decided asynchronously and read back via GET /transactions/{id} or GET /operations/{id}."
+      description: "Registers one atomic unit: a single operation (no transaction row) or a group of 2..max_group_size legs, all belonging to one owner (§2). By default returns 202 immediately (fire-and-forget); the outcome is decided asynchronously and read back via GET /transactions/{id} or GET /operations/{id}. With wait_ms > 0 the call waits up to that budget (capped by api_max_wait_ms) for the decision via LISTEN/NOTIFY with a status-poll fallback: if the outcome is decided in time it returns 200 with the decided status, otherwise 202 with the current (still PENDING) state. Waiting is strictly optional and never guaranteed to return a final outcome."
       operationId: createTransaction
       parameters:
         - description: Owner scope for the request (§2). Single-cell deployments pass the numeric owner_id directly.
