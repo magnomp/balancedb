@@ -30,6 +30,15 @@ type refTx struct {
 	Status      model.TxStatus
 }
 
+// refAccount tracks an account's limits and its FINAL (confirmed) balance — the
+// object of G1. NULL limits are unbounded.
+type refAccount struct {
+	ID      int64
+	Min     *int64
+	Max     *int64
+	Balance int64
+}
+
 // Model is the sequential reference model. It replays insertion in registration
 // order, assigning ids from monotonic counters exactly as Postgres identity
 // columns do, and enforces the same insert-time rules as internal/api.Insert. It
@@ -41,9 +50,10 @@ type Model struct {
 	nextOpID      int64
 	nextTxID      int64
 
-	accounts map[accountKey]int64
-	ops      map[int64]*refOp
-	txs      map[int64]*refTx
+	accounts     map[accountKey]int64
+	accountsByID map[int64]*refAccount
+	ops          map[int64]*refOp
+	txs          map[int64]*refTx
 
 	// Idempotency indexes, keyed by idempotency key. singleByKey stores the
 	// operation id + payload hash of a single; groupByKey the transaction id +
@@ -67,6 +77,7 @@ func NewModel() *Model {
 	return &Model{
 		MaxGroupSize: DefaultMaxGroupSize,
 		accounts:     make(map[accountKey]int64),
+		accountsByID: make(map[int64]*refAccount),
 		ops:          make(map[int64]*refOp),
 		txs:          make(map[int64]*refTx),
 		singleByKey:  make(map[string]keyedRecord),
@@ -185,8 +196,10 @@ func (m *Model) upsertAccount(ownerID int64, externalID string) int64 {
 		return id
 	}
 	m.nextAccountID++
-	m.accounts[k] = m.nextAccountID
-	return m.nextAccountID
+	id := m.nextAccountID
+	m.accounts[k] = id
+	m.accountsByID[id] = &refAccount{ID: id}
+	return id
 }
 
 func canonicalOps(ops []api.InsertOp) []model.CanonicalOp {
