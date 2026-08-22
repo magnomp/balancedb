@@ -145,3 +145,67 @@ Notes for next agents:
 - The `migrate` runner opens its own connection and does NOT touch the app pool, so
   it is safe to call before `db.Connect`. It is safe to call concurrently.
 - `migrate` package map line in CLAUDE.md flipped `(M2)` → **built**.
+
+## M3 — 2026-08-22
+
+Built:
+- `internal/model` (now **built**): domain model per spec §5. Row types (`Account`,
+  `Transaction`, `Operation`, `BalanceSnapshot`, `Config`) mirroring the schema;
+  status vocabularies (`OpStatus`, `TxStatus`); reason codes (`ReasonLimitViolated`,
+  `LimitSide`, and the `Rejection` detail struct with `Marshal`/`ParseRejection`
+  for the reason columns); `ParseAmount(json.Number) (int64,error)` — THE single
+  money entry point, strict (rejects decimals/exponents/whitespace, accepts 0 so the
+  DB CHECK stays the authority); `HashPayload([]CanonicalOp)` — canonical JSON (UTC-
+  normalised effective_at, struct encoding) → SHA-256 for idempotency.
+- `internal/api` insertion core (**built (M3)**; HTTP is still M7–M8): `Insert(ctx,
+  tx, req)` as a pure function over a `pgx.Tx` (spec §10.1). Single vs group branch;
+  on-demand account upsert by `(owner_id, external_id)`; atomic multi-leg group
+  insert with an `op_count` cross-check; Stripe-model idempotency; `payload_hash`
+  conflict → `ErrPayloadConflict`; `max_group_size` read from the `config` table;
+  one-owner-per-group (sharding invariant, spec §2) enforced here and only here.
+  Fresh inserts ring `NOTIFY work_available` inside the tx (ADR-0002); replays do
+  not. Sentinel errors for every rejection so M7 can map status codes without string
+  matching (`ErrNoOperations`, `ErrInvalidIdempotencyKey`, `ErrMixedOwners`,
+  `ErrGroupTooLarge`, `ErrPayloadConflict`, `ErrZeroAmount`).
+- `internal/api/insert_itest_test.go` (build tag `itest`, via `dbtest.NewSchema`):
+  all plan §M3 cases — single, group, idempotent replay (single + group) returns
+  original ids, same-key/different-payload conflict, mixed-owner rejection, group-size
+  cap, amount=0 rejected by CHECK, doorbell fires on fresh insert, replay commits
+  cleanly with no new rows.
+- `simtest/` started (plan §M10 says grow it from M3): `Model`, an in-memory
+  sequential reference model that reproduces the inserter's insert-level outcomes
+  (new / replay / conflict, guards) and assigns ids like identity columns. First §15
+  property test asserts G6 — idempotent replays never duplicate and never grow the op
+  count, and same-key/different-payload retries conflict and change nothing; prints
+  its seed on failure. Runs under `make test` (pure, no DB); a dedicated
+  `make simtest` target stays deferred to M10 per CLAUDE.md.
+
+Decisions:
+- **ADR-0005** — insertion uses `ON CONFLICT DO NOTHING RETURNING` for the
+  probe-and-insert (avoids 23505 poisoning the single insert transaction, so no
+  SAVEPOINTs) and rings the doorbell on fresh inserts only (a replay creates no
+  PENDING work; the doorbell is a hint, ADR-0002). Same DO-NOTHING idiom for account
+  upsert so an existing account's row is never rewritten (no MVCC churn / no lock
+  contention with the processor's version CAS). No new dependencies (pgx/pgconn only).
+
+Deferred/known issues:
+- None blocking. `op_count` cross-check on insert confirms all legs landed; the
+  processor-side load-and-cross-check for partial groups is M6.
+
+Notes for next agents:
+- **Doorbell channel is global, not schema-scoped.** LISTEN/NOTIFY channels are
+  per-database, so `NOTIFY work_available` (literal, per ADR-0002) crosses schemas:
+  if several cells share one Postgres, a processor for schema A is woken by inserts
+  to schema B. Harmless (the doorbell is a hint; the leader selects only its own
+  schema's PENDING work `ORDER BY id`), but M5 (the LISTEN side) may want to
+  schema-scope the channel (e.g. `work_available_<schema>` via `pg_notify`) to avoid
+  spurious cross-cell wakeups. Left literal here on purpose; flag for M5, not a
+  blocker. In `dbtest` (many schemas per DB) this is why the doorbell test asserts a
+  notification *arrives* rather than asserting none arrives on replay.
+- The insert core takes an already-parsed `int64` amount; M7's HTTP layer must decode
+  the body with `json.Decoder.UseNumber()` and call `model.ParseAmount` — that is the
+  only sanctioned path from JSON to money.
+- Idempotency keys are validated as canonical UUIDs in Go (`ErrInvalidIdempotencyKey`)
+  before the DB sees them; SQL casts the key with `$n::uuid`.
+- `simtest` imports `internal/api` for the shared request/result types; M10 will feed
+  the same `api.InsertRequest` schedules to both the DB and the reference model.
