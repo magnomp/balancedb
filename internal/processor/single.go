@@ -44,50 +44,59 @@ const (
 	notifyOutcome = `SELECT pg_notify('outcomes', $1)`
 )
 
-// processSingle decides one single operation in one transaction implementing spec
-// §8.2 with all three guards of §7.2 verbatim, each rowcount-checked. On accept it
-// flips the operation to CONFIRMED (Guard 2), applies the amount to the account
-// under the version CAS (Guard 3), updates the daily snapshots, and notifies the
-// outcome. On reject it flips the operation to INVALID with the machine-readable
-// reason (Guard 2) and notifies — no balance change. Any guard miss returns
-// errGuardMiss, which db.WithTx turns into a rollback.
+// processSingle decides one single operation in its own transaction. It is the
+// single-decision entry point used outside batching (and by the internal tests);
+// the batching path (spec §8.5) calls processSingleTx directly inside a shared
+// batch transaction. Both wrap the same guarded body.
 func (p *Processor) processSingle(ctx context.Context, op pendingOp) error {
 	return db.WithTx(ctx, p.pool, func(tx pgx.Tx) error {
-		// Guard 1: lease fence.
-		var fenced int
-		err := tx.QueryRow(ctx, guardLeaseFence, p.lease.Owner()).Scan(&fenced)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return errGuardMiss
-		}
-		if err != nil {
-			return fmt.Errorf("guard 1 (lease fence): %w", err)
-		}
-
-		// Read the account for validation and the version to CAS on.
-		var (
-			balance    int64
-			version    int64
-			minBalance *int64
-			maxBalance *int64
-			externalID string
-		)
-		if err := tx.QueryRow(ctx, selectAccount, op.AccountID).
-			Scan(&balance, &version, &minBalance, &maxBalance, &externalID); err != nil {
-			return fmt.Errorf("read account %d: %w", op.AccountID, err)
-		}
-
-		// Test seam: inject a concurrent account mutation to exercise Guard 3.
-		if p.afterAccountRead != nil {
-			p.afterAccountRead()
-		}
-
-		// Binary validation (spec §6): the operation's effect on the FINAL balance
-		// is its amount, wherever it lands on the timeline.
-		if side, shortfall, bad := violates(balance+op.Amount, minBalance, maxBalance); bad {
-			return p.reject(ctx, tx, op, externalID, side, shortfall)
-		}
-		return p.accept(ctx, tx, op, version)
+		return p.processSingleTx(ctx, tx, op)
 	})
+}
+
+// processSingleTx decides one single operation inside the caller's transaction,
+// implementing spec §8.2 with all three guards of §7.2 verbatim, each
+// rowcount-checked. On accept it flips the operation to CONFIRMED (Guard 2),
+// applies the amount to the account under the version CAS (Guard 3), updates the
+// daily snapshots, and notifies the outcome. On reject it flips the operation to
+// INVALID with the machine-readable reason (Guard 2) and notifies — no balance
+// change. Any guard miss returns errGuardMiss, which rolls the (possibly batched)
+// transaction back.
+func (p *Processor) processSingleTx(ctx context.Context, tx pgx.Tx, op pendingOp) error {
+	// Guard 1: lease fence.
+	var fenced int
+	err := tx.QueryRow(ctx, guardLeaseFence, p.lease.Owner()).Scan(&fenced)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return errGuardMiss
+	}
+	if err != nil {
+		return fmt.Errorf("guard 1 (lease fence): %w", err)
+	}
+
+	// Read the account for validation and the version to CAS on.
+	var (
+		balance    int64
+		version    int64
+		minBalance *int64
+		maxBalance *int64
+		externalID string
+	)
+	if err := tx.QueryRow(ctx, selectAccount, op.AccountID).
+		Scan(&balance, &version, &minBalance, &maxBalance, &externalID); err != nil {
+		return fmt.Errorf("read account %d: %w", op.AccountID, err)
+	}
+
+	// Test seam: inject a concurrent account mutation to exercise Guard 3.
+	if p.afterAccountRead != nil {
+		p.afterAccountRead()
+	}
+
+	// Binary validation (spec §6): the operation's effect on the FINAL balance
+	// is its amount, wherever it lands on the timeline.
+	if side, shortfall, bad := violates(balance+op.Amount, minBalance, maxBalance); bad {
+		return p.reject(ctx, tx, op, externalID, side, shortfall)
+	}
+	return p.accept(ctx, tx, op, version)
 }
 
 func (p *Processor) accept(ctx context.Context, tx pgx.Tx, op pendingOp, version int64) error {

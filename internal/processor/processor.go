@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/magnomp/balancedb/internal/db"
 	"github.com/magnomp/balancedb/internal/lease"
 	"github.com/magnomp/balancedb/internal/model"
 )
@@ -28,13 +30,14 @@ var errGuardMiss = errors.New("processor: guard miss")
 const (
 	selectConfig = `SELECT lease_ttl_ms, loop_interval_ms, batch_size, max_group_size, api_max_wait_ms FROM config`
 
-	// Singles only for M5: group legs (transaction_id NOT NULL) are left PENDING
-	// for M6, which adds process_group and the full spec §8.1 dispatch. Ordered by
-	// id — the work index idx_ops_work is on (id) WHERE status='PENDING'. Ordering
-	// is taken only from here (G3), never from doorbell arrival.
-	fetchPendingSingles = `SELECT id, account_id, amount, effective_at
+	// The full spec §8.1 work select: every PENDING operation — singles and group
+	// legs alike — ordered by id (the work index idx_ops_work is on (id) WHERE
+	// status='PENDING'). transaction_id NULL marks a single; otherwise the row is a
+	// group leg and the group is decided at its FIRST leg by id, later legs skipped
+	// by status. Ordering is taken only from here (G3), never from doorbell arrival.
+	fetchPendingWork = `SELECT id, account_id, amount, effective_at, transaction_id
   FROM operations
- WHERE status = 'PENDING' AND transaction_id IS NULL
+ WHERE status = 'PENDING'
  ORDER BY id
  LIMIT $1`
 
@@ -53,6 +56,16 @@ type pendingOp struct {
 	EffectiveAt time.Time
 }
 
+// workRow is one PENDING operation as the §8.1 dispatcher sees it. TransactionID
+// is nil for a single and set for a group leg.
+type workRow struct {
+	ID            int64
+	AccountID     int64
+	Amount        int64
+	EffectiveAt   time.Time
+	TransactionID *int64
+}
+
 // Processor is one cell's decision engine. It owns a pgx pool, the leader lease,
 // and a dedicated doorbell listen connection. It is single-threaded: Run drives
 // everything; nothing here is safe for concurrent use.
@@ -67,9 +80,9 @@ type Processor struct {
 
 	// Test seams; always nil in production.
 	//
-	// afterAccountRead runs inside processSingle between the account read and Guard
-	// 3, letting a test commit a concurrent account mutation to exercise the
-	// version-CAS miss path deterministically.
+	// afterAccountRead runs between the account read and the Guard 3 CAS in both the
+	// single and the group path, letting a test commit a concurrent account mutation
+	// to exercise the version-CAS miss path deterministically.
 	afterAccountRead func()
 	// enteredIdleWait fires once the leader has armed its listener and is about to
 	// block on the doorbell, so a timing test can insert without racing the listen
@@ -158,52 +171,87 @@ func (p *Processor) Run(ctx context.Context) error {
 	}
 }
 
-// drain fetches PENDING singles ordered by id and decides each in its own
-// transaction, repeating until a select returns nothing (spec §8.1). A guard miss
-// (or any error) stops the drain and bubbles up so Run re-acquires the lease; the
-// undecided work is simply re-selected next cycle.
-func (p *Processor) drain(ctx context.Context, chunk int) error {
-	if chunk <= 0 {
-		chunk = 1
+// drain fetches PENDING work ordered by id and decides it in batches, repeating
+// until a select returns nothing (spec §8.1). Each batch is one DB transaction
+// packing up to batchSize operations' worth of decisions (spec §8.5). A guard miss
+// (or any error) rolls the whole batch back and bubbles up so Run re-acquires the
+// lease; the undecided work is simply re-selected next cycle — idempotent by
+// construction (the Guard 2 conditional flips make reprocessing a no-op on already
+// decided rows).
+func (p *Processor) drain(ctx context.Context, batchSize int) error {
+	if batchSize <= 0 {
+		batchSize = 1
 	}
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		ops, err := p.fetchPending(ctx, chunk)
+		work, err := p.fetchPending(ctx, batchSize)
 		if err != nil {
 			return err
 		}
-		if len(ops) == 0 {
+		if len(work) == 0 {
 			return nil
 		}
-		for _, op := range ops {
-			if err := p.processSingle(ctx, op); err != nil {
-				return err
-			}
+		if err := p.processBatch(ctx, work); err != nil {
+			return err
 		}
 	}
 }
 
-func (p *Processor) fetchPending(ctx context.Context, chunk int) ([]pendingOp, error) {
-	rows, err := p.pool.Query(ctx, fetchPendingSingles, chunk)
+// processBatch decides one batch of work in a single transaction (spec §8.5). It
+// dispatches per spec §8.1: a single is decided by processSingleTx; a group leg
+// triggers processGroupTx for the whole group at its first leg by id, and later
+// legs of that group are skipped (both in-batch, via the decided set, and across
+// batches, because a decided group's legs are no longer PENDING). Guards are
+// evaluated per decision; any guard miss returns errGuardMiss, which db.WithTx
+// turns into a whole-batch rollback.
+func (p *Processor) processBatch(ctx context.Context, work []workRow) error {
+	return db.WithTx(ctx, p.pool, func(tx pgx.Tx) error {
+		decided := make(map[int64]bool)
+		for _, w := range work {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if w.TransactionID == nil {
+				op := pendingOp{ID: w.ID, AccountID: w.AccountID, Amount: w.Amount, EffectiveAt: w.EffectiveAt}
+				if err := p.processSingleTx(ctx, tx, op); err != nil {
+					return err
+				}
+				continue
+			}
+			txID := *w.TransactionID
+			if decided[txID] {
+				continue // a later leg of a group already decided in this batch
+			}
+			if err := p.processGroupTx(ctx, tx, txID); err != nil {
+				return err
+			}
+			decided[txID] = true
+		}
+		return nil
+	})
+}
+
+func (p *Processor) fetchPending(ctx context.Context, batchSize int) ([]workRow, error) {
+	rows, err := p.pool.Query(ctx, fetchPendingWork, batchSize)
 	if err != nil {
-		return nil, fmt.Errorf("fetch pending singles: %w", err)
+		return nil, fmt.Errorf("fetch pending work: %w", err)
 	}
 	defer rows.Close()
 
-	var ops []pendingOp
+	var work []workRow
 	for rows.Next() {
-		var op pendingOp
-		if err := rows.Scan(&op.ID, &op.AccountID, &op.Amount, &op.EffectiveAt); err != nil {
-			return nil, fmt.Errorf("scan pending single: %w", err)
+		var w workRow
+		if err := rows.Scan(&w.ID, &w.AccountID, &w.Amount, &w.EffectiveAt, &w.TransactionID); err != nil {
+			return nil, fmt.Errorf("scan pending work: %w", err)
 		}
-		ops = append(ops, op)
+		work = append(work, w)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate pending singles: %w", err)
+		return nil, fmt.Errorf("iterate pending work: %w", err)
 	}
-	return ops, nil
+	return work, nil
 }
 
 func (p *Processor) readConfig(ctx context.Context) (model.Config, error) {

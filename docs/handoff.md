@@ -342,3 +342,82 @@ Notes for next agents (M6):
   up to `batch_size` decisions per tx with guards per decision — extend `drain`.
 - `snapshot.Apply` is leg-agnostic; call it once per confirmed leg inside the group tx.
 - CLAUDE.md package map: `processor` → **built (M5)**, `snapshot` → **built**.
+
+## M6 — 2026-08-22
+
+Built:
+- `internal/processor` groups + batching (now fully **built**):
+  - Restored the full spec §8.1 work select — `fetchPendingWork` selects every
+    PENDING operation (singles and group legs) `ORDER BY id LIMIT batch_size`. This
+    fixes the M5 note: interleaving singles ahead of an earlier-registered group can
+    no longer break G3.
+  - `internal/processor/group.go` — `processGroupTx` (spec §8.3): Guard 1 fence,
+    read the transaction row (op_count + status for skip-by-status), load all legs by
+    transaction_id, cross-check `len(legs) == op_count`, net per account, read/validate
+    every involved account in ascending id order (first violation rejects, naming that
+    account + shortfall), then all-or-nothing — Guard 2 flips all legs + the tx row
+    (rowcount checks: legs == leg count, tx == 1), Guard 3 per involved account with
+    its net, `snapshot.Apply` per leg, `NOTIFY outcomes 'tx:<id>'`. A group is decided
+    at its first leg by id; later legs are skipped (in-batch via a `decided` set,
+    across batches because a decided group's legs are no longer PENDING).
+  - Batching (spec §8.5): `drain` → `processBatch` packs one batch (`LIMIT batch_size`
+    ops' worth of decisions) into a single `db.WithTx`; guards run per decision; any
+    miss rolls back the whole batch and `drain` bubbles `errGuardMiss` so `Run`
+    re-acquires and reprocesses — idempotent by construction (Guard 2 conditional
+    flips no-op on decided rows).
+  - Refactor: `processSingle`/`processGroup` are thin `db.WithTx` wrappers over
+    `processSingleTx`/`processGroupTx`, so the guarded body runs either standalone
+    (single-decision, used by the itests) or inside the shared batch tx. The
+    `afterAccountRead` seam now fires in the group path too.
+- `internal/processor/group_itest_test.go` (tag `itest`): multi-account commit,
+  one-leg-fails whole-group reject (offending account + shortfall), net-per-account,
+  skip-by-status, group Guard 1 / Guard 3 misses, mixed single/group batch, and
+  whole-batch rollback + idempotent reprocess on a guard miss.
+- `simtest/` groups in the reference model (pure): `decideGroup` (net per account,
+  all-or-nothing, first offending account by ascending id — matches the processor),
+  `ProcessNext`/`ProcessAll` decide singles and groups in strict registration order,
+  `CheckG2`; `refAccount` gained `ExternalID`. Pure property tests in
+  `simtest/group_test.go`.
+- `simtest/sim_db_test.go` (build tag `simtest`): the DB-backed simulation — drives
+  the real processor over a throwaway schema and asserts the DB against the reference
+  model. `TestSimGroupsBatchedMatchReference` (large batches → G1/G2/G3 match) and
+  `TestSimBatchCrashEqualsSequential` (crash the processor mid-flight via ctx cancel,
+  restart, then finish → final state == sequential reference). G2 is checked with
+  invariant queries at every restart boundary.
+- `Makefile`: added the `make simtest` target (`go test -tags simtest ./simtest/...`,
+  requires `TEST_DATABASE_URL`).
+
+Decisions (no new ADR — all within milestone scope / existing ADRs):
+- **Guards per decision within a batch.** `now()` is fixed within a Postgres tx, so
+  Guard 1 is logically once-per-batch, but the task/spec §8.5 call for guards per
+  decision and it keeps `processSingleTx`/`processGroupTx` individually complete and
+  reusable — kept the fence in each. Guard 3 (the version CAS) is genuinely
+  per-account and is what makes whole-batch rollback safe.
+- **Group Guard 3 applies to every involved account, including net 0** (bumps
+  version uniformly). Simpler and uniformly race-safe; a spurious retry is harmless.
+- **Offending account = smallest involved account_id that violates.** Deterministic
+  tie-break shared by the processor (accounts read `ORDER BY id`, first violation) and
+  the reference model, so G3 comparison is exact.
+- **Batch-crash test uses ctx-cancel + restart** rather than a commit seam: cancelling
+  during `db.WithTx` rolls back the open batch (a real mid-batch crash) using only the
+  exported `processor.New`/`Run`. No test-only public API added.
+- **`make simtest` is DB-backed** (tag `simtest`, requires `TEST_DATABASE_URL`). The
+  pure reference-model property tests still run under `make test`; `-tags simtest`
+  additionally compiles the DB simulation. This is the M10 harness seed, scoped to M6.
+
+Deferred/known issues:
+- `op_count` mismatch in a group is treated as a hard error (not `errGuardMiss`); it
+  is unreachable in practice (groups insert atomically, spec §10.1) and would loop if
+  it ever happened. Left as a loud failure rather than swallowed. Not a blocker.
+- `make simtest` runs ~25s (20 batched seeds + 8 crash-churn seeds). Fine for now;
+  M10 will parallelize / tune when it scales to 1,000+ scenarios.
+
+Notes for next agents:
+- CLAUDE.md package map: `processor` → **built**.
+- The DB simulation relies on **id alignment** between the reference model and the
+  DB: accounts are created in identical order (before any ops) and inserts happen in
+  lockstep, so identity ids match and outcomes can be compared row for row. Keep that
+  invariant if you extend the harness (M10) — or compare by a stable key instead.
+- The reference model's group rejection picks the offending account by ascending
+  account_id; if a future spec change redefines the tie-break, change both sides
+  together or G3 comparison breaks.

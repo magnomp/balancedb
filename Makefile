@@ -7,7 +7,7 @@ GOFUMPT ?= gofumpt
 # Package list, computed once.
 PKGS := ./...
 
-.PHONY: all lint test itest tools fmt check-docs
+.PHONY: all lint test itest simtest tools fmt check-docs
 
 all: lint test
 
@@ -54,6 +54,18 @@ itest:
 		exit 1; \
 	fi
 	$(GO) test -tags itest $(PKGS)
+
+## simtest: deterministic simulation harness (spec §15). The reference-model
+## property tests are pure; the DB-backed simulation (build tag `simtest`) drives the
+## real processor over a throwaway schema and asserts the database against the
+## reference model, so it requires TEST_DATABASE_URL. Grows milestone by milestone
+## (M6 covers groups + batching; M10 is the full harness).
+simtest:
+	@if [ -z "$(TEST_DATABASE_URL)" ]; then \
+		echo "simtest: TEST_DATABASE_URL is required (e.g. postgres://user:pass@host:5432/db?sslmode=disable)"; \
+		exit 1; \
+	fi
+	$(GO) test -tags simtest ./simtest/...
 
 ## tools: install pinned dev tooling into GOBIN.
 tools:
