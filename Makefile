@@ -7,7 +7,7 @@ GOFUMPT ?= gofumpt
 # Package list, computed once.
 PKGS := ./...
 
-.PHONY: all lint test itest simtest tools fmt check-docs
+.PHONY: all lint test itest simtest tools fmt check-docs openapi openapi-gen
 
 all: lint test
 
@@ -66,6 +66,36 @@ simtest:
 		exit 1; \
 	fi
 	$(GO) test -tags simtest ./simtest/...
+
+## openapi-gen: (re)generate the committed contract from the code (ADR-0003).
+## The server is the authority; this writes its OpenAPI 3.1 document to
+## api/openapi.yaml. No database needed.
+openapi-gen:
+	$(GO) run ./cmd/openapigen -o api/openapi.yaml
+
+## openapi: regenerate api/openapi.yaml, fail if it drifts from the committed
+## copy (CI diff gate), then run an oasdiff breaking-change check against the
+## previously committed spec. oasdiff is optional: if it is not installed the
+## breaking-change check is skipped with a clear message (it belongs in CI).
+openapi: openapi-gen
+	@if ! git diff --quiet -- api/openapi.yaml; then \
+		echo "openapi: api/openapi.yaml is out of date — it was regenerated from the code."; \
+		echo "        Commit the regenerated file (ADR-0003: the spec is a committed artifact)."; \
+		git --no-pager diff -- api/openapi.yaml; \
+		exit 1; \
+	fi
+	@echo "openapi: api/openapi.yaml is up to date."
+	@if command -v oasdiff >/dev/null 2>&1; then \
+		if git cat-file -e HEAD:api/openapi.yaml 2>/dev/null; then \
+			git show HEAD:api/openapi.yaml > /tmp/balancedb-openapi-base.yaml; \
+			echo "openapi: checking for breaking changes vs HEAD..."; \
+			oasdiff breaking /tmp/balancedb-openapi-base.yaml api/openapi.yaml; \
+		else \
+			echo "openapi: no committed baseline yet — skipping breaking-change check."; \
+		fi; \
+	else \
+		echo "openapi: oasdiff not installed — skipping breaking-change check (runs in CI)."; \
+	fi
 
 ## tools: install pinned dev tooling into GOBIN.
 tools:
