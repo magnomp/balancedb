@@ -209,3 +209,53 @@ Notes for next agents:
   before the DB sees them; SQL casts the key with `$n::uuid`.
 - `simtest` imports `internal/api` for the shared request/result types; M10 will feed
   the same `api.InsertRequest` schedules to both the DB and the reference model.
+
+## M4 — 2026-08-22
+
+Built:
+- `internal/lease` (now **built**): the spec §7.1 leader lease. `New(db)` generates a
+  boot UUID (crypto/rand v4, no new dependency). `Acquire(ctx, ttl)` runs the spec's
+  single-UPDATE acquire/renew verbatim (`owner=:me OR owner IS NULL OR lease_until <
+  now()`), returning whether this instance leads the cycle; `RowsAffected()==1` is the
+  leader test. `IsLeader()` returns the cached result of the last Acquire — no
+  background goroutine, the caller's loop is the heartbeat (plan §M4). `Release(ctx)`
+  clears ownership only `WHERE owner=:me` (never stomps a new leader) and marks the
+  instance non-leader. `Owner()` exposes the UUID for logging.
+- All lease/expiry comparisons run in SQL against `now()` (DB clock). TTL is passed in
+  as a `time.Duration` and sent as milliseconds (`ttl.Milliseconds()`); the expiry is
+  computed as `now() + ($2 * interval '1 millisecond')` inside the UPDATE. No
+  `time.Now()` anywhere in the package. The caller reads `config.lease_ttl_ms` and
+  passes it in (per the M4 constraint; the config read is the processor's job in M5).
+- SQL is `const` beside its single call site, unqualified (search_path owns the
+  schema). The lease takes a minimal unexported `execer` interface (just `Exec`), which
+  `*pgxpool.Pool` satisfies — the lease is autocommit, deliberately not transactional
+  (arbitrated by the row, not a connection).
+- `internal/lease/lease_itest_test.go` (build tag `itest`, via `dbtest.NewSchema`):
+  every plan §M4 "Done when" case — empty lease acquired, held lease renewed
+  (lease_until extended), foreign unexpired lease NOT acquired, expired foreign lease
+  taken over, graceful release (owner cleared + immediate takeover), plus
+  release-does-not-stomp-a-new-leader, and the 100-round two-instance
+  mutual-exclusion loop (never both leaders, exactly one each round, IsLeader agrees
+  with Acquire).
+
+Decisions: no ADRs. No deviation from spec/plan. No new dependencies (UUID via
+crypto/rand, not google/uuid). `owner` is passed as a string cast `$1::uuid`, matching
+the M3 insertion convention.
+
+Deferred/known issues:
+- The two competing instances in the mutual-exclusion test share one pool (each Lease
+  has its own owner UUID); the DB row is the arbiter, so this faithfully tests
+  exclusion without a second pool. If a future test wants genuinely separate pools on
+  one schema, `dbtest` would need a NewSchema variant that also returns the schema
+  name — not needed for M4.
+
+Notes for next agents (M5, processor loop):
+- The loop owns the heartbeat: read the `config` row (lease_ttl_ms, loop_interval_ms)
+  each cycle, call `lease.Acquire(ctx, ttl)`, and only process when it returns true.
+  Call `lease.Release(ctx)` on graceful shutdown before exit.
+- Guard 1 (the in-transaction lease fence, spec §7.2) is a SEPARATE `SELECT 1 FROM
+  leader_lease WHERE owner=:me AND lease_until > now()` inside each processing tx — it
+  is NOT `lease.Acquire`. The lease package covers only §7.1 (the loop-level
+  acquire/renew/release); M5 writes the fence against the same `owner` value
+  (`lease.Owner()`).
+- CLAUDE.md package map line for `lease` flipped `(M4)` → **built**.
