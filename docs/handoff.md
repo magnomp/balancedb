@@ -510,3 +510,71 @@ Notes for next agents (M8):
 - Any change to an `internal/api` request/response struct changes the contract:
   run `make openapi` and commit the regenerated `api/openapi.yaml` in the same
   change (the diff gate enforces it).
+
+## M8 — 2026-08-22
+
+Built:
+- `internal/notify` (now **built**): the outcome fan-out half of ADR-0002. `New`
+  builds a `Notifier`; `Run(ctx)` holds one dedicated `LISTEN outcomes` connection
+  per API process and demultiplexes each `op:<id>` / `tx:<id>` payload to the waiters
+  registered for that key. `Register(key)` returns a size-1 buffered signal channel
+  (coalesced; the dispatcher never blocks) plus an unregister func. On any connection
+  failure `Run` reconnects-with-resubscribe: the in-memory registry is untouched, only
+  `LISTEN` is re-issued — notifications lost during the gap are the API poll path's
+  job (NOTIFY is a hint, correctness is the poll). `BackendPID()` exposes the listen
+  backend (M9 metrics + tests). Depends only on pgxpool — no cycle with `api`.
+- `internal/api` synchronous wait (now fully **built**): replaced M7's stubbed
+  `wait_ms>0` inside the existing `createTransaction`. New `wait.go`:
+  `waitForOutcome` registers the waiter BEFORE one immediate status check (closes the
+  decided-before-registration race), then `select`s over the deciding NOTIFY, a
+  status-poll ticker (`defaultPollInterval` 1s; the durability fallback), and the
+  deadline. Budget = `min(wait_ms, api_max_wait_ms)` read from the config row per
+  request. Outcome → 200 with decided status; expiry → 202 with current state.
+  `wait_ms<=0` is unchanged fire-and-forget (202) and never calls the notifier.
+- Wiring: `NewServer(pool, resolver, notifier)` gained the notifier param (an
+  `outcomeWaiter` interface — nil = poll-only, used by `cmd/openapigen`). `runAPI`
+  in `cmd/balancedb` starts one `notify.Notifier` per api process in a goroutine.
+- `api/openapi.yaml` regenerated: description-only changes (endpoint + `wait_ms`
+  field); no shape change (see Decisions). CLAUDE.md map: `api` and `notify` → **built**.
+- itests: `internal/notify` (delivery, reconnect-with-resubscribe after the listen
+  backend is terminated, key-scoped dispatch, coalescing); `internal/api`
+  (`wait_itest_test.go`: decided-before-registration, expiry→202+PENDING, cap by
+  api_max_wait_ms, poll fallback after the listen backend is killed with reconnect
+  held off so only the poll resolves, wait_ms=0 registers no waiter) and
+  `wait_e2e_itest_test.go` (external `package api_test`: real processor + real
+  notifier, `loop_interval=10s`, synchronous insert resolved in ~25 ms → proves the
+  doorbell+notify fast path, not a timed fallback).
+
+Decisions (no new ADR — implements ADR-0002 as planned; reconciles a Huma detail):
+- **200/202 via runtime status override, contract unchanged.** Huma reads the
+  output struct's special `Status int` field to set the response code at runtime but
+  (v2.39.1) does NOT register it as an extra response — so the OpenAPI still declares
+  only 202 for `POST /transactions`. The task required "no shape change, only
+  descriptions"; this delivers exactly that. NB: because the `Status` field now
+  exists on `CreateTransactionOutput`, every return path MUST set it explicitly
+  (0 would emit HTTP 0) — the fire-and-forget path sets 202.
+- **Poll interval is a fixed 1s default with an unexported `Server.pollInterval`
+  test seam** (mirrors the existing `afterAccountRead`/`afterLimitsRead` seams).
+  Not a config knob: spec §10.1 pins 1–2 s and it is a durability fallback, not a
+  behavioral tuning surface.
+- **`outcomeWaiter` interface in `api`, not a hard dep on `notify`.** Keeps `api`
+  decoupled (it still imports no notify) and lets the wait tests use a fake. A nil
+  notifier degrades cleanly to poll-only.
+- **Notify test shortcut:** the api wait itests flip op status directly (past the
+  processor guards) because they test the API wait *mechanics*, not the decision
+  engine; the end-to-end test uses the real processor.
+
+Deferred/known issues:
+- The `outcomes` channel is global (per-database, like the doorbell): a Notifier may
+  receive another cell's payloads sharing the DB — harmless (dispatched to zero local
+  waiters). Same latent cross-cell wakeup noted for the doorbell in M3/M5; if ever
+  scoped, scope both channels together (needs the processor NOTIFY side too).
+- On request-context cancellation mid-wait the handler returns `ctx.Err()` (→ 500-ish
+  via Huma). Fine for a disconnected client / shutdown; not worth a special code.
+
+Notes for next agents (M9 observability):
+- `Notifier.BackendPID()` is already exported for metrics. ADR-0002 asks M9 to
+  measure doorbell wakeup lag and NOTIFY→outcome lag — the wait path in `wait.go` is
+  the natural place to time register→resolve, and `notify.Run` for reconnect counts.
+- The wait path reads `api_max_wait_ms` once per waiting request (`selectAPIMaxWait`);
+  if M9 adds a cached/observed config read, route it through there too.
