@@ -87,3 +87,61 @@ Notes for next agents:
   `TEST_DATABASE_URL`).
 - Gates green: `make lint` (incl. `check-docs`), `make test`. PATH bootstrap from
   the M1 note above still applies on this box.
+
+## M2 — 2026-08-22
+
+Built:
+- `migrations/0001_init.sql` — full spec §5.2 DDL verbatim (accounts, transactions,
+  operations, balance_snapshots, leader_lease, config, all indexes) + seed rows for
+  `leader_lease` and `config` (`INSERT ... ON CONFLICT DO NOTHING`; column defaults
+  fill every behavioral value — no env-seeding needed, there are no env vars for the
+  config-table knobs). Unqualified names; the runner sets `search_path` first.
+- `migrations/` asset package (`migrations.go`, `package migrations`, `//go:embed
+  *.sql` → `migrations.FS`). See note below on why the embed lives here.
+- `internal/migrate` — the runner (`Run(ctx, databaseURL, schema) (applied []int,
+  err error)`): dedicated connection → set search_path → advisory lock → CREATE
+  SCHEMA → per-schema `schema_migrations` → apply each pending embedded migration in
+  its own tx (recording the version in the same tx). Returns versions applied this
+  call (empty on a no-op boot). Unit test covers filename parsing/ordering (no DB).
+- `internal/dbtest` — the throwaway-schema integration harness used by every later
+  milestone: `URL(t)` (skip if `TEST_DATABASE_URL` unset), `RandomSchema(t)`,
+  `NewSchema(t) *pgxpool.Pool` (fresh migrated schema, auto drop+close via
+  `t.Cleanup`), `DropSchema(ctx, url, schema)`. Normal (untagged) package so `make
+  lint` vets it.
+- `internal/migrate/migrate_itest_test.go` (build tag `itest`) — creates-objects +
+  idempotent-second-boot, parallel-migrators race (8 goroutines, exactly-once
+  apply), two-schemas-one-database independence.
+- `cmd/balancedb/main.go` — migrations wired into boot: `migrate` role always runs
+  them then exits; `api`/`processor` run them on boot unless
+  `BALANCEDB_MIGRATE_ON_START=false`. Runner uses its own connection, so it runs
+  before the app pool is built.
+- `Makefile` — real `itest` target: requires `TEST_DATABASE_URL` (fails fast if
+  unset), runs `go test -tags itest ./...`. `make test` stays DB-free (integration
+  files are behind the `itest` tag).
+
+Decisions:
+- **ADR-0004** — reordered plan §M2 steps 2/3: take the advisory lock BEFORE
+  `CREATE SCHEMA`. `CREATE SCHEMA IF NOT EXISTS` is not concurrency-safe in Postgres
+  (racing boots → 23505 on `pg_namespace_nspname_index`); the lock exists precisely
+  to serialize concurrent boots, so schema creation must sit inside it. The lock key
+  is the schema *name* (a string) and needs no schema object, so lock-first is
+  sound. Caught by the parallel-migrator test before the fix. No G1–G6 impact.
+- No new dependencies. The race test uses `sync.WaitGroup` (not
+  `golang.org/x/sync/errgroup`, which plan §M2 mentions only illustratively) to
+  avoid adding a dependency.
+
+Deferred/known issues:
+- None blocking. `make simtest` still absent (M10).
+
+Notes for next agents:
+- **go:embed placement.** go:embed cannot reach across directories (`../migrations`),
+  so the repo-root `migrations/` dir (per plan §0 layout) carries its own tiny
+  `package migrations` with `//go:embed *.sql`; `internal/migrate` imports it. This
+  keeps migrations at the root as diagrammed while embedding cleanly. To add a
+  migration: drop `NNNN_name.sql` into `migrations/` (numeric prefix, unique,
+  positive, unqualified SQL) — the runner discovers and orders it automatically.
+- **Use `dbtest.NewSchema(t)`** for any DB-touching test from M3 on; put such files
+  behind `//go:build itest` so `make test` stays DB-free and `make itest` runs them.
+- The `migrate` runner opens its own connection and does NOT touch the app pool, so
+  it is safe to call before `db.Connect`. It is safe to call concurrently.
+- `migrate` package map line in CLAUDE.md flipped `(M2)` → **built**.

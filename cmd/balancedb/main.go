@@ -15,6 +15,7 @@ import (
 
 	"github.com/magnomp/balancedb/internal/config"
 	"github.com/magnomp/balancedb/internal/db"
+	"github.com/magnomp/balancedb/internal/migrate"
 )
 
 func main() {
@@ -59,6 +60,26 @@ func run() error {
 		"migrate_on_start", cfg.MigrateOnStart,
 	)
 
+	// Migrations: the migrate role always runs them; api and processor run them
+	// on boot unless BALANCEDB_MIGRATE_ON_START=false (an explicit migrate gate,
+	// plan §0/§M2). The runner opens its own dedicated connection, so it runs
+	// before the app pool is built.
+	if role == config.RoleMigrate || cfg.MigrateOnStart {
+		logger.Info("running migrations", "schema", cfg.Schema)
+		applied, err := migrate.Run(ctx, cfg.DatabaseURL, cfg.Schema)
+		if err != nil {
+			return fmt.Errorf("migrate: %w", err)
+		}
+		logger.Info("migrations up to date", "schema", cfg.Schema, "applied", applied)
+	} else {
+		logger.Info("skipping migrations on start (BALANCEDB_MIGRATE_ON_START=false)")
+	}
+
+	if role == config.RoleMigrate {
+		logger.Info("migrate role complete")
+		return nil
+	}
+
 	pool, err := db.Connect(ctx, cfg.DatabaseURL, cfg.Schema, cfg.PoolMaxConns)
 	if err != nil {
 		return err
@@ -66,17 +87,11 @@ func run() error {
 	defer pool.Close()
 	logger.Info("database connected", "schema", cfg.Schema)
 
-	switch role {
-	case config.RoleMigrate:
-		// Migration runner arrives in M2; for now the role boots and exits.
-		logger.Info("migrate role: no migrations wired yet (M2)")
-	case config.RoleAPI, config.RoleProcessor:
-		// The HTTP server (M7) and processor loop (M5) are not built yet.
-		// Boot, hold until a shutdown signal, then exit cleanly so the
-		// lifecycle wiring is exercised from day one (plan §M1).
-		logger.Info("running; awaiting shutdown signal", "role", string(role))
-		<-ctx.Done()
-	}
+	// The HTTP server (M7) and processor loop (M5) are not built yet. Boot, hold
+	// until a shutdown signal, then exit cleanly so the lifecycle wiring is
+	// exercised from day one (plan §M1).
+	logger.Info("running; awaiting shutdown signal", "role", string(role))
+	<-ctx.Done()
 
 	logger.Info("shutting down", "role", string(role))
 	return nil

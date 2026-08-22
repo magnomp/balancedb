@@ -45,14 +45,15 @@ check-docs:
 test:
 	$(GO) test $(PKGS)
 
-## itest: integration tests against TEST_DATABASE_URL. Stub until M2 wires
-## the throwaway-schema harness; real integration tests arrive with migrations.
+## itest: integration tests against TEST_DATABASE_URL. Each test self-isolates
+## in a throwaway schema (internal/dbtest). Files are behind the `itest` build
+## tag, so `make test` never touches the database.
 itest:
 	@if [ -z "$(TEST_DATABASE_URL)" ]; then \
-		echo "itest: TEST_DATABASE_URL not set — skipping (no integration tests yet, M2)"; \
-	else \
-		echo "itest: no integration tests defined yet (M2)"; \
+		echo "itest: TEST_DATABASE_URL is required (e.g. postgres://user:pass@host:5432/db?sslmode=disable)"; \
+		exit 1; \
 	fi
+	$(GO) test -tags itest $(PKGS)
 
 ## tools: install pinned dev tooling into GOBIN.
 tools:
