@@ -25,3 +25,6 @@ explains it, that is a bug in either the code or the log.
   server is the authority; the committed spec is derived from real types.
 - [0004 — Advisory lock before CREATE SCHEMA](0004-advisory-lock-before-create-schema.md)
   — reorder plan §M2 steps 2/3 so schema creation is inside the boot lock.
+- [0005 — Insertion idempotency and doorbell](0005-insertion-idempotency-and-doorbell.md)
+  — `ON CONFLICT DO NOTHING` probe-and-insert (no tx poisoning); doorbell rings on
+  fresh inserts only.

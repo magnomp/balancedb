@@ -80,11 +80,11 @@ Packages marked *(Mn)* are not built yet — the map is the stable target.
 - `config` — env parsing + validation of `BALANCEDB_*` (plan §0). **built**
 - `db` — pgxpool, `search_path` per connection, ping-on-boot, `WithTx` (plan §0). **built**
 - `migrate` — embedded migrations + purpose-built runner (spec §5.2, ADR-0001). **built**
-- `model` — row types, status enums, reason codes, the one amount helper (spec §5). *(M3)*
+- `model` — row types, status enums, reason codes, the one amount helper, payload hashing (spec §5). **built**
 - `lease` — leader lease acquire/renew/release (spec §7.1). *(M4)*
 - `processor` — main loop, single/group processing, the three guards, batching (spec §7–§8). *(M5–M6)*
 - `snapshot` — snapshot upsert + cascade update (spec §8.4). *(M5)*
-- `api` — HTTP handlers: insertion, waiting, queries (Huma, spec §10, ADR-0003). *(M7–M8)*
+- `api` — insertion core (`Insert` over a `pgx.Tx`, spec §10.1) **built (M3)**; HTTP handlers: waiting, queries (Huma, spec §10, ADR-0003) *(M7–M8)*.
 - `notify` — LISTEN/NOTIFY: work doorbell + outcome fan-out (spec §11, ADR-0002). *(M3/M5/M8)*
 - `obs` — metrics registry, health endpoints (spec §13). *(M9)*
 
