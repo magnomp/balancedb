@@ -62,7 +62,9 @@ you do.
 - `make itest` — integration tests against **`TEST_DATABASE_URL`**; each test
   self-isolates in a throwaway schema. *(Stub until M2 lands the migration/schema
   harness.)*
-- `make simtest` — deterministic simulation harness (spec §15). *(Arrives in M10.)*
+- `make simtest` — deterministic simulation harness (spec §15): 1,000+ seeded
+  scenarios, in-memory breadth + DB-backed fidelity with fault injection (ADR-0006).
+  Requires `TEST_DATABASE_URL`.
 - `make openapi` — regenerate `api/openapi.yaml` from the code (server is the
   authority, ADR-0003), fail on drift, and run the `oasdiff` breaking-change check
   (skipped gracefully when `oasdiff` is absent). Run it after any `internal/api`
