@@ -28,3 +28,7 @@ explains it, that is a bug in either the code or the log.
 - [0005 — Insertion idempotency and doorbell](0005-insertion-idempotency-and-doorbell.md)
   — `ON CONFLICT DO NOTHING` probe-and-insert (no tx poisoning); doorbell rings on
   fresh inserts only.
+- [0006 — Deterministic simulation harness design](0006-simulation-harness-design.md)
+  — two-tier harness (breadth in-memory / fidelity DB-backed), reference→DB id map,
+  zombie-leader via lease tampering, and the Guard-3 version-race stressor the
+  mutation smoke test uses.

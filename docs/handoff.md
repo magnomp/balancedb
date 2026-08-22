@@ -672,3 +672,69 @@ Notes for next agents:
   `api_wait_seconds` (~8 ms) from a synchronous insert. `/readyz` reported the
   processor's leader state.
 - Gates green: `make lint`, `make test`, `make itest`, and `make simtest` (~24 s).
+
+## M10 — 2026-08-22
+
+Built (deterministic simulation hardening; completes the spec §15 harness — see
+ADR-0006):
+- `simtest/generate.go` — the seeded full-scenario generator. `Generator` emits rounds
+  of `Action`s shaped by the current reference state: fresh singles/groups (2–4 legs,
+  mixed accounts, same-account multi-leg, non-zero-sum), reversals (double-reversals
+  arise because a confirmed reversal is itself an eligible target; reversal-after-reject
+  because a rejected reversal frees its original), state-aware limit changes (always
+  bracket the confirmed balance, §6), and idempotent replays/payload conflicts.
+  Aggressive back/future-dating across 7 UTC days with midnight-boundary hits and
+  exact-timestamp ties. Fully seed-determined.
+- `simtest/reference.go` — refOp now carries EffectiveAt + ReversalOf; added
+  `Timeline` (G4 order), `CheckG6`, `confirmedReversalTargets`, and account/limit
+  snapshot helpers the generator reads.
+- `simtest/generate_test.go` — breadth tier (pure, runs under `make test` and
+  `make simtest`): `TestFullScenarioReference` sweeps **1,200 seeds** (env
+  `SIMTEST_SEEDS`) asserting G1/G2/G4/G6; `TestFullScenarioReproduces` asserts G3
+  reproducibility (same seed → identical decision sequence). ~1 s.
+- `simtest/sim_db_test.go` — rewritten around a `harness` with an explicit
+  reference→database **id map** (idempotent replays consume Postgres IDENTITY values
+  the reference does not, so raw ids no longer align — the map also translates a
+  reversal's reversal_of). `TestSimFullScenarioMatchReference` (full scenario, real
+  processor, asserts G1/G3/G6 + G4 timeline + snapshot-cascade invariant);
+  `TestSimBatchCrashEqualsSequential` (batch-boundary crashes).
+- `simtest/sim_faults_test.go` — `TestSimCompetingLeaders` (3 processors, short TTL,
+  kill/restart failover), `TestSimZombieLeader` (real processors + direct lease
+  expire/steal → stale-lease-write windows the guards must catch),
+  `TestSimVersionRaceGuard3` (out-of-band version bumps racing the processor —
+  the Guard-3 API-race stressor), `TestSimReversalConstraints` (one-live-reversal-
+  per-op + reversal-after-reject, N3).
+- `docs/decisions/0006-simulation-harness-design.md`; README "Simulation testing"
+  section incl. the one-time Guard-3 mutation smoke-test write-up; `simtest/doc.go`
+  updated.
+
+Decisions (ADR-0006): two-tier harness (breadth in-memory 1,000+ / fidelity
+DB-backed), reference→DB id map instead of id alignment, zombie-leader via lease
+tampering under real processors, and a dedicated Guard-3 version-race stressor.
+Env-overridable seed counts (`SIMTEST_SEEDS`, `SIMTEST_DB_SEEDS`,
+`SIMTEST_CRASH_SEEDS`, `SIMTEST_FAULT_SEEDS`, `SIMTEST_GUARD_SEEDS`).
+
+Mutation smoke test (one-time, done manually, documented in README): disabling
+Guard 3's rowcount check in `internal/processor/single.go` (`_ = tag`) makes
+`TestSimVersionRaceGuard3` fail immediately on every seed with a G1 balance
+divergence (a CONFIRMED op whose amount never reached the balance). Reverted; the
+committed tree keeps all three guard rowcount checks (verified `git diff` clean).
+
+Key finding for next agents:
+- **Pure leadership churn does NOT reliably catch a disabled Guard 3.** Guard 2 plus
+  the lowest-id-first work select already serialize same-operation work, so the
+  competing/zombie tests (correctness under failover) rarely open Guard 3's window.
+  Guard 3's spec'd job is arbitrating API races — the concurrent account-version write
+  between the processor's read and its CAS — which `TestSimVersionRaceGuard3`
+  reproduces directly. That is the mutation-catch vehicle; keep it if you refactor.
+- The reference↔DB id map must stay faithful: record every fresh insert's legs (and
+  the tx) in registration order. A new insert path that consumes ids differently, or
+  a new insert outcome, needs the map updated or the comparison silently breaks.
+- Limit changes are out-of-band (not registered operations), so a DB schedule must
+  apply them while drained (no in-flight decisions) to match the reference — the
+  full-scenario test applies all of a round's moves before draining for exactly this
+  reason.
+
+Gates green: `make lint`, `make test` (simtest breadth ~1.25 s), `make itest`, and
+`make simtest` (full, ~52 s: 1,200 breadth seeds + 40 reproducibility + 30 DB-backed
+fidelity seeds/cases across full-scenario/crash/competing/zombie/version-race/reversal).

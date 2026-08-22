@@ -111,3 +111,62 @@ The `Makefile` is the interface:
 
 This box has no toolchain on the default PATH; see `docs/handoff.md` for the
 bootstrap (`export PATH="$HOME/sdk/go/bin:$HOME/go/bin:$HOME/bin:$PATH"`).
+
+## Simulation testing (spec §15)
+
+The `simtest/` package is the deterministic simulation harness — the spec's declared
+first investment and the proof that the consistency contract G1–G6 holds. It runs in
+two tiers (ADR-0006):
+
+- **Breadth (in-memory, `make test` and `make simtest`).** A seeded generator drives
+  the full scenario space — tight/loose/one-sided/unbounded limits, singles, groups
+  (mixed sizes, same-account multi-leg, non-zero-sum), aggressive back/future-dating
+  with day crossings and exact-timestamp ties, reversals (double-reversals and
+  reversal-after-reject retries), state-aware limit changes, and idempotent
+  replays/conflicts — through the sequential reference model across **1,000+ seeds**
+  (default 1,200), asserting G1 (final balance within limits), G2 (no partially
+  applied group), G4 (timeline order total and unique), G6 (no duplicate rows), and G3
+  reproducibility (the same seed replays to an identical decision sequence).
+- **Fidelity (DB-backed, `make simtest`, build tag `simtest`).** The real processor
+  runs over throwaway schemas and the database is asserted equal to the reference
+  model — interleaved with fault injection: batch-boundary crashes, competing-leader
+  failover, zombie-leader stale-lease writes (the lease row is expired/stolen under
+  running processors; the guards must catch every stale write), and a Guard-3
+  version-race stressor. Identity ids do not line up between the two (idempotent
+  replays consume Postgres IDENTITY values the reference does not), so the harness
+  compares through an explicit reference→database id map.
+
+Every failure prints its seed, and every seed reproduces exactly. Seed counts are
+environment-overridable so CI can scale the fidelity tier: `SIMTEST_SEEDS` (breadth),
+`SIMTEST_DB_SEEDS` (full-scenario), `SIMTEST_CRASH_SEEDS`, `SIMTEST_FAULT_SEEDS`
+(competing/zombie), `SIMTEST_GUARD_SEEDS` (version race).
+
+### Guard-3 mutation smoke test (one-time, manual)
+
+The plan (§M10 "Done when") calls for a deliberately introduced bug to be caught by
+the harness. The guard with the subtlest teeth is Guard 3 (the account-version CAS,
+spec §7.2): its protection is the **rowcount check** that rolls the transaction back
+when the CAS matches zero rows (the account version moved between the processor's read
+and its write — an API race). Removing that check lets a missed CAS commit the
+operation's status flip *without* applying the balance.
+
+To reproduce (do **not** commit the change): in `internal/processor/single.go`,
+replace the Guard-3 rowcount check in `accept`
+
+```go
+	if tag.RowsAffected() != 1 {
+		return errGuardMiss
+	}
+```
+
+with `_ = tag` and run `make simtest`. `TestSimVersionRaceGuard3` fails immediately,
+e.g.:
+
+```
+--- FAIL: TestSimVersionRaceGuard3/seed=7000000
+    sim_faults_test.go:225: seed 7000000: account unbounded balance db=-21 reference=-43 (G1)
+```
+
+Then revert the file (`git checkout -- internal/processor/single.go`) — the guards are
+inviolable (CLAUDE.md §2) and never ship weakened. Verified once on 2026-08-22; the
+committed tree keeps all three guard rowcount checks.

@@ -1,10 +1,23 @@
 //go:build simtest
 
-// Package simtest DB harness (M6): it drives the real processor over a real
-// throwaway schema and asserts the database against the sequential reference model.
-// It is the seed the full spec §15 simulation (M10) grows from, scoped here to the
-// M6 concerns — group processing (§8.3) and batching (§8.5). Run via `make simtest`
-// against TEST_DATABASE_URL; each test self-isolates in a throwaway schema.
+// Package simtest DB harness (M10): the fidelity tier of the spec §15 simulation.
+// It drives the real processor over a real throwaway schema and asserts the
+// database against the sequential reference model across the full scenario space
+// (the shared seeded generator in generate.go), interleaved with fault injection —
+// batch-boundary crashes (this file), competing-leader failover and zombie-leader
+// stale-lease writes (sim_faults_test.go). The reference model is the oracle; an
+// exact match after churn proves the three guards (spec §7.2) hold the consistency
+// contract G1–G6. Run via `make simtest` against TEST_DATABASE_URL; each test
+// self-isolates in a throwaway schema. Every failure prints its seed.
+//
+// Identity ids do NOT line up between the reference and the database: idempotent
+// replays and payload conflicts run `INSERT ... ON CONFLICT DO NOTHING`, which
+// consumes (skips) a Postgres IDENTITY value while the reference, checking the key
+// first, assigns none. So the harness maintains an explicit reference→database id
+// map (built from each fresh insert's returned ids, in registration order) and
+// compares through it — the approach the M6 handoff flagged as the alternative to id
+// alignment. The map also translates a reversal's reversal_of (a reference op id) to
+// the real operation it must reference in the database.
 package simtest
 
 import (
@@ -12,7 +25,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand"
 	"testing"
 	"time"
 
@@ -26,138 +38,222 @@ import (
 	"github.com/magnomp/balancedb/internal/processor"
 )
 
-const simOwner int64 = 1
+// dbRounds and dbMovesPerRound shape one DB-backed schedule: generate a round of
+// moves into the database and the reference model in lockstep, drain it through the
+// real processor, then assert the two agree. Draining between rounds is what lets
+// reversals target confirmed operations and limit changes bracket a settled
+// balance.
+const (
+	dbRounds        = 5
+	dbMovesPerRound = 20
 
-// simAccount is one account the schedule targets, with its limits.
-type simAccount struct {
-	ext string
-	min *int64
-	max *int64
+	// crashRounds is fewer than dbRounds because each crash round pays for many
+	// processor restarts; it still spans several drains so reversals and limit changes
+	// act on settled state.
+	crashRounds = 3
+)
+
+// harness runs one DB-backed schedule: the reference model, the database pool, and
+// the reference→database id maps that let the two be compared despite id skew.
+type harness struct {
+	pool        *pgxpool.Pool
+	g           *Generator
+	m           *Model
+	refToDBOp   map[int64]int64  // reference op id → database op id
+	refToDBTx   map[int64]int64  // reference transaction id → database transaction id
+	dbAcctByExt map[string]int64 // external id → database account id
 }
 
-var simAccounts = []simAccount{
-	{"tight", ptr(-60), ptr(60)},
-	{"loose", ptr(-100000), ptr(100000)},
-	{"unbounded", nil, nil},
-	{"floor", ptr(-300), nil},
-	{"ceiling", nil, ptr(300)},
-}
-
-// TestSimGroupsBatchedMatchReference runs randomized schedules of interleaved
-// singles and groups through the real processor with large batches, then asserts
-// the database matches the sequential reference model: G3 (every operation and
-// transaction reaches the reference outcome), G1 (every confirmed balance within
-// limits and equal to the reference), and G2 (no group partially applied). Every
-// failure prints its seed.
-func TestSimGroupsBatchedMatchReference(t *testing.T) {
-	for iter := 0; iter < 20; iter++ {
-		seed := int64(1_000 + iter)
-		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
-			pool := dbtest.NewSchema(t)
-			m := seedAccounts(t, pool)
-			generateSchedule(t, pool, m, rand.New(rand.NewSource(seed)), 60)
-
-			// A big batch exercises multi-decision transactions; a fast loop drains
-			// quickly.
-			setSimConfig(t, pool, 5, 5000, 50)
-			runProcessorToDrain(t, pool, 20*time.Second)
-
-			m.ProcessAll() // sequential oracle
-			assertG2(t, pool, seed)
-			assertMatchesReference(t, pool, m, seed)
-		})
-	}
-}
-
-// TestSimBatchCrashEqualsSequential proves batching is crash-safe: it drives the
-// processor with small batches while repeatedly crashing it mid-flight (cancelling
-// its context, which rolls back any open batch), restarts it, and after the churn
-// finishes draining. The final database state must equal the sequential reference
-// model — a batch crash is simply reprocessed, idempotent by construction (spec
-// §8.5). G2 is checked at every restart boundary.
-func TestSimBatchCrashEqualsSequential(t *testing.T) {
-	for iter := 0; iter < 8; iter++ {
-		seed := int64(9_000 + iter)
-		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
-			pool := dbtest.NewSchema(t)
-			m := seedAccounts(t, pool)
-			rng := rand.New(rand.NewSource(seed))
-			generateSchedule(t, pool, m, rng, 60)
-
-			// Small batches → more batch boundaries → more chances to crash mid-batch.
-			setSimConfig(t, pool, 3, 5000, 4)
-			runWithCrashChurn(t, pool, rng, seed)
-			// Finish cleanly (churn may leave a tail of PENDING work).
-			runProcessorToDrain(t, pool, 20*time.Second)
-
-			m.ProcessAll()
-			assertG2(t, pool, seed)
-			assertMatchesReference(t, pool, m, seed)
-		})
-	}
-}
-
-// seedAccounts creates every schedule account, with limits, in both the database
-// and the reference model in the same order — so identity ids line up and the two
-// can be compared row for row.
-func seedAccounts(t *testing.T, pool *pgxpool.Pool) *Model {
+// newHarness creates every schedule account (with limits) in both the database and
+// the reference model, caches each account's database id, and returns a ready
+// harness.
+func newHarness(t *testing.T, pool *pgxpool.Pool, g *Generator) *harness {
 	t.Helper()
-	m := NewModel()
+	h := &harness{
+		pool:        pool,
+		g:           g,
+		m:           NewModel(),
+		refToDBOp:   make(map[int64]int64),
+		refToDBTx:   make(map[int64]int64),
+		dbAcctByExt: make(map[string]int64),
+	}
 	ctx := context.Background()
-	for _, a := range simAccounts {
-		if _, err := pool.Exec(ctx,
-			`INSERT INTO accounts (owner_id, external_id, min_balance, max_balance) VALUES ($1,$2,$3,$4)`,
-			simOwner, a.ext, a.min, a.max); err != nil {
+	for _, a := range g.Accounts() {
+		var id int64
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO accounts (owner_id, external_id, min_balance, max_balance) VALUES ($1,$2,$3,$4) RETURNING id`,
+			g.owner, a.ext, a.min, a.max).Scan(&id); err != nil {
 			t.Fatalf("create account %s: %v", a.ext, err)
 		}
-		if err := m.SetLimits(simOwner, a.ext, a.min, a.max); err != nil {
+		h.dbAcctByExt[a.ext] = id
+		if err := h.m.SetLimits(g.owner, a.ext, a.min, a.max); err != nil {
 			t.Fatalf("reference SetLimits %s: %v", a.ext, err)
 		}
 	}
-	return m
+	return h
 }
 
-// generateSchedule inserts `steps` fresh units (singles and groups, 1..4 legs) into
-// both the database and the reference model in lockstep, asserting the two return
-// identical ids (so the reference stays a faithful mirror before any processing).
-func generateSchedule(t *testing.T, pool *pgxpool.Pool, m *Model, rng *rand.Rand, steps int) {
+// TestSimFullScenarioMatchReference is the primary fidelity check: randomized
+// schedules across the full scenario space (limits, singles, groups, aggressive
+// back/future-dating with day crossings and timestamp ties, reversals including
+// double-reversals and reversal-after-reject retries, limit changes, idempotent
+// replays/conflicts) run through the real batched processor, then the database is
+// asserted equal to the sequential reference model: G1 (every confirmed balance
+// within limits and equal to the reference), G2 (no group partially applied), G3
+// (every operation and transaction reaches the reference outcome), G4 (timeline
+// order stable and identical to the reference), plus the snapshot cascade invariant
+// (the latest daily snapshot equals the confirmed balance) and G6 (no duplicate
+// rows). Every failure prints its seed.
+func TestSimFullScenarioMatchReference(t *testing.T) {
+	seeds := envInt("SIMTEST_DB_SEEDS", 12)
+	for i := 0; i < seeds; i++ {
+		seed := int64(4_000_000 + i)
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
+			pool := dbtest.NewSchema(t)
+			h := newHarness(t, pool, NewGenerator(seed))
+			setSimConfig(t, pool, 5, 5000, 50)
+
+			for r := 0; r < dbRounds; r++ {
+				// Apply all of the round's moves (inserts and out-of-band limit changes)
+				// before any decision: a limit change is not a registered operation, so
+				// its effect must be settled before the round's operations are decided —
+				// exactly as the reference applies it before ProcessAll. Then one
+				// processor drains the whole round in batches.
+				for _, a := range h.g.Round(h.m, dbMovesPerRound) {
+					h.apply(t, a)
+				}
+				runProcessorToDrain(t, pool, 20*time.Second)
+				h.m.ProcessAll() // sequential oracle
+				assertG2(t, pool, seed)
+				h.assertMatches(t, seed)
+				h.assertG4(t, seed)
+				h.assertSnapshots(t, seed)
+			}
+		})
+	}
+}
+
+// TestSimBatchCrashEqualsSequential proves batching is crash-safe under the full
+// scenario space: it drives the processor with small batches while repeatedly
+// crashing it mid-flight (cancelling its context, which rolls back any open batch),
+// restarts it, and after the churn finishes draining. The final database state must
+// equal the sequential reference model — a batch-boundary crash is simply
+// reprocessed, idempotent by construction (spec §8.5). G2 is checked at every
+// restart boundary. Every failure prints its seed.
+func TestSimBatchCrashEqualsSequential(t *testing.T) {
+	seeds := envInt("SIMTEST_CRASH_SEEDS", 4)
+	for i := 0; i < seeds; i++ {
+		seed := int64(9_000_000 + i)
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
+			pool := dbtest.NewSchema(t)
+			h := newHarness(t, pool, NewGenerator(seed))
+			// Small batches → more batch boundaries → more chances to crash mid-batch.
+			setSimConfig(t, pool, 3, 5000, 4)
+
+			for r := 0; r < crashRounds; r++ {
+				for _, a := range h.g.Round(h.m, dbMovesPerRound) {
+					h.apply(t, a)
+				}
+				runWithCrashChurn(t, pool, h.g, seed)
+				// Finish cleanly (churn may leave a tail of PENDING work).
+				runProcessorToDrain(t, pool, 20*time.Second)
+				h.m.ProcessAll()
+				assertG2(t, pool, seed)
+				h.assertMatches(t, seed)
+				h.assertG4(t, seed)
+			}
+		})
+	}
+}
+
+// apply replays one generated move against the database and the reference model in
+// lockstep, asserting they agree, and records the reference→database id map for
+// every fresh leg. Fresh inserts must return legs in the same registration order on
+// both sides; replays are flagged and add no rows; payload conflicts are refused on
+// both sides; satisfiable limit changes apply on both. This is where G6 is enforced
+// on the DB side (a replay must not duplicate; a conflict must not write).
+func (h *harness) apply(t *testing.T, a Action) {
 	t.Helper()
 	ctx := context.Background()
-	when := time.Unix(0, 0).UTC()
-	for step := 0; step < steps; step++ {
-		nLegs := 1 + rng.Intn(4)
-		ops := make([]api.InsertOp, nLegs)
-		for i := range ops {
-			amt := int64(rng.Intn(121) - 60)
-			if amt == 0 {
-				amt = 1
-			}
-			ops[i] = api.InsertOp{
-				OwnerID:     simOwner,
-				ExternalID:  simAccounts[rng.Intn(len(simAccounts))].ext,
-				Amount:      amt,
-				EffectiveAt: when.Add(time.Duration(rng.Intn(5)) * 24 * time.Hour),
-			}
-		}
-		req := api.InsertRequest{IdempotencyKey: uuid(step + 1), Operations: ops}
 
-		refRes, err := m.Insert(req)
-		if err != nil {
-			t.Fatalf("reference insert step %d: %v", step, err)
+	if a.Kind == actSetLimits {
+		if err := h.m.SetLimits(simOwnerID, a.Limits.ExternalID, a.Limits.Min, a.Limits.Max); err != nil {
+			t.Fatalf("reference limit change on %s: %v", a.Limits.ExternalID, err)
 		}
-		var dbRes *api.InsertResult
-		err = db.WithTx(ctx, pool, func(tx pgx.Tx) error {
-			r, e := api.Insert(ctx, tx, req)
-			dbRes = r
-			return e
-		})
+		// Mirror the real PUT /limits: replace both bounds and bump the version.
+		ct, err := h.pool.Exec(ctx,
+			`UPDATE accounts SET min_balance=$1, max_balance=$2, version=version+1 WHERE owner_id=$3 AND external_id=$4`,
+			a.Limits.Min, a.Limits.Max, simOwnerID, a.Limits.ExternalID)
 		if err != nil {
-			t.Fatalf("db insert step %d: %v", step, err)
+			t.Fatalf("db limit change on %s: %v", a.Limits.ExternalID, err)
 		}
-		if !sameIDs(refRes, dbRes) {
-			t.Fatalf("step %d: db and reference assigned different ids", step)
+		if ct.RowsAffected() != 1 {
+			t.Fatalf("db limit change on %s affected %d rows", a.Limits.ExternalID, ct.RowsAffected())
+		}
+		return
+	}
+
+	// Insert-family action. The reference request carries reference op ids in
+	// reversal_of; the database needs the mapped real op id, so translate a copy.
+	refRes, refErr := h.m.Insert(a.Req)
+	dbReq := h.translate(a.Req)
+	var dbRes *api.InsertResult
+	dbErr := db.WithTx(ctx, h.pool, func(tx pgx.Tx) error {
+		r, e := api.Insert(ctx, tx, dbReq)
+		dbRes = r
+		return e
+	})
+
+	if a.ExpectConflict {
+		if refErr == nil || dbErr == nil {
+			t.Fatalf("expected payload conflict, ref=%v db=%v", refErr, dbErr)
+		}
+		return
+	}
+	if refErr != nil || dbErr != nil {
+		t.Fatalf("insert errored ref=%v db=%v", refErr, dbErr)
+	}
+	if len(refRes.Operations) != len(dbRes.Operations) {
+		t.Fatalf("leg count differs ref=%d db=%d", len(refRes.Operations), len(dbRes.Operations))
+	}
+
+	if a.ExpectReplay {
+		if !refRes.Replayed || !dbRes.Replayed {
+			t.Fatalf("expected replay, ref.Replayed=%v db.Replayed=%v", refRes.Replayed, dbRes.Replayed)
+		}
+		// A replay must return the same ids as the original insert (G6): verify the
+		// established mapping still holds.
+		for i := range refRes.Operations {
+			if got := h.refToDBOp[refRes.Operations[i].ID]; got != dbRes.Operations[i].ID {
+				t.Fatalf("replay op id remap changed: ref %d → db %d, was %d",
+					refRes.Operations[i].ID, dbRes.Operations[i].ID, got)
+			}
+		}
+		return
+	}
+
+	// Fresh insert: record the reference→database id map, leg by leg.
+	for i := range refRes.Operations {
+		h.refToDBOp[refRes.Operations[i].ID] = dbRes.Operations[i].ID
+	}
+	if refRes.TransactionID != nil && dbRes.TransactionID != nil {
+		h.refToDBTx[*refRes.TransactionID] = *dbRes.TransactionID
+	}
+}
+
+// translate returns a copy of req with each op's reversal_of remapped from the
+// reference op id the generator chose to the real database op id it must reference.
+func (h *harness) translate(req api.InsertRequest) api.InsertRequest {
+	ops := make([]api.InsertOp, len(req.Operations))
+	copy(ops, req.Operations)
+	for i := range ops {
+		if ops[i].ReversalOf != nil {
+			dbID := h.refToDBOp[*ops[i].ReversalOf]
+			ops[i].ReversalOf = &dbID
 		}
 	}
+	req.Operations = ops
+	return req
 }
 
 func setSimConfig(t *testing.T, pool *pgxpool.Pool, loopMs, ttlMs, batchSize int) {
@@ -182,15 +278,15 @@ func runProcessorToDrain(t *testing.T, pool *pgxpool.Pool, timeout time.Duration
 // runWithCrashChurn repeatedly starts the processor, lets it run for a short random
 // slice, then crashes it (cancel → any open batch rolls back). It checks G2 at each
 // restart boundary. It stops early once the queue is drained.
-func runWithCrashChurn(t *testing.T, pool *pgxpool.Pool, rng *rand.Rand, seed int64) {
+func runWithCrashChurn(t *testing.T, pool *pgxpool.Pool, g *Generator, seed int64) {
 	t.Helper()
-	for i := 0; i < 40; i++ {
+	for i := 0; i < 10; i++ {
 		if pendingCount(t, pool) == 0 {
 			return
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		done := startProcessor(t, pool, ctx)
-		time.Sleep(time.Duration(1+rng.Intn(12)) * time.Millisecond)
+		time.Sleep(time.Duration(1+g.rng.Intn(12)) * time.Millisecond)
 		cancel()
 		<-done
 		// After a crash, an open batch must have rolled back wholesale — no group is
@@ -287,87 +383,154 @@ func assertG2(t *testing.T, pool *pgxpool.Pool, seed int64) {
 	}
 }
 
-// assertMatchesReference compares the drained database against the sequential
-// reference model: every operation's status (G3), every transaction's status (G3),
-// and every account's confirmed balance (G1). The reference is the oracle, so an
-// exact match proves the batched, possibly-crashed run produced the same outcomes
-// as a sequential unbatched run.
-func assertMatchesReference(t *testing.T, pool *pgxpool.Pool, m *Model, seed int64) {
+// assertMatches compares the drained database against the sequential reference
+// model, through the id map: every operation's status (G3), every transaction's
+// status (G3), row counts (G6), and every account's confirmed balance (G1). The
+// reference is the oracle, so an exact match proves the batched, possibly-crashed,
+// possibly-contended run produced the same outcomes as a sequential unbatched run.
+func (h *harness) assertMatches(t *testing.T, seed int64) {
 	t.Helper()
 	ctx := context.Background()
 
-	// Operations.
-	rows, err := pool.Query(ctx, `SELECT id, status FROM operations ORDER BY id`)
+	// Operations: read all real statuses, compare each reference op through the map.
+	dbStatus, err := scanStatuses(ctx, h.pool, `SELECT id, status FROM operations`)
 	if err != nil {
 		t.Fatalf("seed %d: read operations: %v", seed, err)
 	}
+	if len(dbStatus) != len(h.m.ops) {
+		t.Fatalf("seed %d: db has %d operations, reference has %d (G6)", seed, len(dbStatus), len(h.m.ops))
+	}
+	for refID, op := range h.m.ops {
+		dbID, ok := h.refToDBOp[refID]
+		if !ok {
+			t.Fatalf("seed %d: reference op %d has no database mapping", seed, refID)
+		}
+		if got := dbStatus[dbID]; got != string(op.Status) {
+			t.Fatalf("seed %d: operation ref=%d db=%d status db=%s reference=%s (G3)", seed, refID, dbID, got, op.Status)
+		}
+	}
+
+	// Transactions.
+	dbTxStatus, err := scanStatuses(ctx, h.pool, `SELECT id, status FROM transactions`)
+	if err != nil {
+		t.Fatalf("seed %d: read transactions: %v", seed, err)
+	}
+	if len(dbTxStatus) != len(h.m.txs) {
+		t.Fatalf("seed %d: db has %d transactions, reference has %d", seed, len(dbTxStatus), len(h.m.txs))
+	}
+	for refID, tx := range h.m.txs {
+		dbID, ok := h.refToDBTx[refID]
+		if !ok {
+			t.Fatalf("seed %d: reference transaction %d has no database mapping", seed, refID)
+		}
+		if got := dbTxStatus[dbID]; got != string(tx.Status) {
+			t.Fatalf("seed %d: transaction ref=%d db=%d status db=%s reference=%s (G3)", seed, refID, dbID, got, tx.Status)
+		}
+	}
+
+	// Balances (G1: equal to the reference — compared by the stable external id — and,
+	// checked by the reference, within limits).
+	for _, acctID := range h.m.AccountIDs() {
+		ext := h.m.accountsByID[acctID].ExternalID
+		var bal int64
+		if err := h.pool.QueryRow(ctx,
+			`SELECT confirmed_balance FROM accounts WHERE owner_id=$1 AND external_id=$2`,
+			simOwnerID, ext).Scan(&bal); err != nil {
+			t.Fatalf("seed %d: read balance %s: %v", seed, ext, err)
+		}
+		if want := h.m.accountsByID[acctID].Balance; bal != want {
+			t.Fatalf("seed %d: account %s balance db=%d reference=%d (G1)", seed, ext, bal, want)
+		}
+	}
+	if err := h.m.CheckG1(); err != nil {
+		t.Fatalf("seed %d: reference %v", seed, err)
+	}
+}
+
+// assertG4 checks the deterministic, immutable ordering guarantee (spec §4.1): for
+// every account the database's timeline — operations ordered by (effective_at, id) —
+// is identical to the reference model's (mapped through the id table). Identity ids
+// are monotonic in insertion order, so the map preserves relative order and the tie
+// break on equal effective_at agrees; statuses change during processing, but
+// effective_at and id never do, so the order is stable.
+func (h *harness) assertG4(t *testing.T, seed int64) {
+	t.Helper()
+	ctx := context.Background()
+	for _, acctID := range h.m.AccountIDs() {
+		ext := h.m.accountsByID[acctID].ExternalID
+		dbAcct := h.dbAcctByExt[ext]
+		rows, err := h.pool.Query(ctx,
+			`SELECT id FROM operations WHERE account_id=$1 ORDER BY effective_at, id`, dbAcct)
+		if err != nil {
+			t.Fatalf("seed %d: G4 query %s: %v", seed, ext, err)
+		}
+		var got []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				t.Fatalf("seed %d: G4 scan %s: %v", seed, ext, err)
+			}
+			got = append(got, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			t.Fatalf("seed %d: G4 iterate %s: %v", seed, ext, err)
+		}
+		want := h.m.Timeline(acctID)
+		if len(got) != len(want) {
+			t.Fatalf("seed %d: G4 %s timeline length db=%d reference=%d", seed, ext, len(got), len(want))
+		}
+		for i := range got {
+			if got[i] != h.refToDBOp[want[i]] {
+				t.Fatalf("seed %d: G4 %s timeline differs at %d: db=%d reference(mapped)=%d",
+					seed, ext, i, got[i], h.refToDBOp[want[i]])
+			}
+		}
+	}
+}
+
+// assertSnapshots checks the daily-snapshot cascade (spec §8.4): the balance of an
+// account's latest snapshot day equals its confirmed balance. Since every confirmed
+// operation lands on or before the latest day, the cumulative snapshot there is the
+// full final balance — so a cascade that dropped or double-counted a backdated
+// operation would diverge here.
+func (h *harness) assertSnapshots(t *testing.T, seed int64) {
+	t.Helper()
+	ctx := context.Background()
+	for _, acctID := range h.m.AccountIDs() {
+		ext := h.m.accountsByID[acctID].ExternalID
+		dbAcct := h.dbAcctByExt[ext]
+		var bal int64
+		err := h.pool.QueryRow(ctx,
+			`SELECT balance FROM balance_snapshots WHERE account_id=$1 ORDER BY day DESC LIMIT 1`, dbAcct).Scan(&bal)
+		if err == pgx.ErrNoRows {
+			continue // no confirmed operation on this account yet
+		}
+		if err != nil {
+			t.Fatalf("seed %d: read latest snapshot %s: %v", seed, ext, err)
+		}
+		if want := h.m.accountsByID[acctID].Balance; bal != want {
+			t.Fatalf("seed %d: account %s latest snapshot balance %d != confirmed balance %d", seed, ext, bal, want)
+		}
+	}
+}
+
+// scanStatuses reads an (id, status) query into a map.
+func scanStatuses(ctx context.Context, pool *pgxpool.Pool, sql string) (map[int64]string, error) {
+	rows, err := pool.Query(ctx, sql)
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
-	dbOps := 0
+	out := make(map[int64]string)
 	for rows.Next() {
 		var id int64
 		var status string
 		if err := rows.Scan(&id, &status); err != nil {
-			t.Fatalf("seed %d: scan operation: %v", seed, err)
+			return nil, err
 		}
-		dbOps++
-		ref, ok := m.ops[id]
-		if !ok {
-			t.Fatalf("seed %d: db operation %d absent from reference", seed, id)
-		}
-		if status != string(ref.Status) {
-			t.Fatalf("seed %d: operation %d status db=%s reference=%s (G3)", seed, id, status, ref.Status)
-		}
+		out[id] = status
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("seed %d: iterate operations: %v", seed, err)
-	}
-	if dbOps != len(m.ops) {
-		t.Fatalf("seed %d: db has %d operations, reference has %d", seed, dbOps, len(m.ops))
-	}
-
-	// Transactions.
-	txRows, err := pool.Query(ctx, `SELECT id, status FROM transactions ORDER BY id`)
-	if err != nil {
-		t.Fatalf("seed %d: read transactions: %v", seed, err)
-	}
-	defer txRows.Close()
-	dbTxs := 0
-	for txRows.Next() {
-		var id int64
-		var status string
-		if err := txRows.Scan(&id, &status); err != nil {
-			t.Fatalf("seed %d: scan transaction: %v", seed, err)
-		}
-		dbTxs++
-		ref, ok := m.txs[id]
-		if !ok {
-			t.Fatalf("seed %d: db transaction %d absent from reference", seed, id)
-		}
-		if status != string(ref.Status) {
-			t.Fatalf("seed %d: transaction %d status db=%s reference=%s (G3)", seed, id, status, ref.Status)
-		}
-	}
-	if err := txRows.Err(); err != nil {
-		t.Fatalf("seed %d: iterate transactions: %v", seed, err)
-	}
-	if dbTxs != len(m.txs) {
-		t.Fatalf("seed %d: db has %d transactions, reference has %d", seed, dbTxs, len(m.txs))
-	}
-
-	// Balances (G1: equal to the reference, and — checked by the reference — within
-	// limits).
-	for _, a := range simAccounts {
-		var bal int64
-		if err := pool.QueryRow(ctx,
-			`SELECT confirmed_balance FROM accounts WHERE owner_id=$1 AND external_id=$2`,
-			simOwner, a.ext).Scan(&bal); err != nil {
-			t.Fatalf("seed %d: read balance %s: %v", seed, a.ext, err)
-		}
-		if want := m.AccountBalance(simOwner, a.ext); bal != want {
-			t.Fatalf("seed %d: account %s balance db=%d reference=%d (G1)", seed, a.ext, bal, want)
-		}
-	}
-	if err := m.CheckG1(); err != nil {
-		t.Fatalf("seed %d: reference %v", seed, err)
-	}
+	return out, rows.Err()
 }
