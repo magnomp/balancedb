@@ -1,0 +1,49 @@
+# BalanceDB — devcontainer stack (plan §M12).
+#
+# Two services: `dev` (where VS Code attaches; carries the Go toolchain) and
+# `postgres` (the bundled database the dev's `make itest`/`make run-*` target). This
+# is DEV infrastructure, distinct from the prod-like ../docker-compose.yml: here a
+# single long-lived Postgres backs both the app roles and the integration tests
+# (tests self-isolate in throwaway schemas — internal/dbtest — so they never collide
+# with a running api/processor on the same database).
+#
+# devcontainer.json owns the wiring the editor cares about (containerEnv, features,
+# forwardPorts, postCreateCommand); this file only defines the containers. Postgres
+# is reached over the compose network as host `postgres:5432` and is NOT published to
+# the host here — VS Code's forwardPorts handles host exposure, which also avoids
+# colliding with any Postgres already bound to the host's 5432.
+
+services:
+  dev:
+    image: mcr.microsoft.com/devcontainers/go:1.25
+    # Keep the container alive; VS Code execs into it. Features (docker-in-docker,
+    # postgres-client) and the BALANCEDB_*/TEST_DATABASE_URL env are applied by
+    # devcontainer.json, not here.
+    command: sleep infinity
+    volumes:
+      - ..:/workspaces/balancedb:cached
+    # Don't start the editor container until the database can accept connections, so a
+    # freshly reopened container can run `make itest` with zero manual setup.
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: balancedb
+      POSTGRES_PASSWORD: balancedb
+      POSTGRES_DB: balancedb
+    volumes:
+      # postgres:18 stores its cluster in a major-version subdirectory and rejects a
+      # mount at the legacy .../data path — mount the parent dir instead (same lesson
+      # as ../docker-compose.yml; docker-library/postgres#1259).
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U balancedb -d balancedb"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  pgdata:
