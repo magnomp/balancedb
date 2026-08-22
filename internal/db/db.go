@@ -8,11 +8,24 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Option configures the pool built by Connect. Options are applied before the
+// pool is created; existing callers pass none and get the M1 behavior unchanged.
+type Option func(*pgxpool.Config)
+
+// WithTracer attaches a pgx query tracer to every connection in the pool — used
+// by the observability layer for slow-query logging (plan §M9). The tracer must
+// be safe for concurrent use across pooled connections.
+func WithTracer(tracer pgx.QueryTracer) Option {
+	return func(cfg *pgxpool.Config) {
+		cfg.ConnConfig.Tracer = tracer
+	}
+}
+
 // Connect builds a pgxpool bound to the given schema. Every connection sets
 // search_path to that schema (as a quoted identifier) in AfterConnect, so all
 // downstream SQL is written unqualified. It pings once before returning so a
 // misconfigured DSN or unreachable database fails fast at boot.
-func Connect(ctx context.Context, databaseURL, schema string, maxConns int32) (*pgxpool.Pool, error) {
+func Connect(ctx context.Context, databaseURL, schema string, maxConns int32, opts ...Option) (*pgxpool.Pool, error) {
 	poolCfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse database url: %w", err)
@@ -30,6 +43,10 @@ func Connect(ctx context.Context, databaseURL, schema string, maxConns int32) (*
 			return fmt.Errorf("set search_path to %q: %w", schema, err)
 		}
 		return nil
+	}
+
+	for _, opt := range opts {
+		opt(poolCfg)
 	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
