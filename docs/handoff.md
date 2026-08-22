@@ -421,3 +421,92 @@ Notes for next agents:
 - The reference model's group rejection picks the offending account by ascending
   account_id; if a future spec change redefines the tie-break, change both sides
   together or G3 comparison breaks.
+
+## M7 — 2026-08-22
+
+Built:
+- `internal/api` HTTP layer (now **built (M7)**) on Huma v2 (`v2.39.1`) over chi
+  (`v5.3.2`), code-first per ADR-0003, confined to this package. Every spec §10
+  endpoint is a typed operation registered in `server.go`:
+  - `POST /transactions` — wraps the M3 `Insert` core inside `db.WithTx`; maps the
+    insert sentinels to status codes (`errors.go`); always 202 (fire-and-forget).
+  - `GET /transactions/{id}`, `GET /operations/{id}` — status + per-leg statuses +
+    machine-readable rejection detail (reuses `model.Rejection` as the typed schema).
+  - `GET /accounts/{ext}/balance` (+ `?at=T` point-in-time, §9/N2),
+    `GET /accounts/{ext}/statement` (keyset pagination, snapshot-seeded running
+    balance, §9), `POST /accounts` (201; 409 on duplicate),
+    `PUT /accounts/{ext}/limits` (§6 rules, version CAS, retry-once → 409).
+  - `/docs` (Stoplight Elements, request-executing) and `/openapi.{yaml,json}`
+    served by Huma via `humachi`/`DefaultConfig`.
+- `amount.go` — the `Amount` int64 transport type: a `huma.SchemaProvider` that
+  reports `integer/int64` (with the minor-units + JS-precision descriptions) AND an
+  `UnmarshalJSON` that decodes via `json.Number` → `model.ParseAmount`. This is how
+  the ADR-0003 "int64 fields" requirement and the "all money through
+  `model.ParseAmount`, no float64" inviolable are both satisfied at once — see
+  Decisions.
+- `owner.go` — `OwnerResolver` interface + `HeaderOwnerResolver` (X-Owner-Id →
+  positive int64). Declared on every operation; read paths join through
+  `accounts.owner_id`, so cross-owner reads 404. This is the pluggable seam the plan
+  asks for (a directory-backed resolver drops in without touching handlers).
+- `cmd/openapigen` + `make openapi` — regenerates the committed `api/openapi.yaml`
+  from the code (no DB needed), fails on drift (CI diff gate), then runs an
+  `oasdiff` breaking-change check vs `HEAD:api/openapi.yaml`.
+- `cmd/balancedb` api role now serves the router with graceful shutdown (`runAPI`).
+- Tests: `api_test.go` (no DB — Amount parsing, spec generation, owner resolver) and
+  `api_itest_test.go` (`package api`, tag `itest`; httptest over a throwaway schema)
+  covering every endpoint contract, the float-amount / missing-field 7807 rejections,
+  payload conflict, owner scoping, N2 point-in-time, statement pagination across a
+  snapshot-day boundary, and the limit-update version conflict.
+
+Decisions (no new ADR — this reconciles two existing authorities, it does not
+deviate from spec/plan; ADR-0003 governs and pre-approves the Huma/chi stack):
+- **Amount routes through `model.ParseAmount`.** ADR-0003 says "int64 fields, floats
+  rejected by type"; the CLAUDE.md inviolable + M3 handoff say every JSON→money
+  conversion goes through the one helper with a `json.Number` decode (never float64).
+  The `Amount` type does both. Note Huma's schema-validation pass parses the body
+  into `any` (numbers → float64), but the *authoritative* value comes from a second
+  unmarshal into the struct, which invokes `Amount.UnmarshalJSON` (json.Number →
+  `ParseAmount`) — so no float64 ever holds a stored money value, and `15.00`/`1e3`
+  are rejected there (whole-number floats slip past the integer schema check but not
+  past `ParseAmount`). Verified live: `-5.5` → 422 `application/problem+json`.
+- **PUT /limits is a full replace.** Both `min_balance` and `max_balance` are set;
+  an omitted/null field means unbounded (documented in the field docs and the
+  endpoint description). JSON can't distinguish "absent" from "null" for a pointer,
+  so partial-update semantics were not attempted; PUT = replace is the clean choice.
+- **UTC day buckets computed in Go for reads.** Point-in-time and statement seeds
+  compute the UTC day boundary in Go (matching `internal/snapshot`'s write side) and
+  bind it as a timestamptz / `::date`, so results are independent of the DB session
+  timezone — the snapshot buckets are UTC-fixed forever (spec §5.2).
+- **`afterLimitsRead` test seam** on `Server` (nil in production) forces the version
+  CAS to miss deterministically, exercising the retry-then-409 path. Mirrors the M5
+  `afterAccountRead` seam; not behavior.
+- **Dependencies:** `danielgtaylor/huma/v2` + `go-chi/chi/v5` (both pre-approved by
+  ADR-0003) and their transitive deps (`google/uuid`, `fxamacker/cbor/v2`,
+  `x448/float16`). No new ADR needed.
+
+Deferred/known issues:
+- **`oasdiff` is not installed on this box**, so `make openapi`'s breaking-change
+  check is skipped with a message (the diff gate still runs and passes). CI must
+  install `oasdiff` for the breaking-change gate to be active. The target is wired
+  correctly (compares `HEAD:api/openapi.yaml` vs the regenerated file).
+- **`wait_ms > 0` is stubbed as 0** (always 202) — synchronous waiting is M8. The
+  field is documented as such in the request schema. M8 wires `internal/notify` +
+  the wait path into `createTransaction`.
+- The `/docs` page uses Huma's default Stoplight Elements renderer, which loads its
+  JS from a CDN in the browser. Automated tests assert `/docs` returns HTML that
+  references the spec URL and that real requests execute against the live server
+  (all itests do); full in-browser "click Try It" execution was verified only via
+  the reasoning that Stoplight calls the same endpoints — treat browser execution as
+  a manual check if needed. No CSP is set (this is a first-party server, not an
+  Artifact), so the CDN load is fine.
+
+Notes for next agents (M8):
+- Reuse `createTransaction` in `transactions.go`: when `wait_ms > 0`, register a
+  waiter on `tx:<id>`/`op:<id>` before/around the insert, then wait (with the
+  1–2 s poll fallback) capped by `api_max_wait_ms` from the `config` row. Outcome →
+  200; expiry → 202 + current state. The processor already emits
+  `NOTIFY outcomes 'op:<id>'|'tx:<id>'` inside the deciding commit (M5/M6).
+- CLAUDE.md package map: `api` → **built (M7)**; `notify` stays `(M8)`.
+- Any change to an `internal/api` request/response struct changes the contract:
+  run `make openapi` and commit the regenerated `api/openapi.yaml` in the same
+  change (the diff gate enforces it).
