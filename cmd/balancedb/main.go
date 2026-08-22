@@ -15,7 +15,9 @@ import (
 
 	"github.com/magnomp/balancedb/internal/config"
 	"github.com/magnomp/balancedb/internal/db"
+	"github.com/magnomp/balancedb/internal/lease"
 	"github.com/magnomp/balancedb/internal/migrate"
+	"github.com/magnomp/balancedb/internal/processor"
 )
 
 func main() {
@@ -87,9 +89,21 @@ func run() error {
 	defer pool.Close()
 	logger.Info("database connected", "schema", cfg.Schema)
 
-	// The HTTP server (M7) and processor loop (M5) are not built yet. Boot, hold
-	// until a shutdown signal, then exit cleanly so the lifecycle wiring is
-	// exercised from day one (plan §M1).
+	if role == config.RoleProcessor {
+		l, err := lease.New(pool)
+		if err != nil {
+			return fmt.Errorf("processor: init lease: %w", err)
+		}
+		logger.Info("running processor loop", "owner", l.Owner())
+		if err := processor.New(pool, l, logger).Run(ctx); err != nil {
+			return fmt.Errorf("processor: %w", err)
+		}
+		logger.Info("shutting down", "role", string(role))
+		return nil
+	}
+
+	// The HTTP server (M7) is not built yet. Boot, hold until a shutdown signal,
+	// then exit cleanly so the lifecycle wiring is exercised from day one (plan §M1).
 	logger.Info("running; awaiting shutdown signal", "role", string(role))
 	<-ctx.Done()
 
