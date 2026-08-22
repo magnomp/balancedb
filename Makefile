@@ -7,7 +7,7 @@ GOFUMPT ?= gofumpt
 # Package list, computed once.
 PKGS := ./...
 
-.PHONY: all lint test itest simtest tools fmt check-docs openapi openapi-gen loadgen
+.PHONY: all lint test itest simtest tools fmt check-docs openapi openapi-gen loadgen smoke image
 
 all: lint test
 
@@ -102,6 +102,18 @@ openapi: openapi-gen
 ## Pass flags via ARGS, e.g. make loadgen ARGS="-rate 200 -duration 1m".
 loadgen:
 	$(GO) run ./cmd/loadgen $(ARGS)
+
+## image: build the production Docker image (multi-stage, distroless, plan §M11).
+image:
+	docker build -t balancedb:local .
+
+## smoke: end-to-end smoke test (plan §M11 "Done when"). Builds the image, brings
+## up the prod-like docker-compose stack, inserts a group with a synchronous wait,
+## reads balances, then kills the active processor and asserts the standby takes
+## over within the lease TTL. Self-contained (tears the stack down on exit); set
+## KEEP_UP=1 to leave it running. Requires Docker + the compose plugin. M13 reuses it.
+smoke:
+	./scripts/smoke.sh
 
 ## tools: install pinned dev tooling into GOBIN.
 tools:
