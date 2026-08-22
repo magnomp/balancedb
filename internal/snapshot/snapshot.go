@@ -46,14 +46,17 @@ const dayFormat = "2006-01-02"
 // Apply records a confirmed operation of amount v against account a on the UTC day
 // of effectiveAt: it upserts that day's cumulative snapshot and cascades v into
 // every existing later day (spec §8.4). It must run inside the transaction that
-// confirms the operation.
-func Apply(ctx context.Context, db execer, accountID int64, effectiveAt time.Time, amount int64) error {
+// confirms the operation. It returns the total snapshot rows touched (1 for the
+// op's own day plus one per existing later day cascaded) — the backdating-workload
+// signal surfaced as a metric in the processor (spec §13).
+func Apply(ctx context.Context, db execer, accountID int64, effectiveAt time.Time, amount int64) (int64, error) {
 	day := effectiveAt.UTC().Format(dayFormat)
 	if _, err := db.Exec(ctx, upsertDay, accountID, day, amount); err != nil {
-		return fmt.Errorf("snapshot upsert (account %d, day %s): %w", accountID, day, err)
+		return 0, fmt.Errorf("snapshot upsert (account %d, day %s): %w", accountID, day, err)
 	}
-	if _, err := db.Exec(ctx, cascadeLater, accountID, day, amount); err != nil {
-		return fmt.Errorf("snapshot cascade (account %d, day %s): %w", accountID, day, err)
+	tag, err := db.Exec(ctx, cascadeLater, accountID, day, amount)
+	if err != nil {
+		return 0, fmt.Errorf("snapshot cascade (account %d, day %s): %w", accountID, day, err)
 	}
-	return nil
+	return 1 + tag.RowsAffected(), nil
 }

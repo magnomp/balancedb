@@ -37,7 +37,7 @@ func balOn(t *testing.T, pool *pgxpool.Pool, dayStr string) (int64, bool) {
 
 func apply(t *testing.T, pool *pgxpool.Pool, when time.Time, amount int64) {
 	t.Helper()
-	if err := snapshot.Apply(context.Background(), pool, acct, when, amount); err != nil {
+	if _, err := snapshot.Apply(context.Background(), pool, acct, when, amount); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
 }

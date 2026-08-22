@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -13,6 +14,7 @@ import (
 	"github.com/magnomp/balancedb/internal/db"
 	"github.com/magnomp/balancedb/internal/lease"
 	"github.com/magnomp/balancedb/internal/model"
+	"github.com/magnomp/balancedb/internal/obs"
 )
 
 // configRetryBackoff is the fixed pause after a failed config read before the
@@ -35,11 +37,19 @@ const (
 	// status='PENDING'). transaction_id NULL marks a single; otherwise the row is a
 	// group leg and the group is decided at its FIRST leg by id, later legs skipped
 	// by status. Ordering is taken only from here (G3), never from doorbell arrival.
-	fetchPendingWork = `SELECT id, account_id, amount, effective_at, transaction_id
+	fetchPendingWork = `SELECT id, account_id, amount, effective_at, transaction_id, registered_at, now()
   FROM operations
  WHERE status = 'PENDING'
  ORDER BY id
  LIMIT $1`
+
+	// selectQueueStats samples the PENDING backlog for the §13 queue-depth and
+	// oldest-PENDING-age gauges. Both endpoints of the age are the DB clock (now()
+	// minus the row's registered_at), so it never mixes the process clock in. Cheap:
+	// the count uses the partial work index and min(registered_at) is monotone with
+	// the min pending id.
+	selectQueueStats = `SELECT count(*), COALESCE(EXTRACT(EPOCH FROM (now() - min(registered_at))), 0)
+  FROM operations WHERE status = 'PENDING'`
 
 	// The doorbell channel is the literal global work_available (ADR-0002); the api
 	// insert path rings the same channel. It is per-database, so a processor may be
@@ -74,6 +84,22 @@ type Processor struct {
 	lease *lease.Lease
 	log   *slog.Logger
 
+	// metrics is the observability sink (spec §13). Nil-safe: every record call is a
+	// no-op on a nil *obs.Metrics, so tests and metric-less runs work unchanged.
+	metrics *obs.Metrics
+	// wasLeader tracks the previous cycle's leadership so a transition (gain or loss)
+	// can be counted as one leadership change (§13).
+	wasLeader bool
+	// leaderState mirrors wasLeader for concurrent readers (the /readyz handler runs
+	// on another goroutine). The lease itself is single-threaded, so this atomic is
+	// the safe cross-goroutine view of leadership.
+	leaderState atomic.Bool
+	// acc accumulates a batch's decision/snapshot observations; it is flushed to
+	// metrics only after the batch transaction commits, so a rolled-back batch counts
+	// nothing. Set for the duration of one transaction, nil otherwise. Safe because
+	// the Processor is single-threaded.
+	acc *batchAccum
+
 	// listenConn is the dedicated LISTEN work_available connection, lazily armed
 	// the first time the leader idle-waits and re-armed if it breaks.
 	listenConn *pgxpool.Conn
@@ -96,6 +122,56 @@ func New(pool *pgxpool.Pool, l *lease.Lease, log *slog.Logger) *Processor {
 		log = slog.Default()
 	}
 	return &Processor{pool: pool, lease: l, log: log}
+}
+
+// SetMetrics wires the observability sink (spec §13). Call it before Run; the
+// zero value (nil metrics) leaves every record call a no-op. Kept a setter rather
+// than a constructor parameter so existing callers and tests are unaffected.
+func (p *Processor) SetMetrics(m *obs.Metrics) { p.metrics = m }
+
+// decision records one committed terminal decision by kind and outcome (§13).
+type decision struct{ kind, outcome string }
+
+// batchAccum buffers a batch transaction's observations so they reach Prometheus
+// only if the batch commits (a rolled-back batch counts nothing).
+type batchAccum struct {
+	decisions    []decision
+	snapshotRows []int64
+}
+
+// recordDecision buffers one decision for post-commit flush. No-op outside a batch.
+func (p *Processor) recordDecision(kind, outcome string) {
+	if p.acc != nil {
+		p.acc.decisions = append(p.acc.decisions, decision{kind: kind, outcome: outcome})
+	}
+}
+
+// recordSnapshotRows buffers one confirmation's snapshot-rows-touched count.
+func (p *Processor) recordSnapshotRows(n int64) {
+	if p.acc != nil {
+		p.acc.snapshotRows = append(p.acc.snapshotRows, n)
+	}
+}
+
+// withBatchTx runs fn inside a transaction with an accumulator armed, then flushes
+// the buffered observations to metrics only on a clean commit. It replaces the raw
+// db.WithTx call in every decision path (single, group, and batch) so decision and
+// snapshot metrics are never double-counted across a guard-miss rollback.
+func (p *Processor) withBatchTx(ctx context.Context, fn func(pgx.Tx) error) error {
+	acc := &batchAccum{}
+	p.acc = acc
+	err := db.WithTx(ctx, p.pool, fn)
+	p.acc = nil
+	if err != nil {
+		return err
+	}
+	for _, d := range acc.decisions {
+		p.metrics.RecordDecision(d.kind, d.outcome)
+	}
+	for _, n := range acc.snapshotRows {
+		p.metrics.ObserveSnapshotRows(n)
+	}
+	return nil
 }
 
 // Run drives the loop until ctx is cancelled, then releases the lease and returns
@@ -131,6 +207,11 @@ func (p *Processor) Run(ctx context.Context) error {
 		ttl := time.Duration(cfg.LeaseTTLMs) * time.Millisecond
 		loopInterval := clampInterval(time.Duration(cfg.LoopIntervalMs) * time.Millisecond)
 
+		// Sample the cell's PENDING backlog once per cycle for the §13 queue-depth
+		// and oldest-age gauges. Any node may sample; a best-effort read whose error
+		// is logged and ignored (metrics never affect control flow).
+		p.sampleQueue(ctx)
+
 		leader, err := p.lease.Acquire(ctx, ttl)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -142,6 +223,7 @@ func (p *Processor) Run(ctx context.Context) error {
 			}
 			continue
 		}
+		p.observeLeadership(leader)
 
 		if !leader {
 			// Standby: do not listen; just poll for the lease next interval.
@@ -151,6 +233,11 @@ func (p *Processor) Run(ctx context.Context) error {
 			continue
 		}
 
+		// Loop utilization rho (§13): busy time (drain) over the whole cycle
+		// wall-clock (drain + idle wait). Measured on the process clock — a
+		// within-process elapsed duration, not a lease or ordering comparison.
+		cycleStart := time.Now()
+		busyStart := time.Now()
 		if err := p.drain(ctx, cfg.BatchSize); err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -163,12 +250,50 @@ func (p *Processor) Run(ctx context.Context) error {
 			}
 			// Either way fall through to the idle wait, then loop.
 		}
+		p.metrics.AddLoopBusy(time.Since(busyStart).Seconds())
 
 		deadline := idleDeadline(loopInterval, ttl)
 		if err := p.idleWaitLeader(ctx, deadline); err != nil {
 			return nil
 		}
+		p.metrics.AddLoopWall(time.Since(cycleStart).Seconds())
 	}
+}
+
+// observeLeadership records this cycle's leadership state and counts a transition
+// (gain or loss) as one leadership change (§13 leadership changes/hour signal).
+func (p *Processor) observeLeadership(leader bool) {
+	if leader != p.wasLeader {
+		p.metrics.LeadershipChanged()
+		p.wasLeader = leader
+	}
+	p.leaderState.Store(leader)
+	p.metrics.SetLeader(leader)
+}
+
+// IsLeader reports whether this instance currently holds the lease. Safe to call
+// from another goroutine (the /readyz handler); the value is informational — a
+// standby is still healthy (plan §M9).
+func (p *Processor) IsLeader() bool { return p.leaderState.Load() }
+
+// sampleQueue reads the PENDING backlog into the §13 gauges. Best-effort: on error
+// it logs and returns without touching the gauges (they hold their last value).
+func (p *Processor) sampleQueue(ctx context.Context) {
+	if p.metrics == nil {
+		return
+	}
+	var (
+		depth  int64
+		ageSec float64
+	)
+	if err := p.pool.QueryRow(ctx, selectQueueStats).Scan(&depth, &ageSec); err != nil {
+		if ctx.Err() == nil {
+			p.log.Debug("sample queue stats", "err", err)
+		}
+		return
+	}
+	p.metrics.SetQueueDepth(float64(depth))
+	p.metrics.SetOldestPendingAge(ageSec)
 }
 
 // drain fetches PENDING work ordered by id and decides it in batches, repeating
@@ -205,9 +330,10 @@ func (p *Processor) drain(ctx context.Context, batchSize int) error {
 // legs of that group are skipped (both in-batch, via the decided set, and across
 // batches, because a decided group's legs are no longer PENDING). Guards are
 // evaluated per decision; any guard miss returns errGuardMiss, which db.WithTx
-// turns into a whole-batch rollback.
+// turns into a whole-batch rollback. Decision/snapshot metrics buffered during the
+// batch are flushed only on a clean commit (withBatchTx).
 func (p *Processor) processBatch(ctx context.Context, work []workRow) error {
-	return db.WithTx(ctx, p.pool, func(tx pgx.Tx) error {
+	return p.withBatchTx(ctx, func(tx pgx.Tx) error {
 		decided := make(map[int64]bool)
 		for _, w := range work {
 			if ctx.Err() != nil {
@@ -242,10 +368,18 @@ func (p *Processor) fetchPending(ctx context.Context, batchSize int) ([]workRow,
 
 	var work []workRow
 	for rows.Next() {
-		var w workRow
-		if err := rows.Scan(&w.ID, &w.AccountID, &w.Amount, &w.EffectiveAt, &w.TransactionID); err != nil {
+		var (
+			w            workRow
+			registeredAt time.Time
+			dbNow        time.Time
+		)
+		if err := rows.Scan(&w.ID, &w.AccountID, &w.Amount, &w.EffectiveAt, &w.TransactionID, &registeredAt, &dbNow); err != nil {
 			return nil, fmt.Errorf("scan pending work: %w", err)
 		}
+		// Doorbell wakeup lag (ADR-0002): insert-commit to leader-pickup, both ends
+		// on the DB clock (now() and registered_at from the same query), so no process
+		// clock enters the measurement.
+		p.metrics.ObserveDoorbellLag(dbNow.Sub(registeredAt).Seconds())
 		work = append(work, w)
 	}
 	if err := rows.Err(); err != nil {
