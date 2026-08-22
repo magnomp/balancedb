@@ -1,0 +1,157 @@
+# BalanceDB CI + release pipeline (plan §M13).
+#
+# Stages (fan-in via `needs:`):
+#   lint  ─┐
+#   test  ─┼─▶ integration ─▶ image (build → compose smoke → push)
+#          ┘
+# On a tagged commit (refs/tags/v*) the image job produces a pullable image that has
+# passed the M11 compose smoke test, tagged by git SHA and by semver — plan §M13
+# "Done when". Pushes happen only on push events to the repo (never from PRs/forks).
+#
+# The gate commands (make lint / test / itest / simtest / smoke) are the SAME targets
+# a developer runs locally; CI just provisions the toolchain and a Postgres 18 service.
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+
+# Least privilege: read source by default; the image job additionally needs
+# packages:write to push to GHCR (granted at the job level).
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.25.0"
+  GOLANGCI_LINT_VERSION: "v2.5.0"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 1a: lint — gofumpt formatting + golangci-lint (go vet) + docs sync.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      # gofumpt is the formatting authority (make fmt / make lint); install the same
+      # binary the repo standardizes on so the CI check matches local `make lint`.
+      - name: Install gofumpt
+        run: go install mvdan.cc/gofumpt@latest
+      # golangci-lint runs `go vet` across all build tags (.golangci.yml). Installed
+      # via its official pinned installer — identical to `make tools`' version.
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" "${GOLANGCI_LINT_VERSION}"
+      - name: make lint
+        run: make lint
+
+  # ---------------------------------------------------------------------------
+  # Stage 1b: unit tests — pure, no database (includes the in-memory sim reference
+  # model property tests, which run under `make test`).
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: make test
+        run: make test
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: integration + simulation against a Postgres 18 service container.
+  # Tests self-isolate in throwaway schemas (internal/dbtest), so one database
+  # serves both make itest and make simtest.
+  integration:
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: balancedb
+          POSTGRES_PASSWORD: balancedb
+          POSTGRES_DB: balancedb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U balancedb -d balancedb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgres://balancedb:balancedb@127.0.0.1:5432/balancedb?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: make itest
+        run: make itest
+      - name: make simtest
+        run: make simtest
+
+  # ---------------------------------------------------------------------------
+  # Stage 3: build the image, prove it with the M11 compose smoke test, then push.
+  # `make smoke` builds `balancedb:local` (docker compose up --build), runs the full
+  # end-to-end + failover checks, and tears the stack down. The image that PASSED the
+  # smoke test is exactly the one tagged and pushed below — build once, prove, ship.
+  image:
+    runs-on: ubuntu-latest
+    needs: [integration]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compose smoke test (builds balancedb:local, runs + tears down)
+        env:
+          # Generous budgets: shared CI runners are slower than a dev box. The
+          # config-default lease_ttl_ms is 15000, so failover needs a >15s budget.
+          BOOT_TIMEOUT: "300"
+          FAILOVER_TIMEOUT: "60"
+        run: make smoke
+
+      # Publish only on push events (branch pushes and tags) — never for pull
+      # requests, which lack write credentials and may originate from forks.
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and push the smoke-tested image
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          # GHCR requires a lowercase repository path.
+          repo="ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+
+          # Always: tag by (short) git SHA — the immutable, always-pullable handle.
+          sha_tag="${repo}:sha-${GITHUB_SHA::12}"
+          docker tag balancedb:local "${sha_tag}"
+          docker push "${sha_tag}"
+          echo "pushed ${sha_tag}"
+
+          # On a semver tag (refs/tags/vX.Y.Z): also publish the version and :latest.
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+            for t in "${repo}:${version}" "${repo}:latest"; do
+              docker tag balancedb:local "${t}"
+              docker push "${t}"
+              echo "pushed ${t}"
+            done
+          fi

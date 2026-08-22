@@ -891,3 +891,104 @@ Notes for next agents (M13 CI):
   schemas isolate). The compose smoke stage reuses `make smoke` verbatim (M11 note).
 - `oasdiff` still not installed on this box (M7/M11 note) — `make openapi` skips its
   breaking-change check gracefully; CI must install it to activate that gate.
+
+## M13 — 2026-08-22
+
+Built (CI + release; the final milestone):
+- `.golangci.yml` (schema v2) — the committed golangci-lint config plan §M13 asks
+  for. Deliberately narrow: golangci-lint is the `go vet` runner (`default: none`,
+  enable `govet`), with `build-tags: [itest, simtest]` so it vets EVERY .go file —
+  including the integration/simulation sources that the previous bare `go vet ./...`
+  silently skipped. gofumpt (the other §M13 gate) stays enforced by the standalone
+  binary the repo already standardizes on — see the gofumpt decision below.
+- `Makefile` — `make lint` now runs `golangci-lint run` in place of bare `go vet`
+  (still gofumpt check + check-docs); `make tools` now also installs the pinned
+  golangci-lint (`GOLANGCI_LINT_VERSION=v2.5.0`), so the M12 devcontainer postCreate
+  (`make tools`) picks it up for free — closes the M12 handoff's open item.
+- `CLAUDE.md` §4 — updated IN THIS milestone's commit (build(lint) commit) to
+  describe the new `make lint` (gofumpt + golangci-lint go vet + check-docs) and its
+  tool requirement, replacing the old "go vet … no external deps" line. check-docs
+  stays green (AGENTS.md is the symlink). File is 103 lines (≤150 cap).
+- `.github/workflows/ci.yml` — the GitHub Actions pipeline (plan §M13). Jobs fan in
+  via `needs:`  — `lint` + `test` (parallel) → `integration` → `image`:
+  - lint: `make lint` (gofumpt via `go install`, golangci-lint via its official
+    pinned installer script — identical to what `make tools`/local use).
+  - test: `make test` (pure unit + in-memory sim reference-model property tests).
+  - integration: `make itest` + `make simtest` against a `postgres:18` **service
+    container**; `TEST_DATABASE_URL` points at it and tests self-isolate in throwaway
+    schemas (internal/dbtest), so one DB serves both targets.
+  - image: `make smoke` builds `balancedb:local` (docker compose up --build) and runs
+    the M11 end-to-end + failover smoke test; the **exact image that passed smoke** is
+    then tagged and pushed to GHCR — always `:sha-<12>`, and additionally
+    `:<semver>` + `:latest` on `refs/tags/v*`. Push steps are gated to
+    `github.event_name == 'push'` (never PRs/forks; job has `packages: write`).
+    Smoke runs on PRs too (build+e2e validation) but does not push.
+
+Decisions (no ADR — plan §M13 pre-sanctions "golangci-lint config committed", so this
+is planned, not a deviation; golangci-lint is a dev tool, not a go.mod dependency, so
+the "new dependency ⇒ ADR" convention does not apply):
+- **gofumpt authority = standalone gofumpt, NOT golangci-lint's bundled gofumpt.**
+  golangci-lint v2.5.0 bundles an older gofumpt that wants to expand ONE naked return
+  (`internal/processor/processor_itest_test.go`) that standalone gofumpt v0.11.0 (and
+  the devcontainer's gopls gofumpt) consider already-formatted. Routing the format
+  gate through golangci-lint would have (a) forced a reformat of an M5 test file for a
+  cosmetic tool-version quirk and (b) created a two-gofumpt drift where a dev's editor
+  says "clean" and CI says "dirty". Keeping the standalone gofumpt gate (unchanged
+  from M1) avoids both. Consequence: `.golangci.yml` intentionally declares NO
+  formatter — golangci-lint does vet only; gofumpt is the separate, stable gate.
+- **golangci-lint linter set kept to govet only** (not the broader `default: standard`
+  errcheck/staticcheck/unused set). Enabling the standard set surfaces ~22 pre-existing
+  findings across earlier milestones (e.g. `obs/metrics.go` uses the deprecated
+  `prometheus.NewGoCollector`/`NewProcessCollector`; a couple of dead assignments /
+  unused helpers in itest files). Fixing those is out of a CI milestone's scope
+  (tasks/_common.md scope discipline). A future cleanup milestone can flip to
+  `default: standard` once they are addressed — the config comment says so.
+- **CI installs golangci-lint via its official installer script (pinned v2.5.0), not
+  the golangci-lint-action.** Fewer third-party actions to version-verify, and the CI
+  command becomes byte-identical to the local `make lint` I validated. The Makefile
+  `make tools` uses `go install …@v2.5.0` for the same version (both were verified to
+  work on this box).
+- **Push target = GHCR** (`ghcr.io/<repo>`, lowercased), authenticated with the
+  built-in `GITHUB_TOKEN` (no extra secret). SHA tag always; semver + latest on tags.
+  The image is built once (by the smoke stage) and that same image is shipped — build
+  once, prove, push.
+
+Validation — the live GHA run was validated by LOCAL EQUIVALENT + INSPECTION, NOT an
+actual pipeline execution (this box cannot trigger GitHub Actions):
+- Workflow parses (`python3 yaml.safe_load`) and passes **actionlint** (which also
+  shellchecks the `run:` scripts) with zero findings.
+- All referenced action versions confirmed to exist on GitHub (git ls-remote):
+  `actions/checkout@v4`, `actions/setup-go@v5`, `docker/login-action@v3`.
+- **Every command the CI invokes was run locally and passed**: `make lint`,
+  `make test`, `make itest`, `make simtest` (fresh `-count=1`: 42.9s), and
+  `make smoke` (built `balancedb:local` 16.1MB, group COMMITTED w/ 2 CONFIRMED legs,
+  balances correct, killed leader → standby took over in ~17s, post-failover insert
+  CONFIRMED — "SMOKE TEST PASSED"). golangci-lint v2.5.0 installed via the same
+  official installer the workflow uses.
+- The image job's tag/push shell logic was exercised under bash (the GHA `run:`
+  shell): branch push → one `sha-…` tag; `refs/tags/v1.4.2` → `sha-…` + `1.4.2` +
+  `latest`. `docker tag balancedb:local …` verified against the real smoke image.
+
+Deferred/known issues:
+- **`oasdiff` breaking-change gate is NOT wired into CI.** M7/M11 noted oasdiff isn't
+  installed here; `make openapi` skips it gracefully. I did not add an oasdiff step to
+  ci.yml because plan §M13's scope is lint/test/image/smoke/push and I could not
+  validate an oasdiff step end-to-end locally (tool absent). A follow-up can add an
+  `openapi` job that installs oasdiff and runs `make openapi` (the target is already
+  correct — compares `HEAD:api/openapi.yaml`). Flagged, not blocking §M13's "Done when".
+- CI failover budget is generous (`BOOT_TIMEOUT=300`, `FAILOVER_TIMEOUT=60`) because
+  shared runners are slower than a dev box (config-default lease_ttl_ms=15000). Local
+  smoke used the script defaults (180/30) and passed with ~17s failover.
+- No Go/processor/validation code changed, so the simulation reference model is
+  untouched; `make simtest` needed nothing extended for M13.
+
+Notes for next agents:
+- To cut a release: push a `vX.Y.Z` tag. CI runs the full pipeline and, on green,
+  pushes `ghcr.io/magnomp/balancedb:X.Y.Z` + `:latest` + `:sha-<12>` — a pullable
+  image that passed the compose smoke test (plan §M13 "Done when").
+- If you widen linting to `default: standard`, fix the pre-existing findings listed
+  above FIRST (they live in earlier-milestone code) or the lint gate goes red.
+- Environment: golangci-lint v2.5.0 was installed to `$HOME/go/bin` on this box (via
+  the official installer script) to validate the config; the PATH bootstrap from the
+  M1 note still applies. The standalone `balancedb-pg` on host 5432 was left running
+  and untouched; the M13 smoke compose stack was torn down (`down -v`).

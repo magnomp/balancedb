@@ -56,8 +56,9 @@ you do.
 
 ## 4. Workflow — the Makefile is the interface
 
-- `make lint` — gofumpt check + `go vet` + `check-docs` (CLAUDE.md/AGENTS.md sync).
-  No external deps.
+- `make lint` — gofumpt check + `golangci-lint run` (go vet across all build tags,
+  incl. `itest`/`simtest`; config in `.golangci.yml`) + `check-docs` (CLAUDE.md/
+  AGENTS.md sync). Needs `gofumpt` + `golangci-lint` on PATH (`make tools`).
 - `make test` — unit tests, no external deps.
 - `make itest` — integration tests against **`TEST_DATABASE_URL`**; each test
   self-isolates in a throwaway schema. *(Stub until M2 lands the migration/schema
