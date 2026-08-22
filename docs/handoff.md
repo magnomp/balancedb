@@ -49,3 +49,41 @@ Notes for next agents (environment):
   `BALANCEDB_DATABASE_URL=postgres://balancedb:balancedb@127.0.0.1:5432/balancedb?sslmode=disable`.
 - Gates run green: `make lint`, `make test`. Manual: `migrate`, `api`, `processor`
   all boot, log the redacted startup line, and shut down cleanly.
+
+## M1.5 — 2026-08-22
+
+Built:
+- `CLAUDE.md` (96 lines, ≤150 cap) — five sections per plan §M1.5: orientation,
+  inviolables, code conventions, workflow, package map. Points at spec/plan/ADR
+  sections; paraphrases nothing. Package map lists the full `internal/` target set
+  with spec sections, marking unbuilt packages `(Mn)`.
+- `AGENTS.md` — symlink → `CLAUDE.md` (sync by construction).
+- ADR skeleton: `docs/decisions/README.md` (numbering rule + index),
+  `template.md`, and `0001-custom-migration-runner.md` (records the plan §M2
+  decision). Existing 0002/0003 integrated into the index, not renumbered.
+- `doc.go` for `internal/config` and `internal/db` — package comment moved out of
+  `config.go`/`db.go` into `doc.go` (single package comment per package), each
+  stating responsibility + spec/plan section.
+- `make check-docs` (wired into `make lint`) — verifies `AGENTS.md` is a symlink to
+  `CLAUDE.md`, else byte-identical, else fails with an actionable message.
+
+Decisions: ADR-0001 written (custom migration runner; retroactive record of the
+plan §M2 call, no behavior change). No new dependencies. No deviations from
+spec/plan.
+
+Deferred/known issues:
+- CLAUDE.md's workflow section references `make simtest` (M10) and a real
+  `make itest` (M2) that are still stubs/absent — intentional; the map/workflow
+  describe the stable target, not today's partial state.
+
+Notes for next agents:
+- CLAUDE.md is now authoritative and supersedes the seed "Conventions" in
+  `tasks/_common.md`. Update CLAUDE.md in the SAME commit as any change that alters
+  a convention it states, and keep it ≤150 lines.
+- When you add an `internal/` package, add its `doc.go` (responsibility + spec
+  section) and flip its map line in CLAUDE.md from `(Mn)` to **built**.
+- Cold-session spot-check passed: CLAUDE.md alone answers "the three guards + where"
+  (§7.2, every processor tx) and "how to run integration tests" (`make itest` +
+  `TEST_DATABASE_URL`).
+- Gates green: `make lint` (incl. `check-docs`), `make test`. PATH bootstrap from
+  the M1 note above still applies on this box.
