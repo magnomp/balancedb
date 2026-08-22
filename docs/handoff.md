@@ -259,3 +259,86 @@ Notes for next agents (M5, processor loop):
   acquire/renew/release); M5 writes the fence against the same `owner` value
   (`lease.Owner()`).
 - CLAUDE.md package map line for `lease` flipped `(M4)` → **built**.
+
+## M5 — 2026-08-22
+
+Built:
+- `internal/snapshot` (now **built**): the spec §8.4 daily cumulative snapshots.
+  `Apply(ctx, execer, accountID, effectiveAt, amount)` does two writes — upsert the
+  operation's own UTC-day row (a fresh day is seeded from the most recent earlier
+  snapshot so it starts at the right running total; an existing day just gains v),
+  then the sparse cascade `UPDATE ... WHERE day > :op_day`. Newest-day common case
+  touches zero later rows; a k-day backdate touches ≤ k. UTC day computed in Go from
+  the op's own effective_at (pure data transform, not a clock read) and passed as a
+  literal `YYYY-MM-DD` cast `::date`, so it is independent of DB session tz. Takes an
+  `execer` interface (pool or tx). itest covers new-day/increment and seed+cascade.
+- `internal/processor` (now **built (M5)**; groups + batching are M6): the spec §8.1
+  leader loop and §8.2 single-op processing with all three §7.2 guards verbatim,
+  each rowcount-checked.
+  - Loop (`Run`): re-read `config` row → `lease.Acquire` (renew) → if leader, `drain`
+    PENDING singles `ORDER BY id LIMIT batch_size` until an empty select → idle-wait.
+    Standbys don't listen; they `sleepCtx(loop_interval)`. Only ctx cancellation ends
+    `Run` (it then Releases the lease); transient errors and guard misses are logged
+    and folded back into the loop.
+  - Idle wait (leader only): a dedicated `LISTEN work_available` pool connection,
+    `WaitForNotification` with deadline `idleDeadline = min(loop_interval, ttl/2)`.
+    Doorbell wakes early; the timed wakeup (DeadlineExceeded → nil) is the correctness
+    path. Connection loss drops the listener (re-armed next cycle). Ordering is taken
+    ONLY from `ORDER BY id`, never from notification arrival (G3).
+  - `processSingle` (one `db.WithTx`): Guard 1 lease fence (`SELECT 1 FROM leader_lease
+    WHERE owner=:me AND lease_until > now()`, ErrNoRows → miss) — separate from
+    `lease.Acquire`, uses `lease.Owner()`; account read (balance, version, limits,
+    external_id); §6 binary validation; ACCEPT → Guard 2 conditional flip to CONFIRMED
+    (rowcount≠1 → miss), Guard 3 account version CAS (rowcount≠1 → miss),
+    `snapshot.Apply`, `NOTIFY outcomes 'op:<id>'`; REJECT → Guard 2 flip to INVALID
+    with `model.Rejection` detail (no account write, so no Guard 3), notify. Any guard
+    miss returns `errGuardMiss`, WithTx rolls back, the loop re-acquires and continues.
+  - Wired the `processor` role in `cmd/balancedb/main.go` (builds a lease, runs the
+    loop). The `api` role still just holds until shutdown (M7).
+- `internal/processor/processor_itest_test.go` (internal `package processor`, tag
+  `itest`): accept (balance/version/snapshot/status/confirmed_at), reject (INVALID +
+  reason detail, no change), unbounded limits, backdated cascade through existing later
+  snapshots, future-dated entering final balance + forward cascade (N5), and the three
+  guard-miss scenarios (Guard 1 non-leader; Guard 2 re-process already-decided; Guard 3
+  stale-version via a test seam, then clean retry). Doorbell wakeup (~0.09s under a 60s
+  interval) and doorbell-loss timed wakeup (~1.08s ≈ one 1s interval) both pass.
+- `simtest/` reference model extended (single-op validation + confirmed-balance
+  evolution): accounts now track limits + balance; `SetLimits` (enforces §6),
+  `ProcessNext`/`ProcessAll` decide PENDING singles in registration order and evolve
+  balances, `CheckG1`. New property test asserts G1 after every single decision and
+  that each decision matches the validation rule (300 seeds; seed printed on failure).
+
+Decisions (no new ADR — all within milestone scope or adherence to existing ADRs):
+- **M5 processes singles only.** The work select filters `transaction_id IS NULL`;
+  group legs stay PENDING for M6, which replaces this with the full §8.1 single/group
+  dispatch + skip-by-status. This is the milestone boundary, not a spec deviation. NB:
+  once groups exist, interleaving singles ahead of an earlier-registered group would
+  break G3 — M6 must restore the "select all PENDING ORDER BY id, dispatch" form.
+- **Doorbell channel kept literal `work_available`** (matches the api NOTIFY side and
+  ADR-0002). Not schema-scoped despite the M3 handoff's suggestion, because scoping
+  would require changing the api side too (out of M5 scope) and cross-schema wakeups
+  are harmless (a spurious wake just re-selects and finds nothing). Left as a possible
+  future refinement needing BOTH sides changed together.
+- **`idleDeadline = min(loop_interval, ttl/2)`** concretizes plan §M5's "time to next
+  safe lease renewal": ttl/2 guarantees the loop wakes to renew well before expiry even
+  if loop_interval is configured longer than the TTL.
+- Two unexported test seams on `Processor` (`afterAccountRead`, `enteredIdleWait`),
+  always nil in production, make the Guard 3 version-CAS miss and the doorbell timing
+  deterministic. Not behavior.
+
+Deferred/known issues:
+- Groups + batching (§8.3/§8.5) are M6, as planned.
+- A standby that never becomes leader still holds its armed listen conn once armed;
+  harmless (released on shutdown). Not worth dropping-on-demotion for one conn.
+
+Notes for next agents (M6):
+- Replace `fetchPendingSingles` (the `transaction_id IS NULL` filter) with the full
+  §8.1 dispatch: `SELECT ... WHERE status='PENDING' ORDER BY id LIMIT :chunk`, then
+  `process_single` (exists) vs `process_group` (new), with skip-by-status for later
+  legs of an already-decided group. This is what restores G3 when groups are present.
+- `process_group` reuses the same guard shape: Guard 1 fence once, Guard 2 flips all
+  legs + the transaction row conditionally, Guard 3 per involved account (net per
+  account), `snapshot.Apply` per leg, `NOTIFY outcomes 'tx:<id>'`. §8.5 batching packs
+  up to `batch_size` decisions per tx with guards per decision — extend `drain`.
+- `snapshot.Apply` is leg-agnostic; call it once per confirmed leg inside the group tx.
+- CLAUDE.md package map: `processor` → **built (M5)**, `snapshot` → **built**.
