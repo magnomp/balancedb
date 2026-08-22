@@ -31,12 +31,14 @@ type refTx struct {
 }
 
 // refAccount tracks an account's limits and its FINAL (confirmed) balance — the
-// object of G1. NULL limits are unbounded.
+// object of G1. NULL limits are unbounded. ExternalID is carried so a group
+// rejection can name the offending account exactly as the processor does.
 type refAccount struct {
-	ID      int64
-	Min     *int64
-	Max     *int64
-	Balance int64
+	ID         int64
+	ExternalID string
+	Min        *int64
+	Max        *int64
+	Balance    int64
 }
 
 // Model is the sequential reference model. It replays insertion in registration
@@ -198,7 +200,7 @@ func (m *Model) upsertAccount(ownerID int64, externalID string) int64 {
 	m.nextAccountID++
 	id := m.nextAccountID
 	m.accounts[k] = id
-	m.accountsByID[id] = &refAccount{ID: id}
+	m.accountsByID[id] = &refAccount{ID: id, ExternalID: externalID}
 	return id
 }
 
