@@ -1,8 +1,13 @@
 # BalanceDB — maintenance interface. The Makefile is the contract; see CLAUDE.md
 # (from M1.5) for what each target requires.
 
-GO      ?= go
-GOFUMPT ?= gofumpt
+GO            ?= go
+GOFUMPT       ?= gofumpt
+GOLANGCI_LINT ?= golangci-lint
+
+# Pinned tool versions (installed by `make tools`). golangci-lint 2.x supports the
+# Go 1.25 toolchain; gofumpt is the formatter of record.
+GOLANGCI_LINT_VERSION ?= v2.5.0
 
 # Package list, computed once.
 PKGS := ./...
@@ -31,7 +36,9 @@ psql:
 fmt:
 	$(GOFUMPT) -w .
 
-## lint: gofumpt formatting check + go vet + docs sync. No third-party linter yet (M13).
+## lint: gofumpt formatting check + golangci-lint (go vet) + docs sync (plan §M13).
+## golangci-lint runs go vet across all build tags (incl. itest/simtest); gofumpt is
+## the single formatting authority (see .golangci.yml). Both gates run in CI too.
 lint: check-docs
 	@unformatted="$$($(GOFUMPT) -l .)"; \
 	if [ -n "$$unformatted" ]; then \
@@ -40,7 +47,7 @@ lint: check-docs
 		echo "run 'make fmt'"; \
 		exit 1; \
 	fi
-	$(GO) vet $(PKGS)
+	$(GOLANGCI_LINT) run
 
 ## check-docs: AGENTS.md must stay in sync with CLAUDE.md (M1.5). A symlink
 ## satisfies this by construction; a plain file must be byte-identical.
@@ -131,6 +138,9 @@ image:
 smoke:
 	./scripts/smoke.sh
 
-## tools: install pinned dev tooling into GOBIN.
+## tools: install pinned dev tooling into GOBIN (gofumpt + golangci-lint). Used by
+## the devcontainer postCreate and available for local setup; CI installs the same
+## pinned golangci-lint via its official installer script (see .github/workflows/ci.yml).
 tools:
 	$(GO) install mvdan.cc/gofumpt@latest
+	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
