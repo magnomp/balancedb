@@ -1,0 +1,71 @@
+// BalanceDB devcontainer (plan §M12).
+//
+// "Reopen in Container" on a fresh clone gives a working Go 1.25 toolchain wired to a
+// bundled Postgres 18. The maintenance interface is the Makefile: `make itest` passes
+// with zero manual setup; `make run-processor` + `make run-api` in two terminals is a
+// working local system against the bundled database. See CLAUDE.md §4 and the README.
+{
+  "name": "BalanceDB",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "dev",
+  "workspaceFolder": "/workspaces/balancedb",
+
+  // 8080 = HTTP API + /docs, 9090 = /metrics /healthz /readyz, 5432 = bundled Postgres.
+  "forwardPorts": [8080, 9090, 5432],
+
+  // Deployment config (BALANCEDB_*) is env; behavioral knobs live in the DB config
+  // table (spec §5.2). BALANCEDB_DATABASE_URL points the app at the compose Postgres;
+  // TEST_DATABASE_URL is the SAME database — integration/simulation tests self-isolate
+  // in throwaway schemas (internal/dbtest), so they never disturb a running app.
+  "containerEnv": {
+    "BALANCEDB_DATABASE_URL": "postgres://balancedb:balancedb@postgres:5432/balancedb?sslmode=disable",
+    "BALANCEDB_SCHEMA": "balancedb",
+    "TEST_DATABASE_URL": "postgres://balancedb:balancedb@postgres:5432/balancedb?sslmode=disable",
+    "BALANCEDB_LOG_FORMAT": "text"
+  },
+
+  "features": {
+    // docker-in-docker: build/test the production image (`make image`) from inside the
+    // devcontainer without reaching for the host daemon.
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    // postgres-client: psql (+ pg_dump etc.) for poking at state (`make psql`). Only
+    // the client — the server is the `postgres` compose service. A v15 client talks to
+    // the v18 server fine for interactive inspection.
+    "ghcr.io/robbert229/devcontainer-features/postgresql-client:1": {
+      "version": "15"
+    }
+  },
+
+  // First-boot setup: warm the module cache and install pinned dev tooling (gofumpt)
+  // into GOBIN so `make lint`/`make fmt` work immediately.
+  "postCreateCommand": "go mod download && make tools",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go"
+      ],
+      "settings": {
+        "go.useLanguageServer": true,
+        // gopls does the formatting; gofumpt mode matches `make fmt`/`make lint`, and
+        // staticcheck surfaces the extra diagnostics the M13 linter will also enforce.
+        "gopls": {
+          "formatting.gofumpt": true,
+          "ui.diagnostic.staticcheck": true
+        },
+        "editor.formatOnSave": true,
+        "[go]": {
+          "editor.defaultFormatter": "golang.go",
+          "editor.formatOnSave": true
+        },
+        // SQL syntax highlighting for hand-written migrations (spec's SQL-first design).
+        "[sql]": {
+          "editor.formatOnSave": false
+        },
+        "files.associations": {
+          "migrations/*.sql": "sql"
+        }
+      }
+    }
+  }
+}

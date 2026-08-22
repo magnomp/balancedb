@@ -815,3 +815,79 @@ Notes for next agents (M12 devcontainer, M13 CI):
 - Environment left as found: the standalone `balancedb-pg` on host 5432 is still
   running (used by `make itest`/`simtest` via `TEST_DATABASE_URL`); the M11 compose
   stack was torn down (`docker compose down -v`).
+
+## M12 — 2026-08-22
+
+Built:
+- `.devcontainer/docker-compose.yml` — dev infrastructure (distinct from the prod-like
+  root `docker-compose.yml`): a `dev` service (`mcr.microsoft.com/devcontainers/go:1.25`,
+  `sleep infinity`, workspace bind-mount at `/workspaces/balancedb`, `depends_on`
+  postgres `service_healthy`) and a `postgres` service (`postgres:18`, `pg_isready`
+  healthcheck, named `pgdata` volume mounted at `/var/lib/postgresql` — the pg18 mount
+  lesson from M11). Postgres is NOT published to the host (VS Code `forwardPorts`
+  handles host exposure), so it can't collide with a host-bound 5432.
+- `.devcontainer/devcontainer.json` — `dockerComposeFile`+`service: dev`,
+  `workspaceFolder: /workspaces/balancedb`, `forwardPorts: [8080, 9090, 5432]`,
+  `containerEnv` (BALANCEDB_DATABASE_URL / BALANCEDB_SCHEMA / TEST_DATABASE_URL [same
+  URL — tests self-isolate in throwaway schemas] / BALANCEDB_LOG_FORMAT=text),
+  features `docker-in-docker:2` + `robbert229/.../postgresql-client:1`,
+  `postCreateCommand: go mod download && make tools`, and VS Code customizations (Go
+  extension, gopls `formatting.gofumpt` + `ui.diagnostic.staticcheck`, format-on-save,
+  `.sql` association for `migrations/`).
+- `Makefile` — added the three missing maintenance-interface targets: `run-api`,
+  `run-processor` (`go run ./cmd/balancedb <role>`), and `psql` (opens a shell on
+  `$PSQL_URL`/`$BALANCEDB_DATABASE_URL`). The other §M12 targets (test, itest, simtest,
+  lint, image, loadgen) already existed from M1/M2/M6/M9/M11 — not duplicated.
+
+Decisions (no ADR — within milestone scope, no spec/plan deviation):
+- **postgres-client feature = `ghcr.io/robbert229/devcontainer-features/postgresql-client:1`,
+  client-only, `version: "15"`.** Plan §M12 asks for "postgres-client (psql for poking
+  at state)"; the client-only feature is the faithful match (the DB server is the
+  `postgres` compose service — no redundant server). Its version proposals cap at 15; a
+  v15 psql talks to the v18 server fine for interactive inspection. The alternative
+  `itsmechlark/features/postgresql:1` supports v18 but installs a full server (heavier,
+  unnecessary here) — rejected. Both feature refs verified present on ghcr (200).
+- **`make tools` unchanged (installs gofumpt only).** Plan §M12's postCreateCommand
+  parenthetical says `make tools` installs "golangci-lint, gofumpt", but golangci-lint's
+  config lands in M13 and `make lint` does not use it yet. Adding it now would be M13
+  scope, so `postCreateCommand` runs `make tools` exactly as written and it installs
+  gofumpt today; M13 extends `make tools` when it adds the golangci-lint config.
+- **CLAUDE.md left unchanged.** M12 adds no `internal/` package and alters no stated
+  convention. CLAUDE.md §4 names the gate targets, not every Makefile target (same
+  precedent as the unlisted openapi/loadgen/smoke targets from M7/M9/M11); run-api /
+  run-processor / psql are non-gate convenience targets. `check-docs` stays green.
+
+Validation (the interactive "Reopen in Container" path can't run in this non-interactive
+box, so it was validated by construction + a live compose bring-up, NOT a VS Code
+devcontainer session):
+- `docker compose -f .devcontainer/docker-compose.yml config` parses; services =
+  {postgres, dev}. `devcontainer.json` parses as JSONC with all §M12 keys present.
+- Referenced images/features confirmed to exist: `mcr.microsoft.com/devcontainers/go`
+  tag `1.25` (MCR tags list), `docker-in-docker:2` and the postgresql-client feature
+  (ghcr manifests → 200). Pulled the go:1.25 image and verified it ships go 1.25.12 +
+  make 4.4.1 + git + gcc (no psql → hence the client feature; no gofumpt → hence
+  `make tools` in postCreate), so the "zero manual setup" toolchain claim holds.
+- **End-to-end (no VS Code):** brought the `.devcontainer` compose up under a throwaway
+  project name, waited for postgres `healthy`, then inside the real `dev` service (env =
+  what `containerEnv` provides, DB reached as `postgres:5432`) ran `go mod download &&
+  make itest` → all packages green. Also booted `make run-processor` + `make run-api`
+  in the dev container: api `/readyz` → 200, `POST /accounts` → 201, processor logged
+  "running processor loop" as leader with migrate_on_start=true. Torn down with
+  `down -v`; the standalone `balancedb-pg` on host 5432 was untouched.
+
+Deferred/known issues:
+- The devcontainer keeps `BALANCEDB_MIGRATE_ON_START` at its default `true` (single dev
+  DB, simplest UX) — the opposite of the root prod compose's gated `migrate` role. Both
+  are advisory-lock safe (ADR-0001/0004).
+- No Go code changed, so the simulation reference model is untouched; `make simtest`
+  needs nothing added for M12.
+
+Notes for next agents (M13 CI):
+- The GitHub Actions matrix should install `golangci-lint` and add its config, then
+  extend `make tools`/`make lint` to use it (the M12 postCreateCommand already calls
+  `make tools`, so the devcontainer picks it up for free once M13 lands it).
+- CI's integration/simulation stage can mirror the devcontainer wiring: a
+  `postgres:18` service container + `TEST_DATABASE_URL` = the same URL (throwaway
+  schemas isolate). The compose smoke stage reuses `make smoke` verbatim (M11 note).
+- `oasdiff` still not installed on this box (M7/M11 note) — `make openapi` skips its
+  breaking-change check gracefully; CI must install it to activate that gate.

@@ -7,9 +7,25 @@ GOFUMPT ?= gofumpt
 # Package list, computed once.
 PKGS := ./...
 
-.PHONY: all lint test itest simtest tools fmt check-docs openapi openapi-gen loadgen smoke image
+.PHONY: all lint test itest simtest tools fmt check-docs openapi openapi-gen loadgen smoke image run-api run-processor psql
 
 all: lint test
+
+## run-api: run the API role against BALANCEDB_DATABASE_URL (migrates on boot).
+## In the devcontainer the env is preset; pair with `make run-processor` in a second
+## terminal for a working local system against the bundled Postgres (plan §M12).
+run-api:
+	$(GO) run ./cmd/balancedb api
+
+## run-processor: run the processor role (leader loop) against BALANCEDB_DATABASE_URL.
+## Run alongside `make run-api`; the two together are a complete local ledger cell.
+run-processor:
+	$(GO) run ./cmd/balancedb processor
+
+## psql: open a psql shell on the configured database. Uses BALANCEDB_DATABASE_URL
+## (set in the devcontainer) or the PSQL_URL override. Requires the postgres client.
+psql:
+	psql "$${PSQL_URL:-$(BALANCEDB_DATABASE_URL)}"
 
 ## fmt: rewrite all Go files with gofumpt.
 fmt:
