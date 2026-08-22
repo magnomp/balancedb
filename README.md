@@ -31,6 +31,120 @@ Both roles run migrations on boot (idempotent, advisory-lock guarded) unless
 environment (see plan §0); behavioral knobs (`lease_ttl_ms`, `batch_size`, …) live
 in the DB `config` table and are hot-reloaded each cycle.
 
+## Deployment (Docker + compose)
+
+The repository builds a **single, self-contained image** (multi-stage → static
+binary on `gcr.io/distroless/static-debian12:nonroot` — no shell, non-root, and the
+schema migrations are embedded via `go:embed`, so the image needs nothing but a
+Postgres to point at):
+
+```sh
+make image                 # docker build -t balancedb:local .
+```
+
+The root `docker-compose.yml` is a **prod-like reference deployment**: one
+`postgres:18`, a one-shot `migrate` gate, one `api`, and two `processor`s (one
+active leader, one hot standby). Every BalanceDB service runs the *same* image and
+differs only by its command (the role) and `BALANCEDB_*` environment.
+
+```sh
+docker compose up --build          # or: make smoke  (scripted end-to-end test)
+```
+
+| Service | Role | Host ports | Notes |
+|---|---|---|---|
+| `postgres` | — | `55432→5432` | Bundled Postgres 18. Published on 55432 to avoid colliding with a 5432 already in use; services reach it as `postgres:5432`. |
+| `migrate` | `migrate` | — | Deploy gate: applies the embedded migrations and exits 0. The long-running roles start only after it succeeds. |
+| `api` | `api` | `8080` (HTTP+`/docs`), `9090` (health/metrics) | `BALANCEDB_MIGRATE_ON_START=false` — the gate already migrated. |
+| `processor` | `processor` | `9091→9090` | Leader-or-standby; the health body reports `leader`. |
+| `processor-standby` | `processor` | `9092→9090` | Identical replica; takes over within `lease_ttl_ms` if the leader dies. |
+
+Each role's health surface (`/healthz`, `/readyz`, `/metrics`) binds `:9090`
+*inside* its container (isolated network namespaces, so no clash); the compose file
+publishes them on distinct host ports. The ledger endpoints (spec §10) are on the
+`api` container's `:8080`.
+
+Exercising it once up (owner scope is the `X-Owner-Id` header, §2):
+
+```sh
+# Insert a 2-leg atomic group and wait synchronously for the decision (200 = decided):
+curl -s localhost:8080/transactions \
+  -H 'X-Owner-Id: 1' -H "Idempotency-Key: $(cat /proc/sys/kernel/random/uuid)" \
+  -H 'Content-Type: application/json' -d '{
+    "operations": [
+      {"account":"alice","amount":-100,"effective_at":"2026-01-01T00:00:00Z"},
+      {"account":"bob",  "amount": 100,"effective_at":"2026-01-01T00:00:00Z"}
+    ], "wait_ms": 10000 }'
+
+curl -s localhost:8080/accounts/alice/balance -H 'X-Owner-Id: 1'   # {"balance":-100,...}
+```
+
+`make smoke` scripts exactly this plus a failover check: it kills the active
+processor container and asserts the standby acquires leadership within the lease
+TTL and resumes draining work. It is self-contained (builds, runs, tears down); set
+`KEEP_UP=1` to leave the stack up for inspection. **M13 (CI) reuses this target.**
+
+### Configuration contract
+
+Deployment config is `BALANCEDB_*` environment, parsed once at boot; the process
+refuses to start on any invalid value. *Behavioral* knobs (`lease_ttl_ms`,
+`batch_size`, `api_max_wait_ms`, …) are **not** env — they live in the DB `config`
+table (spec §5.2) and are hot-reloaded every cycle (defaults are seeded by the
+first migration).
+
+| Var | Required | Default | Meaning |
+|---|---|---|---|
+| `BALANCEDB_DATABASE_URL` | yes | — | Postgres URL/DSN (`postgres://…`, supports `sslmode` etc.). |
+| `BALANCEDB_SCHEMA` | no | `balancedb` | Target schema; created if absent. Selects the cell (see below). |
+| `BALANCEDB_HTTP_ADDR` | no | `:8080` | API listen address (`api` role). |
+| `BALANCEDB_METRICS_ADDR` | no | `:9090` | Health + Prometheus endpoints (both roles). |
+| `BALANCEDB_LOG_LEVEL` | no | `info` | slog level (`debug`\|`info`\|`warn`\|`error`). |
+| `BALANCEDB_LOG_FORMAT` | no | `json` | `json` \| `text`. |
+| `BALANCEDB_MIGRATE_ON_START` | no | `true` | Set `false` when using the explicit `migrate` role as a deploy gate. |
+| `BALANCEDB_POOL_MAX_CONNS` | no | `10` | pgxpool size. |
+
+### Roles
+
+- **`api`** — serves the HTTP API (spec §10). Stateless; scale horizontally behind a
+  load balancer. Each instance keeps its own `LISTEN outcomes` connection for the
+  synchronous-wait path (ADR-0002).
+- **`processor`** — the single-leader decision loop (spec §7–§8). Run **two or more**;
+  exactly one holds the leader lease at a time (spec §7.1) and the rest idle as hot
+  standbys. Keep every standby in service — on leader death a standby acquires the
+  lease within `lease_ttl_ms` and continues in strict registration order. The three
+  processing guards (spec §7.2) make a stale ex-leader's late writes no-ops, so
+  failover is safe even if the old leader is only *slow*, not dead.
+- **`migrate`** — applies the embedded migrations and exits. Use it as a CI/CD gate
+  (see upgrades). The runner is advisory-lock guarded, so running it concurrently
+  (or alongside `MIGRATE_ON_START=true` roles) is safe and idempotent.
+
+### Multiple cells / environments in one Postgres
+
+`BALANCEDB_SCHEMA` selects an **independent installation** inside the same database:
+all objects are unqualified and resolved through `search_path` (plan §0), and each
+schema carries its own migration history. Point one cell's api+processors at
+`BALANCEDB_SCHEMA=cell_a` and another's at `cell_b` (or `staging` / `prod`) against
+the same Postgres and they share nothing — separate accounts, ledgers, leases, and
+config. (Note: the LISTEN/NOTIFY doorbell/outcome channels are per-*database*, so
+cells sharing a database may receive each other's wakeups — harmless hints; ordering
+and correctness come from each cell's own `ORDER BY id` work select, ADR-0002.)
+
+### Upgrade procedure
+
+The image is self-contained and forward-only (migrations never edit an applied file;
+a rollback is a new migration). Two supported paths:
+
+1. **Migrate-on-boot (default).** Deploy the new image; every `api`/`processor`
+   runs the embedded migrations on boot under an advisory lock
+   (`BALANCEDB_MIGRATE_ON_START=true`), so concurrent rollout is safe and the first
+   one to win the lock applies, the rest no-op.
+2. **Gated migrate (recommended for controlled rollouts).** Set
+   `BALANCEDB_MIGRATE_ON_START=false` on the long-running roles and run the new
+   image once as the **`migrate`** role first (this is what the compose `migrate`
+   service does). It applies migrations and exits; only then do the api/processor
+   containers start. This makes "schema is up to date" an explicit, observable gate
+   in your pipeline rather than a boot side effect.
+
 ## Observability (spec §13)
 
 Every process — `api` and `processor` alike — serves an operational HTTP surface on

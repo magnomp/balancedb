@@ -738,3 +738,80 @@ Key finding for next agents:
 Gates green: `make lint`, `make test` (simtest breadth ~1.25 s), `make itest`, and
 `make simtest` (full, ~52 s: 1,200 breadth seeds + 40 reproducibility + 30 DB-backed
 fidelity seeds/cases across full-scenario/crash/competing/zombie/version-race/reversal).
+
+## M11 — 2026-08-22
+
+Built:
+- `Dockerfile` — the plan §M11 multi-stage build **verbatim**: `golang:1.25`
+  builder → static `CGO_ENABLED=0 -trimpath -ldflags="-s -w"` binary on
+  `gcr.io/distroless/static-debian12:nonroot` (no shell, non-root). Migrations are
+  embedded (go:embed), so the image is self-contained. `ENTRYPOINT ["/balancedb"]`,
+  `CMD ["api"]` — the role is the container command.
+- `.dockerignore` — trims the build context to the Go module (source + go.mod/go.sum
+  + `migrations/`); excludes docs/scripts/tasks/etc. Verified nothing under go:embed
+  lives in an excluded path (only `migrations/*.sql` is embedded).
+- `docker-compose.yml` — prod-like reference deployment, all `BALANCEDB_*` env, one
+  image reused by every role: `postgres:18` (healthchecked), a one-shot `migrate`
+  **deploy gate**, `api`, `processor`, and `processor-standby`. The long-running
+  roles set `BALANCEDB_MIGRATE_ON_START=false` and `depends_on` the migrate gate
+  (`service_completed_successfully`) + postgres (`service_healthy`). YAML anchors
+  share the image/build and env blocks.
+- `scripts/smoke.sh` + `make smoke` (and `make image`) — the plan §M11 "Done when"
+  end to end: `compose up -d --build` → wait for readiness → insert a 2-leg group
+  with `wait_ms` (asserts HTTP 200 + COMMITTED + 2 CONFIRMED legs) → read both
+  balances → kill the active processor → assert the standby acquires leadership
+  within the lease TTL → prove the new leader drains (a fresh insert CONFIRMS).
+  Self-contained (tears the stack down on exit; `KEEP_UP=1` to keep it). No jq/python
+  dependency (grep-based JSON checks) so M13 CI can reuse it as-is.
+- README "Deployment (Docker + compose)" section: the full `BALANCEDB_*` env
+  contract table, role semantics, curl examples, multi-cell via `BALANCEDB_SCHEMA`,
+  and the two upgrade paths (migrate-on-boot vs. gated `migrate` role).
+
+Decisions (no ADR — all within milestone scope, no spec/plan deviation):
+- **postgres:18 volume mount is `/var/lib/postgresql`, NOT `.../data`.** The 18 image
+  refuses a mount at the legacy `.../data` path (docker-library/postgres#1259 — 18
+  stores data in a major-version subdir). First attempt with `.../data` left postgres
+  permanently `unhealthy` and the stack never came up; the fix is the whole-dir mount.
+- **Health endpoints are on `:9090` (metrics port), not the api's `:8080`.** The api
+  role's Huma server (`:8080`) has no `/readyz` (that returns 404); `/healthz`
+  `/readyz` `/metrics` are served by the obs surface on `BALANCEDB_METRICS_ADDR`
+  (M9). The smoke script waits on `:9090/readyz` for the api and hits `:8080` only for
+  the ledger endpoints. Documented in the README ports table.
+- **Compose uses `restart: unless-stopped` (prod-realistic); the smoke script makes
+  failover deterministic by `docker update --restart=no <leader>` before SIGKILL** so
+  the killed container stays down and the *survivor* is the only leadership candidate.
+  Without that, docker restarts the killed processor within ~2s and it races the
+  standby for the lease at TTL expiry (~50/50), making "the standby takes over"
+  flaky. The script also proves work resumed (post-failover CONFIRMED insert), which
+  is robust regardless of which node wins.
+- **Postgres published on host `55432`** (→ container 5432) to avoid colliding with
+  the standalone `balancedb-pg` already on host 5432 (per the orchestrator note).
+  Service-to-service uses the compose network name `postgres:5432`.
+- **Distinct host metrics ports** (api 9090, processor 9091, standby 9092) — inside
+  each container the health server binds the default `:9090` (isolated netns, no
+  clash), addressing the M9 co-location note without overriding `METRICS_ADDR`.
+
+Deferred/known issues:
+- `make smoke` failover leg takes ~16s (config-default `lease_ttl_ms`=15000 + a
+  loop). The script's `FAILOVER_TIMEOUT` defaults to 30s; override via env if a CI
+  runner is slower. Total `make smoke` ~30–40s after the image is built/cached.
+- No code changes to processor/validation/model, so the simulation reference model is
+  untouched; `make simtest` stays green (nothing to extend for M11).
+- `oasdiff` still not installed (M7 note) — unrelated to M11; `make openapi` skips
+  its breaking-change check gracefully.
+
+Notes for next agents (M12 devcontainer, M13 CI):
+- **M13 reuses `make smoke` verbatim** as the compose smoke stage. It exits non-zero
+  on the first failure and needs only Docker + the compose plugin + `curl` (no jq).
+  It builds the image itself (`compose up --build`), so a prior `make image` is
+  optional.
+- The compose `migrate` gate + `BALANCEDB_MIGRATE_ON_START=false` pattern is the
+  reference for the plan §M11 upgrade procedure; M12's devcontainer keeps
+  migrate-on-start=true for the single dev DB (simpler), which is fine — both paths
+  are advisory-lock safe.
+- CLAUDE.md left unchanged: M11 adds no `internal/` package and changes no stated
+  convention; `smoke`/`image` are non-gate Makefile targets (same precedent as the
+  unlisted `openapi`/`loadgen` targets). `check-docs` stays green.
+- Environment left as found: the standalone `balancedb-pg` on host 5432 is still
+  running (used by `make itest`/`simtest` via `TEST_DATABASE_URL`); the M11 compose
+  stack was torn down (`docker compose down -v`).

@@ -1,0 +1,18 @@
+# Keep the build context small and deterministic. The image needs only the Go
+# module (source + go.mod/go.sum, migrations are embedded via go:embed); nothing
+# below affects the build.
+.git
+.gitignore
+.dockerignore
+Dockerfile
+docker-compose.yml
+.devcontainer
+.claude
+docs
+scripts
+tasks
+README.md
+CLAUDE.md
+AGENTS.md
+ORCHESTRATION.md
+api/openapi.yaml
