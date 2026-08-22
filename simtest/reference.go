@@ -3,6 +3,8 @@ package simtest
 import (
 	"bytes"
 	"fmt"
+	"sort"
+	"time"
 
 	"github.com/magnomp/balancedb/internal/api"
 	"github.com/magnomp/balancedb/internal/model"
@@ -12,11 +14,17 @@ import (
 // model holds it as a field so a schedule can vary it just like the real config.
 const DefaultMaxGroupSize = 10
 
-// refOp is one recorded operation in the reference model.
+// refOp is one recorded operation in the reference model. EffectiveAt and
+// ReversalOf are carried so the reference can reproduce the DB's timeline order
+// (G4: order by (effective_at, id)) and its reversal metadata; neither influences
+// the decision (a reversal is an ordinary operation validated against limits,
+// spec §5.4/N3).
 type refOp struct {
 	ID            int64
 	AccountID     int64
 	Amount        int64
+	EffectiveAt   time.Time
+	ReversalOf    *int64
 	TransactionID *int64
 	Status        model.OpStatus
 }
@@ -144,7 +152,7 @@ func (m *Model) insertSingle(req api.InsertRequest, hash []byte) (*api.InsertRes
 	op := req.Operations[0]
 	accountID := m.upsertAccount(op.OwnerID, op.ExternalID)
 	m.nextOpID++
-	rec := &refOp{ID: m.nextOpID, AccountID: accountID, Amount: op.Amount, Status: model.OpPending}
+	rec := &refOp{ID: m.nextOpID, AccountID: accountID, Amount: op.Amount, EffectiveAt: op.EffectiveAt, ReversalOf: op.ReversalOf, Status: model.OpPending}
 	m.ops[rec.ID] = rec
 	m.singleByKey[req.IdempotencyKey] = keyedRecord{id: rec.ID, hash: hash}
 	return &api.InsertResult{Operations: []api.OpOutcome{{ID: rec.ID, Status: string(model.OpPending)}}}, nil
@@ -176,7 +184,7 @@ func (m *Model) insertGroup(req api.InsertRequest, hash []byte) (*api.InsertResu
 		accountID := m.upsertAccount(op.OwnerID, op.ExternalID)
 		m.nextOpID++
 		txID := tx.ID
-		rec := &refOp{ID: m.nextOpID, AccountID: accountID, Amount: op.Amount, TransactionID: &txID, Status: model.OpPending}
+		rec := &refOp{ID: m.nextOpID, AccountID: accountID, Amount: op.Amount, EffectiveAt: op.EffectiveAt, ReversalOf: op.ReversalOf, TransactionID: &txID, Status: model.OpPending}
 		m.ops[rec.ID] = rec
 		tx.LegIDs = append(tx.LegIDs, rec.ID)
 		outcomes = append(outcomes, api.OpOutcome{ID: rec.ID, Status: string(model.OpPending)})
@@ -202,6 +210,128 @@ func (m *Model) upsertAccount(ownerID int64, externalID string) int64 {
 	m.accounts[k] = id
 	m.accountsByID[id] = &refAccount{ID: id, ExternalID: externalID}
 	return id
+}
+
+// Timeline returns the ids of an account's operations in timeline order —
+// (effective_at, id) — the total, unique, immutable order of G4 (spec §4.1/§5.4).
+// Because id is a unique tiebreaker the order is total and unique by construction;
+// this is the sequence the database's `ORDER BY effective_at, id` must reproduce.
+func (m *Model) Timeline(accountID int64) []int64 {
+	type te struct {
+		id  int64
+		eff time.Time
+	}
+	var es []te
+	for _, op := range m.ops {
+		if op.AccountID == accountID {
+			es = append(es, te{id: op.ID, eff: op.EffectiveAt})
+		}
+	}
+	sort.Slice(es, func(i, j int) bool {
+		if !es[i].eff.Equal(es[j].eff) {
+			return es[i].eff.Before(es[j].eff)
+		}
+		return es[i].id < es[j].id
+	})
+	out := make([]int64, len(es))
+	for i, e := range es {
+		out[i] = e.id
+	}
+	return out
+}
+
+// AccountIDs returns every account id the model knows, ascending — used to iterate
+// the per-account timeline for G4 and to pick limit-change / reversal targets.
+func (m *Model) AccountIDs() []int64 {
+	ids := make([]int64, 0, len(m.accountsByID))
+	for id := range m.accountsByID {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+// CheckG6 verifies the idempotency guarantee's structural half (spec §4.1): the
+// number of recorded operations equals the number of distinct idempotency keys'
+// legs — i.e. no key produced duplicate rows. It returns an error, or nil.
+func (m *Model) CheckG6() error {
+	want := 0
+	for _, rec := range m.singleByKey {
+		if _, ok := m.ops[rec.id]; ok {
+			want++
+		}
+	}
+	for _, rec := range m.groupByKey {
+		if tx, ok := m.txs[rec.id]; ok {
+			want += len(tx.LegIDs)
+		}
+	}
+	if want != len(m.ops) {
+		return fmt.Errorf("G6 violated: %d operation rows but %d unique keyed legs", len(m.ops), want)
+	}
+	return nil
+}
+
+// confirmedReversalTargets returns the ids of confirmed operations that have no
+// live (non-INVALID) reversal yet, so a fresh reversal of them inserts cleanly
+// under the one-live-reversal-per-op unique index (idx_ops_reversal). This is the
+// candidate set the generator draws reversals (and double-reversals) from; a
+// reversal that was itself rejected leaves its original eligible again
+// (reversal-after-reject retry).
+func (m *Model) confirmedReversalTargets() []*refOp {
+	liveReversed := make(map[int64]bool)
+	for _, op := range m.ops {
+		if op.ReversalOf != nil && op.Status != model.OpInvalid {
+			liveReversed[*op.ReversalOf] = true
+		}
+	}
+	var out []*refOp
+	for id := int64(1); id <= m.nextOpID; id++ {
+		op, ok := m.ops[id]
+		if !ok || op.Status != model.OpConfirmed || liveReversed[op.ID] {
+			continue
+		}
+		out = append(out, op)
+	}
+	return out
+}
+
+// accountView is a read-only snapshot of an account the generator uses to build
+// state-aware limit changes (a new min/max must bracket the confirmed balance,
+// spec §6).
+type accountView struct {
+	ID         int64
+	OwnerID    int64
+	ExternalID string
+	Balance    int64
+	Min        *int64
+	Max        *int64
+}
+
+// accountViews returns a snapshot of every account, ascending by id.
+func (m *Model) accountViews() []accountView {
+	var out []accountView
+	for id := int64(1); id <= m.nextAccountID; id++ {
+		a, ok := m.accountsByID[id]
+		if !ok {
+			continue
+		}
+		out = append(out, accountView{
+			ID: a.ID, ExternalID: a.ExternalID, Balance: a.Balance, Min: a.Min, Max: a.Max,
+			OwnerID: m.ownerOf(a.ID),
+		})
+	}
+	return out
+}
+
+// ownerOf recovers an account's owner id from the account index.
+func (m *Model) ownerOf(accountID int64) int64 {
+	for k, id := range m.accounts {
+		if id == accountID {
+			return k.ownerID
+		}
+	}
+	return 0
 }
 
 func canonicalOps(ops []api.InsertOp) []model.CanonicalOp {
