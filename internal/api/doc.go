@@ -19,6 +19,13 @@
 // pluggable OwnerResolver (X-Owner-Id header today). The Insert core above is
 // reused unchanged by POST /transactions.
 //
-// Synchronous waiting (wait_ms > 0) is deferred to M8; M7 documents the field and
-// treats every insert as fire-and-forget (202).
+// M8 adds the opt-in synchronous wait (wait_ms > 0, spec §10.1, ADR-0002): after
+// the insert commits, POST /transactions registers an outcome waiter with the
+// internal/notify Notifier, does one immediate status check to close the
+// lost-wakeup race, then waits for the deciding NOTIFY (with a status-poll
+// durability fallback) up to the requested budget capped by api_max_wait_ms —
+// returning 200 with the decided status if it lands in time, else 202 with the
+// current state. wait_ms <= 0 stays fire-and-forget (202) and never touches the
+// notify machinery. The 200/202 split is a runtime status override; the OpenAPI
+// contract advertises 202 as the declared response.
 package api

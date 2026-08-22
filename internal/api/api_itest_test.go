@@ -24,7 +24,7 @@ import (
 func newTestServer(t *testing.T) (*Server, *httptest.Server, *pgxpool.Pool) {
 	t.Helper()
 	pool := dbtest.NewSchema(t)
-	srv := NewServer(pool, nil)
+	srv := NewServer(pool, nil, nil)
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return srv, ts, pool
