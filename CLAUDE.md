@@ -63,6 +63,10 @@ you do.
   self-isolates in a throwaway schema. *(Stub until M2 lands the migration/schema
   harness.)*
 - `make simtest` — deterministic simulation harness (spec §15). *(Arrives in M10.)*
+- `make openapi` — regenerate `api/openapi.yaml` from the code (server is the
+  authority, ADR-0003), fail on drift, and run the `oasdiff` breaking-change check
+  (skipped gracefully when `oasdiff` is absent). Run it after any `internal/api`
+  change and commit the regenerated spec.
 
 Definition of done for any change: `make lint test` green, plus `make itest` if it
 touches the DB and `make simtest` once that exists. **Changes to processor or
@@ -84,7 +88,7 @@ Packages marked *(Mn)* are not built yet — the map is the stable target.
 - `lease` — leader lease acquire/renew/release (spec §7.1). **built**
 - `processor` — main loop, single/group processing, the three guards, batching (spec §7–§8). **built**
 - `snapshot` — snapshot upsert + cascade update (spec §8.4). **built**
-- `api` — insertion core (`Insert` over a `pgx.Tx`, spec §10.1) **built (M3)**; HTTP handlers: waiting, queries (Huma, spec §10, ADR-0003) *(M7–M8)*.
+- `api` — insertion core (`Insert` over a `pgx.Tx`, spec §10.1) + Huma/chi HTTP handlers for every §10 endpoint (ADR-0003) **built (M7)**; synchronous waiting *(M8)*.
 - `notify` — LISTEN/NOTIFY: work doorbell + outcome fan-out (spec §11, ADR-0002). *(M3/M5/M8)*
 - `obs` — metrics registry, health endpoints (spec §13). *(M9)*
 

@@ -7,12 +7,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/magnomp/balancedb/internal/api"
 	"github.com/magnomp/balancedb/internal/config"
 	"github.com/magnomp/balancedb/internal/db"
 	"github.com/magnomp/balancedb/internal/lease"
@@ -102,13 +108,43 @@ func run() error {
 		return nil
 	}
 
-	// The HTTP server (M7) is not built yet. Boot, hold until a shutdown signal,
-	// then exit cleanly so the lifecycle wiring is exercised from day one (plan §M1).
-	logger.Info("running; awaiting shutdown signal", "role", string(role))
-	<-ctx.Done()
+	// api role: serve the Huma-backed HTTP API (spec §10, ADR-0003).
+	return runAPI(ctx, logger, cfg, pool)
+}
 
-	logger.Info("shutting down", "role", string(role))
-	return nil
+// runAPI serves the HTTP API and shuts it down gracefully when ctx is cancelled.
+func runAPI(ctx context.Context, logger *slog.Logger, cfg config.Config, pool *pgxpool.Pool) error {
+	srv := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           api.NewServer(pool, nil).Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		logger.Info("http server listening", "addr", cfg.HTTPAddr, "docs", cfg.HTTPAddr+"/docs")
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return fmt.Errorf("http server: %w", err)
+		}
+		return nil
+	case <-ctx.Done():
+		logger.Info("shutting down", "role", "api")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("http server shutdown: %w", err)
+		}
+		return nil
+	}
 }
 
 func newLogger(cfg config.Config) *slog.Logger {
