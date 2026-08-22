@@ -81,7 +81,7 @@ Packages marked *(Mn)* are not built yet — the map is the stable target.
 - `db` — pgxpool, `search_path` per connection, ping-on-boot, `WithTx` (plan §0). **built**
 - `migrate` — embedded migrations + purpose-built runner (spec §5.2, ADR-0001). **built**
 - `model` — row types, status enums, reason codes, the one amount helper, payload hashing (spec §5). **built**
-- `lease` — leader lease acquire/renew/release (spec §7.1). *(M4)*
+- `lease` — leader lease acquire/renew/release (spec §7.1). **built**
 - `processor` — main loop, single/group processing, the three guards, batching (spec §7–§8). *(M5–M6)*
 - `snapshot` — snapshot upsert + cascade update (spec §8.4). *(M5)*
 - `api` — insertion core (`Insert` over a `pgx.Tx`, spec §10.1) **built (M3)**; HTTP handlers: waiting, queries (Huma, spec §10, ADR-0003) *(M7–M8)*.
