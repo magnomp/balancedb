@@ -1,0 +1,112 @@
+# BalanceDB — prod-like deployment (plan §M11).
+#
+# One Postgres, one api, one processor, plus a second processor as a hot standby.
+# Every BalanceDB service runs the SAME image (built once from the root Dockerfile)
+# and is configured PURELY by BALANCEDB_* env vars — the role is the container
+# command. The `migrate` service is a one-shot deploy gate: it runs the embedded
+# migrations to completion and exits, and the long-running roles start only after it
+# succeeds (BALANCEDB_MIGRATE_ON_START=false on them). See the README "Deployment"
+# section for the env contract, multi-cell schemas, and the upgrade procedure.
+#
+# Ports: this compose brings its OWN postgres:18; it publishes it on host 55432 so it
+# never collides with a standalone Postgres already on 5432. Service-to-service the
+# DSN uses the compose network name `postgres:5432`. Each role's metrics/health
+# server binds :9090 INSIDE its own container (isolated network namespace, so no
+# clash); they are published on distinct HOST ports (api 9090, processor 9091,
+# standby 9092).
+
+x-balancedb-env: &balancedb-env
+  BALANCEDB_DATABASE_URL: postgres://balancedb:balancedb@postgres:5432/balancedb?sslmode=disable
+  BALANCEDB_SCHEMA: balancedb
+  BALANCEDB_LOG_FORMAT: text
+  BALANCEDB_LOG_LEVEL: info
+  # The long-running roles do NOT migrate on boot: the `migrate` service is the gate.
+  BALANCEDB_MIGRATE_ON_START: "false"
+
+x-balancedb-image: &balancedb-image
+  image: balancedb:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: balancedb
+      POSTGRES_PASSWORD: balancedb
+      POSTGRES_DB: balancedb
+    ports:
+      - "55432:5432" # host:container — avoids colliding with a 5432 already in use
+    volumes:
+      # postgres:18+ stores data in a major-version subdirectory and wants the mount
+      # at /var/lib/postgresql (NOT .../data, which the 18 image rejects as a legacy
+      # mount point). See docker-library/postgres#1259.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U balancedb -d balancedb"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  # Deploy gate: apply the embedded migrations and exit 0. The advisory-lock guarded
+  # runner (ADR-0001/0004) is safe to run repeatedly and concurrently.
+  migrate:
+    <<: *balancedb-image
+    environment:
+      <<: *balancedb-env
+    command: ["migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *balancedb-image
+    environment:
+      <<: *balancedb-env
+    command: ["api"] # BALANCEDB_HTTP_ADDR/:8080, BALANCEDB_METRICS_ADDR/:9090 defaults
+    ports:
+      - "8080:8080" # HTTP API + /docs
+      - "9090:9090" # /metrics, /healthz, /readyz
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  processor:
+    <<: *balancedb-image
+    environment:
+      <<: *balancedb-env
+    command: ["processor"]
+    ports:
+      - "9091:9090" # /metrics, /healthz, /readyz (body reports leader state)
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Hot standby: identical processor. Exactly one of the two holds the leader lease
+  # at any instant (spec §7.1); the other idles, ready to take over within lease_ttl
+  # if the leader dies. Scale by adding more identical replicas.
+  processor-standby:
+    <<: *balancedb-image
+    environment:
+      <<: *balancedb-env
+    command: ["processor"]
+    ports:
+      - "9092:9090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pgdata:
