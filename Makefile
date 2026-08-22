@@ -7,7 +7,7 @@ GOFUMPT ?= gofumpt
 # Package list, computed once.
 PKGS := ./...
 
-.PHONY: all lint test itest tools fmt
+.PHONY: all lint test itest tools fmt check-docs
 
 all: lint test
 
@@ -15,8 +15,8 @@ all: lint test
 fmt:
 	$(GOFUMPT) -w .
 
-## lint: gofumpt formatting check + go vet. No third-party linter yet (M13).
-lint:
+## lint: gofumpt formatting check + go vet + docs sync. No third-party linter yet (M13).
+lint: check-docs
 	@unformatted="$$($(GOFUMPT) -l .)"; \
 	if [ -n "$$unformatted" ]; then \
 		echo "gofumpt: the following files are not formatted:"; \
@@ -25,6 +25,21 @@ lint:
 		exit 1; \
 	fi
 	$(GO) vet $(PKGS)
+
+## check-docs: AGENTS.md must stay in sync with CLAUDE.md (M1.5). A symlink
+## satisfies this by construction; a plain file must be byte-identical.
+check-docs:
+	@if [ -L AGENTS.md ]; then \
+		if [ "$$(readlink AGENTS.md)" != "CLAUDE.md" ]; then \
+			echo "check-docs: AGENTS.md symlink must point at CLAUDE.md"; exit 1; \
+		fi; \
+	elif [ -f AGENTS.md ]; then \
+		if ! cmp -s AGENTS.md CLAUDE.md; then \
+			echo "check-docs: AGENTS.md and CLAUDE.md differ — re-sync (symlink AGENTS.md -> CLAUDE.md)"; exit 1; \
+		fi; \
+	else \
+		echo "check-docs: AGENTS.md is missing — symlink it to CLAUDE.md"; exit 1; \
+	fi
 
 ## test: unit tests (no external dependencies).
 test:
