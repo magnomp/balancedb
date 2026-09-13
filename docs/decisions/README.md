@@ -38,3 +38,7 @@ explains it, that is a bug in either the code or the log.
 - [0008 — Caller-controlled insertion transactions](0008-caller-controlled-insertion-transactions.md)
   — no insertion lock or transaction wrapper; G3 limited to visible work, with
   guidance to insert near commit and explicit acceptance-order risks.
+
+- [0009 — Embedded account and query API](0009-embedded-account-and-query-api.md)
+  — shared HTTP/Go account and query core, consistent read snapshots, and
+  initial zero-balance validation on account creation.

@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -10,6 +9,8 @@ import (
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/magnomp/balancedb/internal/db"
+	"github.com/magnomp/balancedb/internal/ledger"
 	"github.com/magnomp/balancedb/internal/model"
 	"github.com/magnomp/balancedb/internal/obs"
 )
@@ -178,43 +179,19 @@ func (s *Server) loadSingleOutcome(ctx context.Context, opID, ownerID int64, rep
 // (owner-scoped) into a response body and reports whether the group is terminal
 // (COMMITTED or REJECTED).
 func (s *Server) loadGroupOutcome(ctx context.Context, txID, ownerID int64, replayed bool) (*CreateTransactionOutput, bool, error) {
-	var (
-		status  string
-		opCount int
-	)
-	err := s.pool.QueryRow(ctx, selectTransactionByID, txID).Scan(&status, &opCount, new(*string))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, false, err
-	}
+	value, err := db.Read(ctx, s.pool, func(tx pgx.Tx) (*ledger.TransactionOutcome, error) {
+		return ledger.GetTransaction(ctx, tx, ownerID, txID)
+	})
 	if err != nil {
 		return nil, false, err
 	}
-
-	rows, err := s.pool.Query(ctx, selectLegsForOwner, txID, ownerID)
-	if err != nil {
-		return nil, false, err
-	}
-	defer rows.Close()
-
-	var legs []OperationOutcome
-	for rows.Next() {
-		var (
-			leg    OperationOutcome
-			reason *string
-		)
-		if err := rows.Scan(&leg.ID, &leg.Status, &reason); err != nil {
-			return nil, false, err
-		}
-		legs = append(legs, leg)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, false, err
-	}
-
 	out := &CreateTransactionOutput{}
-	out.Body.TransactionID = &txID
-	out.Body.TransactionStatus = status
+	out.Body.TransactionID = &value.ID
+	out.Body.TransactionStatus = string(value.Status)
 	out.Body.Replayed = replayed
-	out.Body.Operations = legs
-	return out, status != string(model.TxPending), nil
+	out.Body.Operations = make([]OperationOutcome, len(value.Operations))
+	for i, op := range value.Operations {
+		out.Body.Operations[i] = OperationOutcome{ID: op.ID, Status: string(op.Status)}
+	}
+	return out, value.Status != model.TxPending, nil
 }

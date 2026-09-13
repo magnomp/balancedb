@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/magnomp/balancedb/internal/api"
+	"github.com/magnomp/balancedb/internal/ledger"
 	"github.com/magnomp/balancedb/internal/model"
 )
 
@@ -98,6 +99,30 @@ func NewModel() *Model {
 		singleByKey:  make(map[string]keyedRecord),
 		groupByKey:   make(map[string]keyedRecord),
 	}
+}
+
+// CreateAccount models explicit creation, including the initial G1 check (ADR-0009).
+func (m *Model) CreateAccount(owner int64, externalID string, min, max *int64) error {
+	if owner <= 0 || externalID == "" {
+		return ledger.ErrInvalidArgument
+	}
+	if (min != nil && *min > 0) || (max != nil && *max < 0) || (min != nil && max != nil && *min > *max) {
+		return ledger.ErrInvalidLimits
+	}
+	if _, exists := m.accounts[accountKey{owner, externalID}]; exists {
+		return ledger.ErrAccountExists
+	}
+	id := m.upsertAccount(owner, externalID)
+	a := m.accountsByID[id]
+	if min != nil {
+		value := *min
+		a.Min = &value
+	}
+	if max != nil {
+		value := *max
+		a.Max = &value
+	}
+	return nil
 }
 
 // OpCount returns the number of operation rows the model holds — the quantity G6

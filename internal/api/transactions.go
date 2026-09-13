@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"time"
 
@@ -10,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/magnomp/balancedb/internal/db"
+	"github.com/magnomp/balancedb/internal/ledger"
 	"github.com/magnomp/balancedb/internal/model"
 )
 
@@ -146,71 +146,6 @@ type GetTransactionOutput struct {
 	}
 }
 
-const (
-	selectTransactionByID = `SELECT status, op_count, reject_reason FROM transactions WHERE id = $1`
-	selectLegsForOwner    = `SELECT o.id, o.status, o.invalidation_reason
-FROM operations o JOIN accounts a ON a.id = o.account_id
-WHERE o.transaction_id = $1 AND a.owner_id = $2
-ORDER BY o.id`
-)
-
-func (s *Server) getTransaction(ctx context.Context, in *GetTransactionInput) (*GetTransactionOutput, error) {
-	ownerID, err := s.resolver.Resolve(ctx, in.OwnerID)
-	if err != nil {
-		return nil, huma.Error400BadRequest(err.Error())
-	}
-
-	var (
-		status       string
-		opCount      int
-		rejectReason *string
-	)
-	err = s.pool.QueryRow(ctx, selectTransactionByID, in.ID).Scan(&status, &opCount, &rejectReason)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, huma.Error404NotFound("transaction not found")
-	}
-	if err != nil {
-		return nil, huma.Error500InternalServerError("read transaction", err)
-	}
-
-	rows, err := s.pool.Query(ctx, selectLegsForOwner, in.ID, ownerID)
-	if err != nil {
-		return nil, huma.Error500InternalServerError("read transaction legs", err)
-	}
-	defer rows.Close()
-
-	var legs []LegStatus
-	for rows.Next() {
-		var (
-			leg    LegStatus
-			reason *string
-		)
-		if err := rows.Scan(&leg.ID, &leg.Status, &reason); err != nil {
-			return nil, huma.Error500InternalServerError("scan transaction leg", err)
-		}
-		leg.Rejection = parseRejection(reason)
-		legs = append(legs, leg)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, huma.Error500InternalServerError("iterate transaction legs", err)
-	}
-	// No legs visible to this owner → the transaction is not theirs (or does not
-	// exist). Do not leak another owner's transaction.
-	if len(legs) == 0 {
-		return nil, huma.Error404NotFound("transaction not found")
-	}
-
-	out := &GetTransactionOutput{}
-	out.Body.ID = in.ID
-	out.Body.Status = status
-	out.Body.OpCount = opCount
-	out.Body.Rejection = parseRejection(rejectReason)
-	out.Body.Operations = legs
-	return out, nil
-}
-
-// --- GET /operations/{id} ---------------------------------------------------
-
 // GetOperationInput identifies an operation by its registration id, scoped to the
 // requesting owner.
 type GetOperationInput struct {
@@ -228,47 +163,36 @@ type GetOperationOutput struct {
 	}
 }
 
-const selectOperationForOwner = `SELECT o.id, o.status, o.transaction_id, o.invalidation_reason
-FROM operations o JOIN accounts a ON a.id = o.account_id
-WHERE o.id = $1 AND a.owner_id = $2`
-
-func (s *Server) getOperation(ctx context.Context, in *GetOperationInput) (*GetOperationOutput, error) {
-	ownerID, err := s.resolver.Resolve(ctx, in.OwnerID)
+func (s *Server) getTransaction(ctx context.Context, in *GetTransactionInput) (*GetTransactionOutput, error) {
+	owner, err := s.resolver.Resolve(ctx, in.OwnerID)
 	if err != nil {
 		return nil, huma.Error400BadRequest(err.Error())
 	}
-
-	var (
-		id     int64
-		status string
-		txID   *int64
-		reason *string
-	)
-	err = s.pool.QueryRow(ctx, selectOperationForOwner, in.ID, ownerID).Scan(&id, &status, &txID, &reason)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, huma.Error404NotFound("operation not found")
-	}
+	value, err := db.Read(ctx, s.pool, func(tx pgx.Tx) (*ledger.TransactionOutcome, error) {
+		return ledger.GetTransaction(ctx, tx, owner, in.ID)
+	})
 	if err != nil {
-		return nil, huma.Error500InternalServerError("read operation", err)
+		return nil, mapLedgerErr(err)
 	}
-
-	out := &GetOperationOutput{}
-	out.Body.ID = id
-	out.Body.Status = status
-	out.Body.TransactionID = txID
-	out.Body.Rejection = parseRejection(reason)
+	out := &GetTransactionOutput{}
+	out.Body.ID, out.Body.Status, out.Body.OpCount, out.Body.Rejection = value.ID, string(value.Status), value.OpCount, value.Rejection
+	out.Body.Operations = make([]LegStatus, len(value.Operations))
+	for i, op := range value.Operations {
+		out.Body.Operations[i] = LegStatus{ID: op.ID, Status: string(op.Status), Rejection: op.Rejection}
+	}
 	return out, nil
 }
 
-// parseRejection turns a reason column's JSON text into a Rejection. A column that
-// is NULL or unparseable yields nil — the API never fabricates a rejection detail.
-func parseRejection(reason *string) *model.Rejection {
-	if reason == nil || *reason == "" {
-		return nil
-	}
-	r, err := model.ParseRejection(*reason)
+func (s *Server) getOperation(ctx context.Context, in *GetOperationInput) (*GetOperationOutput, error) {
+	owner, err := s.resolver.Resolve(ctx, in.OwnerID)
 	if err != nil {
-		return nil
+		return nil, huma.Error400BadRequest(err.Error())
 	}
-	return &r
+	value, err := db.Read(ctx, s.pool, func(tx pgx.Tx) (*ledger.OperationOutcome, error) { return ledger.GetOperation(ctx, tx, owner, in.ID) })
+	if err != nil {
+		return nil, mapLedgerErr(err)
+	}
+	out := &GetOperationOutput{}
+	out.Body.ID, out.Body.Status, out.Body.TransactionID, out.Body.Rejection = value.ID, string(value.Status), value.TransactionID, value.Rejection
+	return out, nil
 }

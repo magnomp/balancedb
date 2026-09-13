@@ -407,7 +407,7 @@ components:
           type: integer
       type: object
 info:
-  description: "BalanceDB — a Postgres-backed balance-maintenance engine (ledger). Clients insert money operations (singles or atomic groups); a single elected processor validates and confirms them in strict registration order so an account's final balance never breaks its configured limits. Insertion is asynchronous: POST /transactions returns 202 and outcomes are queried later."
+  description: "BalanceDB — a Postgres-backed balance-maintenance engine (ledger). Clients insert money operations (singles or atomic groups); a single elected processor selects visible committed work in ID order and validates it so an account's final balance never breaks its configured limits. Insertion is asynchronous: POST /transactions returns 202 and outcomes are queried later."
   title: BalanceDB API
   version: 1.0.0
 openapi: 3.1.0

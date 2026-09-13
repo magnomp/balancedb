@@ -50,6 +50,12 @@ func ExampleDB_Insert() {
 	}
 	defer tx.Rollback(ctx)
 
+	min := int64(0)
+	if _, err := ledger.CreateAccount(ctx, tx, 1, "wallet", balancedb.Limits{MinBalance: &min}); err != nil {
+		log.Print(err)
+		return
+	}
+
 	// Execute the host's business SQL on tx here, before registering ledger work.
 	_, err = ledger.Insert(ctx, tx, balancedb.InsertRequest{
 		IdempotencyKey: "00000000-0000-4000-8000-000000000001",
@@ -64,5 +70,13 @@ func ExampleDB_Insert() {
 	}
 	if err := tx.Commit(ctx); err != nil {
 		log.Print(err)
+		return
 	}
+	// Reads use the ledger pool and see committed state; confirmation is async.
+	balance, err := ledger.GetBalance(ctx, 1, "wallet", nil)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	log.Printf("confirmed balance: %d", balance.Balance)
 }

@@ -93,10 +93,10 @@ One line per `internal/` package (plan §0 layout). Navigate here, don't tree-sc
 Packages marked *(Mn)* are not built yet — the map is the stable target.
 
 - `config` — env parsing + validation of `BALANCEDB_*` (plan §0). **built**
-- `db` — pgxpool, `search_path` per connection, ping-on-boot, `WithTx` (plan §0). **built**
+- `db` — pgxpool, `search_path`, ping-on-boot, write transactions + consistent read snapshots (plan §0, ADR-0009). **built**
 - `migrate` — embedded migrations + purpose-built runner (spec §5.2, ADR-0001). **built**
 - `model` — row types, status enums, reason codes, the one amount helper, payload hashing (spec §5). **built**
-- `ledger` — shared transactional insertion and idempotency (spec §10.1, ADR-0007/0008). **built**
+- `ledger` — shared accounts, insertion, idempotency, balances/statements and outcomes (spec §6/§9/§10, ADR-0007–0009). **built**
 - `lease` — leader lease acquire/renew/release (spec §7.1). **built**
 - `processor` — main loop, single/group processing, the three guards, batching (spec §7–§8). **built**
 - `snapshot` — snapshot upsert + cascade update (spec §8.4). **built**

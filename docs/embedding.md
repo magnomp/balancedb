@@ -103,9 +103,8 @@ transaction concurrently from multiple goroutines.
 One operation is a single; two or more operations form one atomic ledger group.
 All group operations must have the same `OwnerID`, and `max_group_size` applies.
 Amounts are `int64` minor units and must be nonzero. Accounts are created on demand
-with unbounded limits. Preconfigured accounts retain their limits. The existing
-HTTP account management and query endpoints remain available; this initial Go
-surface covers registration, migrations and processor lifecycle.
+with unbounded limits. Preconfigured accounts retain their limits. Account management and queries are
+available directly in Go as described below. HTTP endpoints use the same core.
 
 Repeated keys with identical payloads return the original IDs and current status
 with `Replayed=true`. Different payloads return `ErrPayloadConflict`. Use
@@ -117,6 +116,60 @@ balance change was confirmed. A later INVALID operation or REJECTED group does
 not undo the host's committed payment row. Applications should represent that
 pending decision in their workflow. Never wait for a decision inside the inserting
 transaction: the processor cannot see its work until commit.
+
+## Accounts, balances, statements and outcomes
+
+Account writes use the existing host transaction, just like insertion:
+
+```go
+min, max := int64(0), int64(100_000)
+account, err := ledger.CreateAccount(ctx, tx, ownerID, "cash", balancedb.Limits{
+    MinBalance: &min,
+    MaxBalance: &max,
+})
+// Handle err, then commit tx when the host's business work is complete.
+
+// Both bounds are replaced; nil means unbounded.
+account, err = ledger.UpdateLimits(ctx, tx, ownerID, "cash", balancedb.Limits{
+    MinBalance: &min,
+})
+```
+
+New accounts start at zero, so their limits must include zero. Duplicates return
+`ErrAccountExists`; invalid bounds return `ErrInvalidLimits`. Updates validate the
+current final balance and use a version CAS with one retry; repeated contention
+returns `ErrConcurrentUpdate`. On error only this call's savepoint is rolled back.
+The host still commits or rolls back its own transaction normally.
+
+Reads use BalanceDB's schema-bound pool and see **committed state**. Commit the
+host transaction before expecting its changes to appear through these methods:
+
+```go
+account, err := ledger.GetAccount(ctx, ownerID, "cash")
+final, err := ledger.GetBalance(ctx, ownerID, "cash", nil)
+historical, err := ledger.GetBalance(ctx, ownerID, "cash", &at)
+page, err := ledger.GetStatement(ctx, ownerID, "cash", balancedb.StatementOptions{
+    Limit: 50, // zero defaults to 50; range 1..500
+    Cursor: previousNextCursor, // empty for the first page
+})
+operation, err := ledger.GetOperation(ctx, ownerID, operationID)
+group, err := ledger.GetTransaction(ctx, ownerID, transactionID)
+```
+
+All methods scope access to the explicit owner ID. Unknown and foreign-owner
+records both return `ErrNotFound`. Amounts, bounds, balances and shortfalls remain
+`int64` minor units. `OperationOutcome.Status` uses `OpPending`, `OpConfirmed`, or
+`OpInvalid`; groups use `TxPending`, `TxCommitted`, or `TxRejected`. Terminal
+rejections include typed `Rejection` details. A PENDING result is normal; hosts
+can query again later, after committing insertion, using their own request context.
+
+Each read uses one consistent database snapshot. A statement page contains only
+CONFIRMED operations ordered by `(effective_at, id)`, with running balances and an
+opaque `NextCursor`. Pages are independent snapshots: confirmations or backdated
+work between pages can alter later projections. Point-in-time and running balances
+may violate account limits (N2); `ErrBalanceOverflow` or a database scan error is
+returned if a projected result cannot fit in int64. Invalid limits/cursors/IDs are
+reported via errors.Is sentinels, and calls after Close return `ErrClosed`.
 
 ## Registration order and long transactions
 
