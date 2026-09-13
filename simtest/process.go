@@ -58,8 +58,8 @@ func (m *Model) AccountBalance(ownerID int64, externalID string) int64 {
 	return m.accountsByID[id].Balance
 }
 
-// ProcessNext decides the lowest-id PENDING operation in registration order (spec
-// §8.1: strict id order) and returns its decision. A single is decided on its own;
+// ProcessNext decides the lowest-id visible PENDING operation (spec §8.1,
+// ADR-0008) and returns its decision. A single is decided on its own;
 // a group leg triggers the whole group's decision at that first leg, and the
 // group's remaining legs are then no longer PENDING (skipped by status). It reports
 // ok=false when no PENDING operation remains. Ids are dense (identity columns), so
@@ -67,7 +67,7 @@ func (m *Model) AccountBalance(ownerID int64, externalID string) int64 {
 func (m *Model) ProcessNext() (Decision, bool) {
 	for id := int64(1); id <= m.nextOpID; id++ {
 		op, ok := m.ops[id]
-		if !ok || op.Status != model.OpPending {
+		if !ok || m.uncommitted[id] || op.Status != model.OpPending {
 			continue
 		}
 		if op.TransactionID == nil {
@@ -78,8 +78,8 @@ func (m *Model) ProcessNext() (Decision, bool) {
 	return Decision{}, false
 }
 
-// ProcessAll decides every PENDING operation in registration order and returns the
-// decisions in that order — the sequence G3 compares the database against.
+// ProcessAll decides currently visible PENDING operations in ID order. Later
+// commits can expose lower IDs after higher ones were decided (ADR-0008).
 func (m *Model) ProcessAll() []Decision {
 	var out []Decision
 	for {

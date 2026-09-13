@@ -2,8 +2,13 @@
 
 A Postgres-backed balance-maintenance engine (a ledger). Clients insert money
 operations — singles or atomic groups — and a single elected leader validates and
-confirms them in strict registration order, so an account's final balance never
-breaks its configured min/max limits.
+confirms visible committed work in ID order while enforcing final-balance limits.
+Concurrent insertion commits can change decision order and acceptance; insert
+ledger operations near the end of a short transaction ([ordering contract](docs/embedding.md#registration-order-and-long-transactions)).
+
+Go applications can also [embed BalanceDB](docs/embedding.md): register operations
+inside an existing `pgx.Tx`, migrate a separate ledger schema, and run the processor
+in every application replica with PostgreSQL electing one active leader.
 
 One Go binary runs as three roles:
 
@@ -111,7 +116,7 @@ first migration).
 - **`processor`** — the single-leader decision loop (spec §7–§8). Run **two or more**;
   exactly one holds the leader lease at a time (spec §7.1) and the rest idle as hot
   standbys. Keep every standby in service — on leader death a standby acquires the
-  lease within `lease_ttl_ms` and continues in strict registration order. The three
+  lease within `lease_ttl_ms` and continues selecting visible committed work in ID order (ADR-0008). The three
   processing guards (spec §7.2) make a stale ex-leader's late writes no-ops, so
   failover is safe even if the old leader is only *slow*, not dead.
 - **`migrate`** — applies the embedded migrations and exits. Use it as a CI/CD gate
@@ -229,7 +234,8 @@ bootstrap (`export PATH="$HOME/sdk/go/bin:$HOME/go/bin:$HOME/bin:$PATH"`).
 ## Simulation testing (spec §15)
 
 The `simtest/` package is the deterministic simulation harness — the spec's declared
-first investment and the proof that the consistency contract G1–G6 holds. It runs in
+first investment and verification of the consistency contract G1–G6 as refined by
+ADR-0008 for concurrent insertion visibility. It runs in
 two tiers (ADR-0006):
 
 - **Breadth (in-memory, `make test` and `make simtest`).** A seeded generator drives
@@ -249,6 +255,11 @@ two tiers (ADR-0006):
   version-race stressor. Identity ids do not line up between the two (idempotent
   replays consume Postgres IDENTITY values the reference does not), so the harness
   compares through an explicit reference→database id map.
+
+Additional transaction-visibility schedules hold an embedded credit open while a
+later HTTP-core debit commits, then vary processing time and credit commit/rollback.
+These cover both singles and groups and demonstrate the accepted ordering risk:
+an early debit rejection remains terminal after the credit becomes visible.
 
 Every failure prints its seed, and every seed reproduces exactly. Seed counts are
 environment-overridable so CI can scale the fidelity tier: `SIMTEST_SEEDS` (breadth),

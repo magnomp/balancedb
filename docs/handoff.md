@@ -7,6 +7,55 @@ bottom. See `tasks/_common.md` for the protocol.
 
 _(none)_
 
+## Go embedding — 2026-09-13
+
+Historical implementation note: its insertion lock was subsequently removed by
+ADR-0008 at the user's request. See the caller-controlled transaction entry below
+for the current behavior and replacement visibility simulations.
+
+Added the public root `balancedb` package: typed `Config`, explicit `Migrate`,
+`Open`, caller-owned `pgx.Tx` insertion, context-controlled `Run`, diagnostic
+`IsLeader`, and cancelling/joining `Close`. Every host replica can run the existing
+fenced processor; PostgreSQL elects one leader per schema. Embedding opens no HTTP
+server, installs no signals and does not mutate global logging. Background pools
+are owned separately; insertion never checks out a second connection.
+
+ADR-0007 records the refinement to the standalone plan. The insertion core moved
+from `internal/api` to `internal/ledger`; HTTP retains aliases and delegates to it.
+Public insertion uses a savepoint and temporarily sets/restores transaction-local
+search_path, including keeping host temporary tables from shadowing ledger tables.
+Failures discard partial groups/accounts without committing the host transaction.
+READ COMMITTED and the same PostgreSQL database are required; separate schemas
+work. Explicit Migrate reuses the advisory-locked forward-only runner unchanged.
+
+G3 ordering fix: the shared core acquires a schema-specific transaction advisory
+lock before writing accounts/allocating IDs, retained through the outer commit or
+rollback. This prevents an invisible earlier insertion being overtaken by a later
+committed operation. Long host transactions therefore delay subsequent insertions
+in that cell. Upgrade/drain all old insertion nodes before enabling embedding;
+older binaries do not participate in this lock. No processor guards or decision
+logic changed; no dependencies or SQL migrations added.
+
+The simulation reference now models an open registration, commit/rollback, and
+blocked successors. Eight DB-backed schedules compare a held embedded credit and
+a concurrent HTTP-core debit against it, observing the actual blocked advisory
+lock before releasing the first transaction. Tests cover both commit and rollback.
+Public integration coverage includes host-write atomicity, schema restoration and
+temporary-table shadowing, savepoint error recovery, group idempotency/conflicts,
+isolation rejection, parallel migrations, independent schema registration and
+leaders, and replica shutdown/takeover with subsequent processing.
+
+Validation: `make lint test itest simtest openapi` passed (full simulation ~49s),
+plus `go test -race -tags itest .` passed. OpenAPI remained identical; oasdiff is
+absent, so its optional breaking-change check was skipped. Tests used an isolated
+PostgreSQL 18 container on localhost:55439, removed after verification. Sandbox
+socket restrictions required escalation for DB tests. Local make is in
+`$HOME/bin`; Go/lint caches were placed under `/tmp/balancedb-*`.
+
+Usage and rollout notes: `docs/embedding.md`, with a compiled example in
+`example_test.go`. Existing user changes to `.devcontainer/devcontainer.json`,
+`.claude/settings.json`, and `.compozy/` were left as found.
+
 ## M1 — 2026-08-22
 
 Built:
@@ -992,3 +1041,35 @@ Notes for next agents:
   the official installer script) to validate the config; the PATH bootstrap from the
   M1 note still applies. The standalone `balancedb-pg` on host 5432 was left running
   and untouched; the M13 smoke compose stack was torn down (`down -v`).
+
+
+## Caller-controlled insertion transactions — 2026-09-13
+
+The user explicitly chose existing caller-owned transactions with no wrapper or
+before-commit hook, and advice to insert at the very end of a short transaction
+instead of controlling transaction duration or insertion order. ADR-0008
+supersedes ADR-0007's registration lock and unconditional G3 claims. Removed that
+lock from the shared ledger core. Immediate insertion, savepoint error isolation,
+schema restoration, migrations, processor lease and all three guards remain.
+
+Updated the current spec G3/N6, plan §0 refinement, README, embedding guide,
+package comments and CLAUDE.md: work queries select visible committed rows by ID,
+but overlapping insertion commits can change decision order, acceptance and final
+balances. Prompt commit reduces risk without guaranteeing order. Terminal
+rejections are not revisited. No all-writers registration-lock rollout is needed.
+
+Replaced the serial-registration simulation with independent transaction
+visibility: IDs are allocated before commit; ProcessNext skips uncommitted rows;
+rollback discards staged operations while preserving sequence gaps. The staging
+seam is explicitly scoped to fresh keys and preexisting accounts (constraint-lock
+waits remain covered by integration tests). Eight DB schedules cover an embedded
+credit held open while an HTTP-core debit commits, processing before/after credit
+visibility, credit commit/rollback, and single/group debit outcomes. They prove
+both the allowed overtaking and the terminal rejection consequence, plus compare
+balances, operation/group statuses and group atomicity to the reference.
+
+Validation: make lint test itest simtest openapi passed; full simulation ~56s.
+OpenAPI stayed identical; optional oasdiff check skipped because it is absent.
+The isolated PostgreSQL 18 container on localhost:55439 was removed afterward.
+No new dependencies, migrations, wrappers, hooks or queues. Existing unrelated
+user changes were preserved.

@@ -2,6 +2,10 @@
 
 **Final revision — 2026-08-19**
 
+**Contract refinement — 2026-09-13:** [ADR-0008](decisions/0008-caller-controlled-insertion-transactions.md)
+limits G3 to ID-ordered selection of committed work visible to each work query;
+overlapping insertion transactions may change decision order and acceptance.
+
 ---
 
 ## 1. Purpose
@@ -40,7 +44,7 @@ The deployment unit is a **cell**. A cell serves a disjoint set of owners (users
 
 - **API nodes** — any number, stateless. Insert operations, answer queries, wait on outcomes. Route each request to the owner's cell via the directory.
 
-- **Processor** — exactly one active per cell (leader lease, §7), plus standby instances for failover. Processes pending work sequentially in registration order.
+- **Processor** — exactly one active per cell (leader lease, §7), plus standby instances for failover. Selects visible committed pending work in registration ID order (G3, ADR-0008).
 
 - **PostgreSQL** — one per cell; the sole authoritative store *and* the coordination medium. The per-cell throughput ceiling.
 
@@ -70,7 +74,7 @@ Publish to client teams verbatim.
 
 - **G2 — Group atomicity.** All operations of a group are confirmed together in one database transaction, or all are rejected together. Partial application is impossible, even transiently.
 
-- **G3 — Deterministic acceptance.** Outcomes are a deterministic function of registration order: an operation is validated only after every earlier-registered operation has been decided. A group is decided at the registration position of its first leg. Replaying the same inserts in the same order yields the same outcomes.
+- **G3 — Ordered visible work (ADR-0008).** Each work query selects committed PENDING operations visible to that query in ascending registration ID order. A group is selected at its first leg. Across overlapping insertion transactions, this does not guarantee global decision order by ID or commit time: lower IDs committed after a work query may be decided after higher IDs it already fetched. Acceptance can depend on transaction visibility and processor timing. Sequential insertion commits retain ID-ordered acceptance.
 
 - **G4 — Deterministic, immutable ordering.** Timeline order is `(effective_at, registration id)` — total, unique, fixed at insert.
 
@@ -89,6 +93,8 @@ Publish to client teams verbatim.
 - **N4 — Intra-timestamp adjacency is not guaranteed** for reversals sharing the original's timestamp; end-of-instant balances are identical regardless.
 
 - **N5 — Future-dated operations enter the final balance immediately upon confirmation** (and are invisible to point-in-time reads at "now"). BalanceDB does not schedule; the client inserts when the date arrives if scheduling semantics are wanted.
+
+- **N6 — No global decision ordering across overlapping insertion transactions (ADR-0008).** Inserting at the end of a short transaction reduces the risk of a later ID being decided first, but cannot eliminate it. A late commit never revisits terminal rejections, including rejected groups. Balance limits, group atomicity, and `(effective_at, id)` timeline ordering remain enforced.
 
 ## 5. Data Model
 
@@ -348,7 +354,7 @@ every loop_interval:
 
 ```
 
-Strict registration order is what makes acceptance deterministic (G3): when an operation is validated, every earlier-registered operation has been decided.
+Work selection orders the committed rows visible to each query by registration ID (G3, ADR-0008). Uncommitted lower IDs cannot be seen or waited for; later commits do not reorder already fetched work or revisit terminal decisions. Clients should insert immediately before committing a short transaction, without treating that advice as a global ordering guarantee.
 
 ### 8.2 Single operation
 

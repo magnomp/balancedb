@@ -105,14 +105,22 @@ func (c Config) validate() error {
 	if err := validateDatabaseURL(c.DatabaseURL); err != nil {
 		return fmt.Errorf("BALANCEDB_DATABASE_URL: %w", err)
 	}
-	if !schemaNameRe.MatchString(c.Schema) {
-		return fmt.Errorf("BALANCEDB_SCHEMA: %q is not a valid schema name (must match %s)", c.Schema, schemaNameRe.String())
+	if err := ValidateSchema(c.Schema); err != nil {
+		return fmt.Errorf("BALANCEDB_SCHEMA: %w", err)
 	}
 	if _, ok := validLogLevels[c.LogLevel]; !ok {
 		return fmt.Errorf("BALANCEDB_LOG_LEVEL: %q is not one of debug|info|warn|error", c.LogLevel)
 	}
 	if c.LogFormat != "json" && c.LogFormat != "text" {
 		return fmt.Errorf("BALANCEDB_LOG_FORMAT: %q is not one of json|text", c.LogFormat)
+	}
+	return nil
+}
+
+// ValidateSchema validates a schema name for CLI and embedded deployments.
+func ValidateSchema(schema string) error {
+	if !schemaNameRe.MatchString(schema) {
+		return fmt.Errorf("%q is not a valid schema name (must match %s)", schema, schemaNameRe.String())
 	}
 	return nil
 }

@@ -10,9 +10,12 @@ sessions. Deviating from spec or plan requires a new ADR, not a quiet edit.
 ## 1. Orientation
 
 BalanceDB is a Postgres-backed ledger: clients insert money operations (singles or
-atomic groups) and a single elected leader validates and confirms them in strict
-registration order, so an account's final balance never breaks its configured
-min/max limits. One Go binary runs as `api`, `processor`, or `migrate`; all SQL is
+atomic groups) and a single elected leader selects visible committed work in ID
+order and validates final balances against configured min/max limits. Concurrent
+insertion commits can reorder decisions (ADR-0008). The root `balancedb` package
+embeds insertion, migrations and
+the processor (ADR-0007; `docs/embedding.md`). One Go binary also runs as `api`,
+`processor`, or `migrate`; all SQL is
 hand-written against a configurable schema. **Read `docs/architecture-spec.md`
 §2–§4 before any non-trivial change** — the consistency contract G1–G6 (spec §4.1)
 is the product; everything here exists to protect it.
@@ -37,6 +40,10 @@ you do.
 - **No atomic work spanning two owners.** One owner per group is the sharding
   invariant (spec §2/§10.1); a feature that touches two owners atomically is out of
   contract — stop and design, write an ADR, do not improvise.
+- **Host transactions stay caller-owned, without insertion serialization.** Use
+  `internal/ledger` for all insertions; advise inserting just before commit.
+  Concurrent commits can change acceptance order (G3 refined by ADR-0008).
+  Embedded calls isolate errors with a savepoint and restore `search_path`.
 
 ## 3. Code conventions
 
@@ -46,7 +53,8 @@ you do.
 - **Migrations are forward-only.** New numbered file only; never edit an applied
   migration; no down migrations (a rollback is a new migration).
 - **Config split:** new *behavioral* knobs go in the DB `config` table (hot-reloaded,
-  spec §5.2); new *deployment* knobs go in `BALANCEDB_*` env (plan §0 table).
+  spec §5.2); *deployment* knobs use `BALANCEDB_*` env for the CLI (plan §0 table)
+  or typed Go `balancedb.Config` for embedding (ADR-0007).
 - **Errors are handled explicitly at every SQL call.** No panics in library code. A
   guard miss rolls back and continues — it is normal control flow, not an error.
 - **New dependencies require an ADR.** Default answer is no; the stack is boring on
@@ -88,10 +96,11 @@ Packages marked *(Mn)* are not built yet — the map is the stable target.
 - `db` — pgxpool, `search_path` per connection, ping-on-boot, `WithTx` (plan §0). **built**
 - `migrate` — embedded migrations + purpose-built runner (spec §5.2, ADR-0001). **built**
 - `model` — row types, status enums, reason codes, the one amount helper, payload hashing (spec §5). **built**
+- `ledger` — shared transactional insertion and idempotency (spec §10.1, ADR-0007/0008). **built**
 - `lease` — leader lease acquire/renew/release (spec §7.1). **built**
 - `processor` — main loop, single/group processing, the three guards, batching (spec §7–§8). **built**
 - `snapshot` — snapshot upsert + cascade update (spec §8.4). **built**
-- `api` — insertion core (`Insert` over a `pgx.Tx`, spec §10.1) + Huma/chi HTTP handlers for every §10 endpoint (ADR-0003), incl. synchronous waiting (spec §10.1, ADR-0002). **built**
+- `api` — Huma/chi HTTP handlers for every §10 endpoint (ADR-0003), shared ledger insertion + synchronous waiting (ADR-0002/0007). **built**
 - `notify` — LISTEN/NOTIFY: work doorbell (api/processor) + outcome fan-out (spec §11, ADR-0002). **built**
 - `obs` — metrics registry, health endpoints, HTTP middleware, slow-query tracer (spec §13). **built**
 

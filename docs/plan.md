@@ -6,6 +6,13 @@ Target: a single Go codebase producing one Docker image that can run as `api`, `
 
 ## 0. Global decisions (apply to every milestone)
 
+**Embedded transaction refinement (ADR-0007/0008).** The root Go package accepts
+caller-owned `pgx.Tx` with no wrapper, hook, queue, or insertion serialization.
+Advise inserting near the end of a short transaction. G3 references in the original
+milestones below are subject to ADR-0008: work queries order visible committed rows
+by ID; overlapping insertion commits may change decision order and acceptance.
+Embedding uses typed deployment config and explicit migrations.
+
 **One binary, three roles.** `balancedb api`, `balancedb processor`, `balancedb migrate`. One image, role selected by command/args. API and processor both run migrations on boot (idempotent, advisory-lock guarded — see M2), so a plain `docker run` against an empty database works with no separate migration step; `migrate` exists for CI/CD pipelines that want an explicit gate.
 
 **Stack.**

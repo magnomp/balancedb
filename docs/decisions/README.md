@@ -32,3 +32,9 @@ explains it, that is a bug in either the code or the log.
   — two-tier harness (breadth in-memory / fidelity DB-backed), reference→DB id map,
   zombie-leader via lease tampering, and the Guard-3 version-race stressor the
   mutation smoke test uses.
+- [0007 — Embedded Go API](0007-embedded-go-api.md) — public transaction insertion,
+  explicit migrations and embedded leader lifecycle; insertion serialization
+  superseded by ADR-0008.
+- [0008 — Caller-controlled insertion transactions](0008-caller-controlled-insertion-transactions.md)
+  — no insertion lock or transaction wrapper; G3 limited to visible work, with
+  guidance to insert near commit and explicit acceptance-order risks.

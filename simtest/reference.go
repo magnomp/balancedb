@@ -56,6 +56,10 @@ type refAccount struct {
 type Model struct {
 	MaxGroupSize int
 
+	// IDs are allocated at insertion, but only committed rows can be decided.
+	// Independent host transactions may expose higher IDs first (ADR-0008).
+	uncommitted map[int64]bool
+
 	nextAccountID int64
 	nextOpID      int64
 	nextTxID      int64
@@ -86,6 +90,7 @@ type keyedRecord struct {
 func NewModel() *Model {
 	return &Model{
 		MaxGroupSize: DefaultMaxGroupSize,
+		uncommitted:  make(map[int64]bool),
 		accounts:     make(map[accountKey]int64),
 		accountsByID: make(map[int64]*refAccount),
 		ops:          make(map[int64]*refOp),
@@ -98,6 +103,58 @@ func NewModel() *Model {
 // OpCount returns the number of operation rows the model holds — the quantity G6
 // forbids a replay from growing.
 func (m *Model) OpCount() int { return len(m.ops) }
+
+// BeginRegistration models a successful fresh insert in an open host transaction.
+// This visibility seam uses preexisting accounts and distinct idempotency keys;
+// it does not model PostgreSQL constraint-lock waits or transaction-local replays.
+// Existing schedules use Insert for immediately committed registration.
+func (m *Model) BeginRegistration(req api.InsertRequest) (*api.InsertResult, error) {
+	for _, op := range req.Operations {
+		if _, ok := m.accounts[accountKey{ownerID: op.OwnerID, externalID: op.ExternalID}]; !ok {
+			return nil, fmt.Errorf("reference: visibility schedule requires preexisting accounts")
+		}
+	}
+	result, err := m.Insert(req)
+	if err != nil {
+		return nil, err
+	}
+	if result.Replayed {
+		return nil, fmt.Errorf("reference: visibility schedule requires a fresh key")
+	}
+	for _, op := range result.Operations {
+		m.uncommitted[op.ID] = true
+	}
+	return result, nil
+}
+
+// CommitRegistration exposes all legs together, retaining their allocated IDs.
+func (m *Model) CommitRegistration(result *api.InsertResult) {
+	for _, op := range result.Operations {
+		delete(m.uncommitted, op.ID)
+	}
+}
+
+// RollbackRegistration discards an open registration and its idempotency key.
+// Allocated IDs remain consumed, like PostgreSQL sequences after rollback.
+func (m *Model) RollbackRegistration(result *api.InsertResult) {
+	for _, op := range result.Operations {
+		delete(m.uncommitted, op.ID)
+		delete(m.ops, op.ID)
+		for key, record := range m.singleByKey {
+			if record.id == op.ID {
+				delete(m.singleByKey, key)
+			}
+		}
+	}
+	if result.TransactionID != nil {
+		delete(m.txs, *result.TransactionID)
+		for key, record := range m.groupByKey {
+			if record.id == *result.TransactionID {
+				delete(m.groupByKey, key)
+			}
+		}
+	}
+}
 
 // Insert replays one insertion and returns the same shape of result the real
 // inserter returns, including the same sentinel errors (api.ErrNoOperations,
