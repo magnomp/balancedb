@@ -9,6 +9,10 @@
 // Insert near the end of a short host transaction: concurrent commits can make
 // higher operation IDs visible and decided before lower IDs (ADR-0008).
 //
+// CreateAccount and UpdateLimits also use the host transaction. GetAccount,
+// GetBalance, GetStatement, GetOperation and GetTransaction read committed state
+// through the handle's own pool, with one consistent snapshot per call.
+//
 // The host controls contexts, logging, signals and shutdown. No HTTP listener or
 // background goroutine starts until the host calls Run. See docs/embedding.md and
 // ADR-0007 for transaction and deployment contracts.

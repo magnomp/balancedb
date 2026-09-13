@@ -4,6 +4,7 @@ import (
 	"errors"
 
 	"github.com/danielgtaylor/huma/v2"
+	"github.com/magnomp/balancedb/internal/ledger"
 )
 
 // mapInsertErr translates an insertion sentinel (insert.go) into the HTTP status
@@ -29,5 +30,21 @@ func mapInsertErr(err error) error {
 		return huma.Error422UnprocessableEntity(err.Error())
 	default:
 		return huma.Error500InternalServerError("insert failed", err)
+	}
+}
+
+// mapLedgerErr keeps domain errors independent from HTTP status handling.
+func mapLedgerErr(err error) error {
+	switch {
+	case errors.Is(err, ledger.ErrNotFound):
+		return huma.Error404NotFound("record not found")
+	case errors.Is(err, ledger.ErrAccountExists), errors.Is(err, ledger.ErrConcurrentUpdate):
+		return huma.Error409Conflict(err.Error())
+	case errors.Is(err, ledger.ErrInvalidLimits):
+		return huma.Error422UnprocessableEntity(err.Error())
+	case errors.Is(err, ledger.ErrInvalidArgument):
+		return huma.Error400BadRequest(err.Error())
+	default:
+		return huma.Error500InternalServerError("ledger query failed", err)
 	}
 }

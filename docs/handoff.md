@@ -1073,3 +1073,27 @@ OpenAPI stayed identical; optional oasdiff check skipped because it is absent.
 The isolated PostgreSQL 18 container on localhost:55439 was removed afterward.
 No new dependencies, migrations, wrappers, hooks or queues. Existing unrelated
 user changes were preserved.
+
+
+## Embedded account and query API — 2026-09-13
+
+The initial embedding work was committed as c9d47e0 and published to the new public
+repository github.com/magnomp/balancedb. This follow-up uses the isolated worktree
+embedded-account-queries and branch feat/embedded-account-queries.
+
+ADR-0009 adds CreateAccount and UpdateLimits using caller-owned pgx transactions,
+plus account, final/historical balance, paginated statement, and typed operation/
+group outcome queries. HTTP and Go share the internal/ledger core. Composite reads
+use a read-only REPEATABLE READ transaction; individual pages are consistent but
+subsequent pages can reflect new confirmations. Account creation now rejects bounds
+that exclude its initial zero balance (HTTP 422); the simulation reference model
+and DB fidelity cases cover this G1 correction. Checked projection arithmetic
+returns errors instead of wrapping int64.
+
+Validation: make lint test itest simtest passed against an isolated PostgreSQL 18
+instance; simulation completed in 59s. Race tests passed for the public package,
+internal/ledger and internal/api with the itest tag. OpenAPI regeneration changes
+only the overview's ordering description to match ADR-0008; request/response shapes
+are unchanged. Local review covered schema/savepoint restoration, owner isolation,
+CAS retry/revalidation, exact large amounts, paging, and concurrent snapshot reads.
+No dependencies, migrations, processor guards, or insertion coordination changed.

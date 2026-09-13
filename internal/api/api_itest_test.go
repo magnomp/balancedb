@@ -490,3 +490,24 @@ func mustTime(s string) time.Time {
 	}
 	return t
 }
+
+// G1 applies at account creation, including before the first operation.
+func TestHTTPCreateAccountLimitsMustContainZero(t *testing.T) {
+	_, ts, pool := newTestServer(t)
+	for _, body := range []string{
+		`{"external_id":"bad_min","min_balance":1}`,
+		`{"external_id":"bad_max","max_balance":-1}`,
+	} {
+		response, _ := doReq(t, ts, http.MethodPost, "/accounts", "1", "", body)
+		if response.StatusCode != http.StatusUnprocessableEntity {
+			t.Fatalf("initial balance outside limits: status=%d", response.StatusCode)
+		}
+	}
+	var count int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM accounts`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("invalid accounts persisted: %d", count)
+	}
+}

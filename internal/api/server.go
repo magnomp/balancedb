@@ -81,7 +81,7 @@ func NewServer(pool *pgxpool.Pool, resolver OwnerResolver, notifier outcomeWaite
 	cfg := huma.DefaultConfig(apiTitle, apiVersion)
 	cfg.Info.Description = "BalanceDB — a Postgres-backed balance-maintenance engine (ledger). " +
 		"Clients insert money operations (singles or atomic groups); a single elected " +
-		"processor validates and confirms them in strict registration order so an account's " +
+		"processor selects visible committed work in ID order and validates it so an account's " +
 		"final balance never breaks its configured limits. Insertion is asynchronous: " +
 		"POST /transactions returns 202 and outcomes are queried later."
 

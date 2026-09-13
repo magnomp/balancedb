@@ -3,7 +3,8 @@
 // Insert delegates to internal/ledger, shared with the public embedded Go API
 // (ADR-0007). That core owns spec §10.1 validation, account upserts, idempotency,
 // group atomicity and the transactional doorbell. Concurrent insertion commits
-// may expose higher IDs before lower ones (ADR-0008).
+// may expose higher IDs before lower ones (ADR-0008). Account management and reads
+// also delegate to ledger; composite reads share a consistent snapshot (ADR-0009).
 //
 // M7 adds the HTTP surface (spec §10) on Huma v2 over a chi mux (ADR-0003), which
 // is confined to this package by the ADR boundary rule. Every §10 endpoint is a
