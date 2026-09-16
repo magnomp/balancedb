@@ -38,4 +38,16 @@
 // non-edit items before any DB access — and its outcomes and GET
 // /transactions/{id} legs carry edit_of (edit items) / revision (regular legs).
 // Nothing here writes operation_revisions.
+//
+// Operation deletion (ADR-0011) adds DELETE /operations/{id} — one delete item
+// (no body; expected_revision and wait_ms are query parameters) through the same
+// core, the same 404/403 mapping (config.allow_deletes) and the same wait loop
+// on 'op:<deletion id>', answering {"deletion": …}. POST /transactions accepts
+// delete_of items (nothing but expected_revision may accompany one, 400
+// otherwise); outcomes and legs carry delete_of. GET /operations/{id} and the
+// history gain deleted_at/deleted_by on a DELETED row, delete registrations read
+// back with delete_of, and history entries carry kind ("edit" | "delete"). The
+// shared target sentinels arrive wrapped in ledger.TargetError, whose kind the
+// error messages name ("delete target 41 not found"). Nothing here writes
+// status = 'DELETED' or the deletion markers — the leader does.
 package api

@@ -1246,3 +1246,138 @@ folded into the shared `ledger.OperationOutcome` / `TransactionOutcome` /
 `StatementEntry` types so HTTP and embedded Go read them from one query core; the
 API-side SQL that task 04 had added for those reads was dropped in favour of it.
 All gates were re-run green on the rebased tree.
+
+## Operation deletion — 2026-09-16
+
+Shipped (feature spec `.compozy/tasks/operation-deletion/`, tasks 01–06; ADR-0011
+`docs/decisions/0011-operation-deletion.md`, accepted): a confirmed operation can be
+deleted — same id, terminal status `DELETED`, last values kept on the row with
+`deleted_at`/`deleted_by` stamped, nothing physically removed — as a single delete
+(`DELETE /operations/{id}?expected_revision=&wait_ms=`, no body), as `delete_of`
+items of `POST /transactions` mixed freely with edits and new operations, and
+through the embedded core (`InsertOp.DeleteOf`/`ExpectedRevision`). A delete is an
+edit-class registration row (`edit_of` + `is_delete = TRUE`) that reuses the edit
+machinery step for step: same id sequence, PENDING queue, idempotency
+(`CanonicalDeleteOp{owner, delete_of, expected_revision}`), grouping, deferral rule
+and Guard 2 split. The leader decides it as one virtual leg (`−current` on the
+target's current account) under the three guards plus the **delete CAS** on the
+target (`… SET status = 'DELETED', deleted_by, deleted_at = now() WHERE id = target
+AND revision = read AND status = 'CONFIRMED'`, rowcount 1 or rollback); `revision`
+is not bumped and no revision row is appended. `GET /operations/{id}` reads
+`DELETED` + `deleted_at`/`deleted_by` (a delete registration id reads `delete_of`),
+history entries carry `kind` (`edit | delete`), group legs carry `delete_of`.
+`apiVersion` is 1.2.0. Migration `0003_operation_deletes.sql` is additive
+(`is_delete`, `deleted_by`, `deleted_at`, two CHECKs, `config.allow_deletes`).
+
+Decisions (details in ADR-0011 and the task memory files under
+`.compozy/tasks/operation-deletion/memory/`):
+- User-fixed: a DELETED (or INVALID) target is **never refused at submission** — the
+  delete/edit registers and the leader decides it `TARGET_NOT_EDITABLE`; no new
+  rejection code. `checkTarget` is the single enforcement point; the CAS predicate
+  `status = 'CONFIRMED'` makes a stale apply impossible.
+- User-fixed: group membership is not a deletion unit. A leg of a COMMITTED group
+  may be deleted alone (the transaction stays COMMITTED with that leg DELETED);
+  deleting a whole group is a group of `delete_of` items.
+- CLAUDE.md inviolable #1 gains the delete CAS; #2 becomes "status moves forward
+  only": regular rows `PENDING → CONFIRMED → DELETED` or `PENDING → INVALID`,
+  `deleted_by`/`deleted_at` written only by the leader once under the CAS, nothing
+  physically deleted. Spec header note, Principle 5, N7 (extends to deletes),
+  §5.2–§5.4, §7.2, §8.2–§8.3, §9, §10.2, §10.4 (new), §12, §13 refined.
+- Ledger: the three shared target sentinels are wrapped in
+  `*ledger.TargetError{Kind, Target}` (root `balancedb.TargetError`, kinds
+  `TargetEdit`/`TargetDelete`); `errors.Is` still matches the sentinel, `errors.As`
+  gives the kind so the API renders "delete target 41 not found" without string
+  matching. An item with both `edit_of` and `delete_of` (or any other field on a
+  delete item) is `ErrDeleteWithFields` structurally, before any DB access.
+  `allow_deletes` is read with `allow_edits` in one `selectConfig`; the policies
+  apply independently (edits checked first).
+- Processor: `expandDelete` reads the target in the deciding transaction (the delete
+  row's own `account_id`/`amount`/`effective_at` are an informational copy, never
+  read); `guardDeleteCAS` runs per delete target (single and group); the group Guard 2
+  split is unchanged (delete legs flip APPLIED with the edit legs under `edit_of IS
+  NOT NULL`). A delete and an edit of one target in one batch decide in id order.
+  Snapshots: one `Apply(−current)` at the target's current instant, no coalescing.
+  Rejected delete rows stamp `confirmed_at` as their decision instant, like edits.
+  `TestNoPhysicalDeleteAndDeletedWritersConfined` scans every non-test Go file:
+  no `DELETE FROM operations|operation_revisions`, and `status = 'DELETED'` /
+  `deleted_by` / `deleted_at` are written only by `internal/processor`.
+- HTTP: `expected_revision` on `DELETE` is a query parameter with `minimum: 1`, so
+  `0` is Huma's schema `422` (the body path on `PATCH` is the handler's `400`) —
+  deliberate, both are pre-DB client errors, documented in README §Deleting.
+  `403` when `allow_deletes` is false; `404` unknown/foreign target; `422` when the
+  target is itself a registration. Replay with `wait_ms > 0` on a decided delete is
+  `200`. `oasdiff` vs HEAD: 11 info (1 endpoint added, 10 optional/required
+  properties added), 0 errors, 0 warnings — purely additive.
+- Simulation: generator emits `actDelete` (single) and `actDeleteGroup` (grouped and
+  mixed, kind-aware `Mixed()`); the reference decides deletes (`decideDelete`,
+  `applyDelete`, `CheckDeletes` — a DELETED row has exactly one APPLIED delete and
+  never reads CONFIRMED again); every tier prints fine-grained `del_*` classes
+  (guard none/hit/miss, target confirmed/edited/invalid/deleted/fresh, replay,
+  conflict) and fails if any is absent; the DB tier compares `is_delete`,
+  `deleted_by` (mapped), `deleted_at` and DELETED statuses; `assertG2` allows a
+  later-DELETED regular leg of a COMMITTED group.
+- Docs (this task): CLAUDE.md §1 orientation + §5 map lines (`model`, `ledger`,
+  `processor`, `api`; 124 lines, AGENTS.md symlink intact); README "Deleting
+  operations" section, `allow_deletes` config row, metric rows (`kind=delete`,
+  shared `edit_deferrals_total`), simulation coverage, and the stale
+  `0009-operation-editing.md` link fixed to 0010; `docs/embedding.md` gained the
+  "group membership is not a deletion unit" sentence; ADR-0011 and the ADR index
+  entry refined to the shipped fidelity coverage; `_spec.md` Impact Analysis
+  reconciled with what shipped.
+
+Validation — full gate set on the final tree (tasks 01–06 applied), fresh
+throwaway `postgres:17-alpine` on 127.0.0.1:55446, `GOFLAGS=-count=1` so nothing
+was served from the Go test cache:
+- `make lint` → `0 issues.` exit 0, 0.6s (gofumpt + golangci-lint go vet across
+  `itest`/`simtest` tags + `check-docs`).
+- `make test` → exit 0, 4.0s; breadth tier 1,200 seeds, action mix
+  `insert=53758 replay=19115 conflict=14075 reversal=33158 set_limits=29298
+  edit=33497 edit_group=6277 edit_group_mixed=12512 delete=19274 delete_group=6277
+  delete_group_mixed=12759 del_conflict=3160 del_guard_hit=18887
+  del_guard_miss=9446 del_guard_none=28685 del_replay=4093
+  del_target_confirmed=18568 del_target_deleted=2895 del_target_edited=3309
+  del_target_fresh=13741 del_target_invalid=18505`.
+- `make itest` → exit 0, 51.3s (api 50.1s, processor 12.0s, ledger 5.5s, root 5.2s,
+  simtest 4.6s, migrate 1.9s, lease 1.9s, notify 1.0s, snapshot 0.5s); 0 FAIL.
+- `make simtest` → exit 0, 57.1s (`ok simtest 56.3s`: full-scenario DB fidelity
+  with single/grouped/mixed deletes, batch-boundary crash, competing leaders,
+  zombie leader, Guard-3 race, host-registration visibility).
+- `make openapi` → exit 0: `openapigen` idempotent (sha256 `f828c45fdcead76b…`
+  before and after; the regenerated file is **staged**, which is why the drift step
+  passes on an uncommitted tree), `oasdiff breaking` vs HEAD = "No breaking changes
+  to report"; `oasdiff changelog` = 11 info, 0 error, 0 warning (listed above).
+- Every task's own evidence (unit/integration/simulation IDs) is listed per task in
+  `.compozy/tasks/operation-deletion/memory/task_0N.md`; all were re-run here as part
+  of the full suites above.
+
+Deferred/known issues:
+- `ReasonTargetNotEditable` / `ReasonStaleRevision` are not re-exported from the
+  root package (only `ReasonLimitViolated` is); embedded hosts compare
+  `balancedb.ReasonCode("TARGET_NOT_EDITABLE")`. Trivial additive follow-up for
+  whoever next touches `queries.go` (this task was docs-only by contract).
+- A grouped-deferral itest (delete leg whose target is still PENDING) is not
+  written; the single-delete deferral (IT-040, `TestDeleteDeferredWhileTargetPending`)
+  and the edit-group deferral (`TestGroupDeferredWhileTargetPending`) cover the
+  shared path, and deferral remains unreachable through real inserts (edit FK, see
+  the editing entry).
+- The processor never reads `allow_deletes` (by design, like `allow_edits`);
+  `model.Config.AllowDeletes` exists but no `readConfig` scans it.
+- `go build ./...` still fails in `simtest` (pre-existing, see the editing entry).
+- `oasdiff breaking` still runs without `--fail-on` (informational) and is not in CI.
+
+Notes for next agents:
+- Release notes for 1.2.0: purely additive — `DELETE /operations/{id}`, `delete_of`
+  items and fields, `deleted_at`/`deleted_by`, history `kind`; `DELETED` is a new
+  value of the free-text `status`; migration 0003 additive and forward-only.
+- Adding migration `0004+`: bump `latestVersion` (now 3) in
+  `internal/migrate/migrate_itest_test.go`; the UT-001 goldens now pin three
+  encodings (legacy `f5bceba8…`, edit `194e94a7…`, delete `9ac1da8c…`).
+- `simtest/reference.go:canonicalOps` must stay a mirror of
+  `internal/ledger/insert.go:canonicalOps` — it now includes the delete encoding.
+- Any new read that keys on `status <> 'INVALID'` instead of `= 'CONFIRMED'` must be
+  audited against DELETED rows; today only `idx_ops_reversal` does, on purpose.
+- Environment: unchanged from the editing entry (`export PATH="$HOME/sdk/go/bin:$HOME/go/bin:$HOME/bin:$PATH"`,
+  go 1.25, `oasdiff` in `$HOME/go/bin`). No Postgres on 5432; this feature's tasks
+  used throwaway `postgres:17-alpine` containers on 55441–55446, all removed. The
+  whole feature is uncommitted on `feat/operation-editing` (branched from the
+  editing commit `beb07c7`); commit and PR belong to the next surface.

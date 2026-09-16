@@ -23,9 +23,11 @@ const (
 
 	// selectGroupLegs loads every leg of a transaction, any status, in id order.
 	// The universe is complete because groups insert atomically (spec §10.1).
-	// edit_of / expected_revision mark an edit leg (ADR-0010): its row holds the
-	// full proposed state for the target it names.
-	selectGroupLegs = `SELECT id, account_id, amount, effective_at, status, edit_of, expected_revision
+	// edit_of / expected_revision mark an edit-class leg: a plain edit (ADR-0010)
+	// whose row holds the full proposed state for the target it names, or — with
+	// is_delete — a delete (ADR-0011) whose row is an informational copy the
+	// decision never reads.
+	selectGroupLegs = `SELECT id, account_id, amount, effective_at, status, edit_of, is_delete, expected_revision
   FROM operations WHERE transaction_id = $1 ORDER BY id`
 
 	// selectGroupAccounts reads every involved account (balance, version, limits,
@@ -36,10 +38,11 @@ const (
 	// Guard 2 for a group (spec §7.2): the conditional PENDING flips of every leg
 	// and of the transaction row. Each carries a rowcount check — the legs must all
 	// still be PENDING (the two leg flips' rowcounts sum to the leg count: regular
-	// legs, edit_of IS NULL, and edit legs, edit_of IS NOT NULL, each matching its
-	// own count) and the transaction must still be PENDING (rowcount == 1), else
-	// the group was decided under us ⇒ rollback. Regular legs flip to CONFIRMED,
-	// edit legs to APPLIED (ADR-0010: an edit registration is never CONFIRMED).
+	// legs, edit_of IS NULL, and edit-class legs — edits and deletes alike,
+	// edit_of IS NOT NULL — each matching its own count) and the transaction must
+	// still be PENDING (rowcount == 1), else the group was decided under us ⇒
+	// rollback. Regular legs flip to CONFIRMED, edit-class legs to APPLIED
+	// (ADR-0010/0011: an edit or delete registration is never CONFIRMED).
 	guardFlipLegsConfirmed = `UPDATE operations SET status = 'CONFIRMED', confirmed_at = now()
  WHERE transaction_id = $1 AND status = 'PENDING' AND edit_of IS NULL`
 	guardFlipEditLegsApplied = `UPDATE operations SET status = 'APPLIED', confirmed_at = now()
@@ -59,8 +62,10 @@ const (
 )
 
 // groupLeg is the slice of an operations row the group path needs. EditOf set
-// marks an edit leg (ADR-0010): AccountID, Amount and EffectiveAt are then the
-// full proposed state for the target, and ExpectedRevision its optional guard.
+// marks an edit-class leg: a plain edit (ADR-0010), whose AccountID, Amount and
+// EffectiveAt are the full proposed state for the target, or — with IsDelete —
+// a delete (ADR-0011), whose copy of those columns the decision never reads.
+// ExpectedRevision is the optional guard of either kind.
 type groupLeg struct {
 	ID               int64
 	AccountID        int64
@@ -68,15 +73,21 @@ type groupLeg struct {
 	EffectiveAt      time.Time
 	Status           string
 	EditOf           *int64
+	IsDelete         bool
 	ExpectedRevision *int32
 }
 
-// isEdit reports whether the leg is an edit registration.
+// isEdit reports whether the leg is an edit-class registration (a plain edit or
+// a delete) — the class the Guard 2 split flips to APPLIED.
 func (l groupLeg) isEdit() bool { return l.EditOf != nil }
 
-// groupEdit pairs an edit leg with its target as read inside the deciding
-// transaction — what the apply path needs for the history row, the revision CAS
-// and the coalesced snapshot legs.
+// isDelete reports whether the leg is a delete registration.
+func (l groupLeg) isDelete() bool { return l.EditOf != nil && l.IsDelete }
+
+// groupEdit pairs an edit-class leg (edit or delete) with its target as read
+// inside the deciding transaction — what the apply path needs for the history
+// row and revision CAS of an edit, the delete CAS of a delete, and the snapshot
+// legs of either.
 type groupEdit struct {
 	leg    groupLeg
 	target targetState
@@ -106,18 +117,20 @@ func (p *Processor) processGroup(ctx context.Context, txID int64) error {
 // processGroupTx decides one whole group inside the caller's transaction (spec
 // §8.3): load all legs by transaction_id, cross-check op_count, expand every leg
 // into virtual legs (one per regular leg, two per edit leg — −current on the
-// target as read, +proposed — ADR-0010), net per account, validate every involved
-// account, then all-or-nothing — all pass: apply every account's net (each under
-// the Guard 3 version CAS), append each edit target's superseded state and
-// overwrite it under the revision CAS, snapshot every virtual leg, flip regular
-// legs to CONFIRMED, edit legs to APPLIED and the transaction to COMMITTED (Guard
-// 2); any fail: flip all legs to INVALID and the transaction to REJECTED with one
-// shared reason (Guard 2), no balance, snapshot or revision write. An edit leg
-// whose target is still PENDING defers the whole group (errDeferred); a target
-// that ended INVALID or is not at the expected revision rejects the whole group
-// with TARGET_NOT_EDITABLE / STALE_REVISION (Safety Invariant 6). Group atomicity
-// is simply the DB transaction. Any guard miss returns errGuardMiss, rolling the
-// transaction back.
+// target as read, +proposed — ADR-0010, one per delete leg — −current on the
+// target as read — ADR-0011), net per account, validate every involved account,
+// then all-or-nothing — all pass: apply every account's net (each under the
+// Guard 3 version CAS), append each edit target's superseded state and overwrite
+// it under the revision CAS, flip each delete target CONFIRMED → DELETED under
+// the delete CAS, snapshot every virtual leg, flip regular legs to CONFIRMED,
+// edit-class legs to APPLIED and the transaction to COMMITTED (Guard 2); any
+// fail: flip all legs to INVALID and the transaction to REJECTED with one shared
+// reason (Guard 2), no balance, snapshot, revision or target write. An edit-class
+// leg whose target is still PENDING defers the whole group (errDeferred); a
+// target that ended INVALID or DELETED, or is not at the expected revision,
+// rejects the whole group with TARGET_NOT_EDITABLE / STALE_REVISION (Safety
+// Invariant 6). Group atomicity is simply the DB transaction. Any guard miss
+// returns errGuardMiss, rolling the transaction back.
 func (p *Processor) processGroupTx(ctx context.Context, tx pgx.Tx, txID int64) error {
 	// Guard 1: lease fence (spec §7.2) — evaluated per decision even within a batch.
 	var fenced int
@@ -160,10 +173,10 @@ func (p *Processor) processGroupTx(ctx context.Context, tx pgx.Tx, txID int64) e
 		}
 	}
 
-	// Read every edit leg's target inside this transaction. Deferral is decided
-	// over the whole group first — any PENDING target defers every leg — then the
-	// target-state rejections in leg order, so the outcome never depends on which
-	// leg happens to come first.
+	// Read every edit-class leg's target inside this transaction. Deferral is
+	// decided over the whole group first — any PENDING target defers every leg —
+	// then the target-state rejections in leg order, so the outcome never depends
+	// on which leg happens to come first.
 	edits, err := p.readGroupTargets(ctx, tx, legs)
 	if err != nil {
 		return err
@@ -215,8 +228,9 @@ func (p *Processor) processGroupTx(ctx context.Context, tx pgx.Tx, txID int64) e
 	return p.commitGroup(ctx, tx, txID, legs, edits, accts)
 }
 
-// readGroupTargets reads the target of every edit leg, in leg order. Regular
-// legs contribute nothing; a group without edits reads nothing.
+// readGroupTargets reads the target of every edit-class leg — edits and deletes
+// alike — in leg order. Regular legs contribute nothing; a group without
+// edit-class legs reads nothing.
 func (p *Processor) readGroupTargets(ctx context.Context, tx pgx.Tx, legs []groupLeg) ([]groupEdit, error) {
 	var edits []groupEdit
 	for _, l := range legs {
@@ -243,7 +257,7 @@ func (p *Processor) loadGroupLegs(ctx context.Context, tx pgx.Tx, txID int64) ([
 	var legs []groupLeg
 	for rows.Next() {
 		var l groupLeg
-		if err := rows.Scan(&l.ID, &l.AccountID, &l.Amount, &l.EffectiveAt, &l.Status, &l.EditOf, &l.ExpectedRevision); err != nil {
+		if err := rows.Scan(&l.ID, &l.AccountID, &l.Amount, &l.EffectiveAt, &l.Status, &l.EditOf, &l.IsDelete, &l.ExpectedRevision); err != nil {
 			return nil, fmt.Errorf("scan group %d leg: %w", txID, err)
 		}
 		legs = append(legs, l)
@@ -256,8 +270,9 @@ func (p *Processor) loadGroupLegs(ctx context.Context, tx pgx.Tx, txID int64) ([
 
 // expandGroup turns a group's legs into virtual legs in leg order: one per
 // regular leg, two per edit leg (−current on the target as read, +proposed —
-// expandEdit, ADR-0010). edits holds the targets of the edit legs in the same
-// leg order. Pure: shared by the decision and the unit tests (UT-011).
+// expandEdit, ADR-0010), one per delete leg (−current on the target as read —
+// expandDelete, ADR-0011). edits holds the targets of the edit-class legs in
+// the same leg order. Pure: shared by the decision and the unit tests (UT-011).
 func expandGroup(legs []groupLeg, edits []groupEdit) []virtualLeg {
 	out := make([]virtualLeg, 0, len(legs)+len(edits))
 	next := 0
@@ -268,6 +283,10 @@ func expandGroup(legs []groupLeg, edits []groupEdit) []virtualLeg {
 		}
 		e := edits[next]
 		next++
+		if l.isDelete() {
+			out = append(out, expandDelete(e.target)...)
+			continue
+		}
 		out = append(out, expandEdit(e.target, pendingOp{
 			ID: l.ID, AccountID: l.AccountID, Amount: l.Amount, EffectiveAt: l.EffectiveAt,
 			EditOf: l.EditOf, ExpectedRevision: l.ExpectedRevision,
@@ -324,16 +343,19 @@ func (p *Processor) netAndReadAccounts(ctx context.Context, tx pgx.Tx, legs []vi
 }
 
 // commitGroup applies an accepted group: Guard 2 flips every regular leg to
-// CONFIRMED, every edit leg to APPLIED and the transaction to COMMITTED; for each
-// edit leg the superseded state is appended to operation_revisions and the target
-// overwritten under the revision CAS (ADR-0010); Guard 3 applies each account's
-// net — over all virtual legs, once per account — under its version CAS;
-// snapshots update per regular leg and per coalesced edit leg pair; then the
-// outcome is notified — all in the caller's transaction, so it is atomic (spec
-// §8.3/G2, Safety Invariants 1, 2, 5, 6).
+// CONFIRMED, every edit-class leg to APPLIED and the transaction to COMMITTED;
+// for each edit leg the superseded state is appended to operation_revisions and
+// the target overwritten under the revision CAS (ADR-0010); for each delete leg
+// the target flips CONFIRMED → DELETED under the delete CAS, stamped with the
+// leg as deleted_by (ADR-0011); Guard 3 applies each account's net — over all
+// virtual legs, once per account — under its version CAS; snapshots update per
+// regular leg, per coalesced edit leg pair and per delete leg; then the outcome
+// is notified — all in the caller's transaction, so it is atomic (spec §8.3/G2,
+// Safety Invariants 1, 2, 5, 6).
 func (p *Processor) commitGroup(ctx context.Context, tx pgx.Tx, txID int64, legs []groupLeg, edits []groupEdit, accts []groupAccount) error {
-	// Guard 2: flip the regular legs to CONFIRMED and the edit legs to APPLIED;
-	// the two rowcounts must each match their leg count (summing to all legs).
+	// Guard 2: flip the regular legs to CONFIRMED and the edit-class legs (edits
+	// and deletes) to APPLIED; the two rowcounts must each match their leg count
+	// (summing to all legs).
 	nEdits := len(edits)
 	tag, err := tx.Exec(ctx, guardFlipLegsConfirmed, txID)
 	if err != nil {
@@ -361,13 +383,25 @@ func (p *Processor) commitGroup(ctx context.Context, tx pgx.Tx, txID int64, legs
 		return errGuardMiss
 	}
 
-	// Per edit leg, in leg order: history first, then the revision CAS on the
-	// target — the same two writes the single-edit path makes (applyEdit). Two
-	// legs never share a target (ErrDuplicateEditTarget at registration), so each
-	// CAS runs against the revision this transaction read.
+	// Per edit-class leg, in leg order. An edit leg: history first, then the
+	// revision CAS on the target — the same two writes the single-edit path makes
+	// (applyEdit). A delete leg: the delete CAS alone — the same write the
+	// single-delete path makes (applyDelete); nothing is appended and revision is
+	// untouched. Two legs never share a target (ErrDuplicateEditTarget at
+	// registration), so each CAS runs against the revision this transaction read.
 	for _, e := range edits {
 		targetID := *e.leg.EditOf
 		t := e.target
+		if e.leg.isDelete() {
+			tag, err := tx.Exec(ctx, guardDeleteCAS, targetID, e.leg.ID, t.Revision)
+			if err != nil {
+				return fmt.Errorf("delete CAS on operation %d (group %d): %w", targetID, txID, err)
+			}
+			if tag.RowsAffected() != 1 {
+				return errGuardMiss
+			}
+			continue
+		}
 		if _, err := tx.Exec(ctx, insertRevision,
 			targetID, t.Revision, t.AccountID, t.Amount, t.EffectiveAt, t.recordedAt(), e.leg.ID); err != nil {
 			return fmt.Errorf("append revision %d of operation %d (group %d): %w", t.Revision, targetID, txID, err)
@@ -394,8 +428,10 @@ func (p *Processor) commitGroup(ctx context.Context, tx pgx.Tx, txID int64, legs
 
 	// Snapshots (spec §8.4): one per regular leg with the leg's own amount and
 	// day; an edit leg's two virtual legs after same-bucket coalescing, observed
-	// once per edit as on the single path. The snapshot deltas on an account sum
-	// to the net applied above.
+	// once per edit as on the single path; a delete leg's one virtual leg as-is
+	// (−current at the target's instant — there is no pair to coalesce), as on
+	// the single-delete path. The snapshot deltas on an account sum to the net
+	// applied above.
 	next := 0
 	for _, l := range legs {
 		if !l.isEdit() {
@@ -408,6 +444,15 @@ func (p *Processor) commitGroup(ctx context.Context, tx pgx.Tx, txID int64, legs
 		}
 		e := edits[next]
 		next++
+		if l.isDelete() {
+			v := expandDelete(e.target)[0]
+			rows, err := snapshot.Apply(ctx, tx, v.AccountID, v.EffectiveAt, v.Amount)
+			if err != nil {
+				return err
+			}
+			p.recordSnapshotRows(rows)
+			continue
+		}
 		old := virtualLeg{AccountID: e.target.AccountID, Amount: -e.target.Amount, EffectiveAt: e.target.EffectiveAt}
 		cur := virtualLeg{AccountID: l.AccountID, Amount: l.Amount, EffectiveAt: l.EffectiveAt}
 		var rows int64
@@ -427,9 +472,10 @@ func (p *Processor) commitGroup(ctx context.Context, tx pgx.Tx, txID int64, legs
 
 // rejectGroup rejects a group: Guard 2 flips every leg to INVALID and the
 // transaction to REJECTED with the one machine-readable reason every leg shares
-// (an offending account + shortfall, or an edit target that is not editable /
-// not at the expected revision). No account, snapshot or revision is written, so
-// there is no Guard 3 and every edit target keeps its current row (spec §8.3).
+// (an offending account + shortfall, or an edit or delete target that is not
+// editable / not at the expected revision). No account, snapshot or revision is
+// written, so there is no Guard 3 and every target keeps its current row (spec
+// §8.3).
 func (p *Processor) rejectGroup(ctx context.Context, tx pgx.Tx, txID int64, legs []groupLeg, reason model.Rejection) error {
 	detail, err := reason.Marshal()
 	if err != nil {
@@ -442,7 +488,7 @@ func (p *Processor) rejectGroup(ctx context.Context, tx pgx.Tx, txID int64, legs
 		}
 	}
 
-	// Guard 2: flip the regular legs and the edit legs to INVALID; the two
+	// Guard 2: flip the regular legs and the edit-class legs to INVALID; the two
 	// rowcounts must each match their leg count (summing to all legs).
 	tag, err := tx.Exec(ctx, guardFlipLegsInvalid, txID, detail)
 	if err != nil {

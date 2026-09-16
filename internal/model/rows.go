@@ -40,12 +40,18 @@ type Transaction struct {
 // id). transaction_id is NULL for singles; idempotency_key/payload_hash are set
 // on singles only.
 //
-// A row with EditOf set is an edit registration (ADR-0010): AccountID, Amount and
-// EffectiveAt hold the full proposed state for the target; ExpectedRevision is
-// its optional optimistic guard. On a regular operation Revision is the current
+// A row with EditOf set is an edit-class registration. A plain edit (ADR-0010)
+// holds in AccountID, Amount and EffectiveAt the full proposed state for the
+// target; ExpectedRevision is its optional optimistic guard. A delete (ADR-0011)
+// is the same kind of row with IsDelete set: its AccountID, Amount and
+// EffectiveAt are an informational copy of the target at submission that the
+// processor never reads. On a regular operation Revision is the current
 // revision (1 until the first applied edit) and RevisedAt is when that revision
-// became current (nil = never edited); both are unused (1, nil) on edit rows.
-// ConfirmedAt is the decision instant for CONFIRMED and APPLIED rows alike.
+// became current (nil = never edited); both are unused (1, nil) on edit-class
+// rows. DeletedBy and DeletedAt are set together on a DELETED regular row only:
+// the APPLIED delete registration and the instant the row became DELETED
+// (equal to that delete's ConfirmedAt). ConfirmedAt is the decision instant
+// for CONFIRMED and APPLIED rows alike.
 type Operation struct {
 	ID                 int64
 	AccountID          int64
@@ -63,6 +69,9 @@ type Operation struct {
 	ExpectedRevision   *int32
 	Revision           int32
 	RevisedAt          *time.Time
+	IsDelete           bool       // edit-class row that deletes its target (ADR-0011)
+	DeletedBy          *int64     // regular row: the APPLIED delete registration
+	DeletedAt          *time.Time // regular row: when it became DELETED
 }
 
 // OperationRevision is a row of the operation_revisions table (ADR-0010): the
@@ -98,4 +107,5 @@ type Config struct {
 	MaxGroupSize   int
 	APIMaxWaitMs   int
 	AllowEdits     bool // FALSE keeps the cell on the reversal-only contract (ADR-0010)
+	AllowDeletes   bool // FALSE refuses new delete registrations; independent of AllowEdits (ADR-0011)
 }

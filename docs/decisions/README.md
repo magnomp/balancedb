@@ -47,3 +47,9 @@ explains it, that is a bug in either the code or the log.
   is overwritten under a revision CAS and every superseded state is appended to
   `operation_revisions`; the immutability inviolable is restated as "history
   append-only".
+- [0011 — Operation deletion](0011-operation-deletion.md) — deletes are edit-class
+  registration rows (`edit_of + is_delete`) decided by the leader as one virtual leg;
+  the target flips `CONFIRMED → DELETED` under the delete CAS (the revision CAS
+  predicate, `status = 'CONFIRMED'` included) with `deleted_by` / `deleted_at`, keeps
+  its last values and revision, and nothing is ever physically deleted;
+  `TARGET_NOT_EDITABLE` covers DELETED targets, decided by the leader only.

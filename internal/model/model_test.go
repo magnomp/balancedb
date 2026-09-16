@@ -139,6 +139,54 @@ func TestHashPayloadLegacyGolden(t *testing.T) {
 	}
 }
 
+// editPayloadHash and deletePayloadHash are the SHA-256s HashPayload produced
+// for editPayloadFixture and deletePayloadFixture when each item kind was
+// introduced (ADR-0010 and ADR-0011). Like legacyPayloadHash they must never
+// change: every idempotency key registered with an edit or a delete replays
+// against them. Adding an item kind adds a golden here; it never touches an
+// existing encoding.
+const (
+	editPayloadHash   = "194e94a72435349254f8053ca94763a6bea5012cdf26f0aa7d7bf7b0c5929f00"
+	deletePayloadHash = "9ac1da8ce2b3fa6163fb463df74b02211315e2ae1dda5a16396bddfbe23b9aa9"
+)
+
+func editPayloadFixture() []any   { return []any{CanonicalEditOp{OwnerID: 7, EditOf: 41}} }
+func deletePayloadFixture() []any { return []any{CanonicalDeleteOp{OwnerID: 7, DeleteOf: 41}} }
+
+// UT-001 (deletion): the edit encoding is untouched by the delete item kind and
+// a delete item has its own pinned golden. A delete of a target hashes
+// differently from an edit of the same target with every field omitted, and
+// from the same delete with a revision guard.
+func TestHashPayloadEditAndDeleteGolden(t *testing.T) {
+	t.Parallel()
+	h, err := HashPayload(editPayloadFixture())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hex.EncodeToString(h); got != editPayloadHash {
+		t.Fatalf("edit hash drifted:\n got %s\nwant %s", got, editPayloadHash)
+	}
+	hDelete, err := HashPayload(deletePayloadFixture())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hex.EncodeToString(hDelete); got != deletePayloadHash {
+		t.Fatalf("delete hash drifted:\n got %s\nwant %s", got, deletePayloadHash)
+	}
+	if bytes.Equal(h, hDelete) {
+		t.Fatalf("delete of 41 and all-omitted edit of 41 must hash differently")
+	}
+
+	rev := int32(2)
+	hGuarded, err := HashPayload([]any{CanonicalDeleteOp{OwnerID: 7, DeleteOf: 41, ExpectedRevision: &rev}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(hDelete, hGuarded) {
+		t.Fatalf("expected_revision must be part of the delete payload")
+	}
+}
+
 // UT-002: edit items hash as sent — omitting a field and sending the target's
 // current value are different payloads — while the transport shape (PATCH on
 // one operation vs a POST item) does not matter: both build the same

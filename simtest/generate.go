@@ -3,9 +3,11 @@ package simtest
 import (
 	"fmt"
 	"math/rand"
+	"sort"
 	"time"
 
 	"github.com/magnomp/balancedb/internal/api"
+	"github.com/magnomp/balancedb/internal/model"
 )
 
 // This file is the M10 seeded generator for the full spec §15 scenario space. It
@@ -14,7 +16,10 @@ import (
 // reversal-after-reject retries), edits (ADR-0010: single, grouped and mixed
 // with new operations; amount, account and day-crossing effective_at changes,
 // expected_revision hits and misses, targets that are CONFIRMED, INVALID,
-// already edited, or still PENDING from the same round), and limit changes —
+// already edited, DELETED, or still PENDING from the same round), deletes
+// (ADR-0011: single, grouped and mixed with edits and new operations; the same
+// target classes, expected_revision hits and misses, replays and conflicts
+// through the shared replay/conflict draws), and limit changes —
 // drawn from a seeded PRNG and shaped by the current
 // reference-model state so every one is a valid, state-aware move. The same Action
 // stream drives the pure reference model (breadth: 1,000+ seeds under `make test`/
@@ -53,13 +58,15 @@ var scenarioAccounts = []acctSpec{
 type actionKind int
 
 const (
-	actInsert    actionKind = iota // a fresh single or group
-	actReplay                      // an exact resend of a prior request (must replay)
-	actConflict                    // same key, mutated payload (must conflict)
-	actReversal                    // a fresh single reversing a confirmed operation
-	actSetLimits                   // a state-aware limit change
-	actEdit                        // a fresh single edit of a regular operation (ADR-0010)
-	actEditGroup                   // a fresh group of edits, optionally mixed with new operations
+	actInsert      actionKind = iota // a fresh single or group
+	actReplay                        // an exact resend of a prior request (must replay)
+	actConflict                      // same key, mutated payload (must conflict)
+	actReversal                      // a fresh single reversing a confirmed operation
+	actSetLimits                     // a state-aware limit change
+	actEdit                          // a fresh single edit of a regular operation (ADR-0010)
+	actEditGroup                     // a fresh group of edits, optionally mixed with new operations
+	actDelete                        // a fresh single delete of a regular operation (ADR-0011)
+	actDeleteGroup                   // a fresh group of deletes, optionally mixed with edits and new operations
 )
 
 // String names an action kind for the action-mix tally the tests print.
@@ -79,54 +86,109 @@ func (k actionKind) String() string {
 		return "edit"
 	case actEditGroup:
 		return "edit_group"
+	case actDelete:
+		return "delete"
+	case actDeleteGroup:
+		return "delete_group"
 	default:
 		return fmt.Sprintf("kind(%d)", int(k))
 	}
 }
 
-// Mixed reports whether an edit-group action also carries new operations.
+// Mixed reports whether a group action carries more than its own kind: an edit
+// group with new operations (a delete item is edit-class, never "new"), or a
+// delete group with edits or new operations.
 func (a Action) Mixed() bool {
-	if a.Kind != actEditGroup {
-		return false
-	}
 	for _, op := range a.Req.Operations {
-		if op.EditOf == nil {
-			return true
+		switch a.Kind {
+		case actEditGroup:
+			if op.EditOf == nil && op.DeleteOf == nil {
+				return true
+			}
+		case actDeleteGroup:
+			if op.DeleteOf == nil {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-// actionMix tallies generated actions by kind (edit groups split into pure and
-// mixed) so a sweep can print — and assert — that every class of move, edits
-// included, is present in the schedule it just ran.
+// actionMix tallies generated actions by kind (edit and delete groups split
+// into pure and mixed) and every fine-grained delete class an action carries
+// (Action.Classes), so a sweep can print — and assert — that every class of
+// move, edits and deletes included, is present in the schedule it just ran.
 type actionMix map[string]int
+
+// mixKinds is the fixed print order of the action kinds.
+var mixKinds = []string{"insert", "replay", "conflict", "reversal", "set_limits", "edit", "edit_group", "edit_group_mixed", "delete", "delete_group", "delete_group_mixed"}
+
+// deleteClasses is every fine-grained delete class the generator can emit (UT-043):
+// the guard draw, the target's state when the delete was drawn, and a replay or
+// a conflict of a request carrying a delete item.
+var deleteClasses = []string{
+	"del_guard_none", "del_guard_hit", "del_guard_miss",
+	"del_target_confirmed", "del_target_edited", "del_target_invalid", "del_target_deleted", "del_target_fresh",
+	"del_replay", "del_conflict",
+}
 
 func (x actionMix) add(a Action) {
 	name := a.Kind.String()
 	if a.Mixed() {
-		name = "edit_group_mixed"
+		name += "_mixed"
 	}
 	x[name]++
+	for _, c := range a.Classes {
+		x[c]++
+	}
 }
 
-// String renders the tally in a fixed order.
+// String renders the tally: the kinds in a fixed order, then every other key
+// (the delete classes) sorted.
 func (x actionMix) String() string {
 	out := ""
-	for _, k := range []string{"insert", "replay", "conflict", "reversal", "set_limits", "edit", "edit_group", "edit_group_mixed"} {
+	for _, k := range mixKinds {
 		if out != "" {
 			out += " "
 		}
 		out += fmt.Sprintf("%s=%d", k, x[k])
 	}
+	known := make(map[string]bool, len(mixKinds))
+	for _, k := range mixKinds {
+		known[k] = true
+	}
+	var rest []string
+	for k := range x {
+		if !known[k] {
+			rest = append(rest, k)
+		}
+	}
+	sort.Strings(rest)
+	for _, k := range rest {
+		out += fmt.Sprintf(" %s=%d", k, x[k])
+	}
 	return out
 }
 
-// missingEdits names the edit classes absent from the tally, or nil when single
-// edits, pure edit groups and mixed groups all occurred.
-func (x actionMix) missingEdits() []string {
+// missingClasses names the edit-class kinds absent from the tally, or nil when
+// single edits, pure and mixed edit groups, single deletes and pure and mixed
+// delete groups all occurred.
+func (x actionMix) missingClasses() []string {
 	var missing []string
-	for _, k := range []string{"edit", "edit_group", "edit_group_mixed"} {
+	for _, k := range []string{"edit", "edit_group", "edit_group_mixed", "delete", "delete_group", "delete_group_mixed"} {
+		if x[k] == 0 {
+			missing = append(missing, k)
+		}
+	}
+	return missing
+}
+
+// missingDeleteClasses names the fine-grained delete classes absent from the
+// tally, or nil when every one occurred (UT-043; asserted by the breadth sweep,
+// whose 1,000+ seeds make every class certain).
+func (x actionMix) missingDeleteClasses() []string {
+	var missing []string
+	for _, k := range deleteClasses {
 		if x[k] == 0 {
 			missing = append(missing, k)
 		}
@@ -137,12 +199,16 @@ func (x actionMix) missingEdits() []string {
 // Action is one generated move. For the insert-family kinds Req carries the
 // request; for actSetLimits Limits carries the change. ExpectReplay/ExpectConflict
 // record the outcome the reference model and the database must agree on.
+// Classes lists the fine-grained delete classes the move carries (one guard and
+// one target class per delete item, del_replay / del_conflict on a resend of a
+// request with a delete item), for the tally.
 type Action struct {
 	Kind           actionKind
 	Req            api.InsertRequest
 	Limits         *limitChange
 	ExpectReplay   bool
 	ExpectConflict bool
+	Classes        []string
 }
 
 // limitChange is a state-aware §6 limit update: it always brackets the account's
@@ -216,22 +282,51 @@ func (g *Generator) smallAmount() int64 {
 	return a
 }
 
-// editCandidate is one regular operation an edit may target: a settled one from
-// the model (any status, any revision) or a fresh regular leg emitted earlier in
-// the same round — its reference id is predictable because the reference
-// allocates ids densely per recorded leg and records nothing on a replay or a
-// conflict — which the drain decides first by id order, so the edit meets it
-// CONFIRMED or INVALID (never PENDING, whose deferral is unreachable through the
-// insertion path: an edit row cannot reference an uncommitted target).
+// editCandidate is one regular operation an edit or a delete may target: a
+// settled one from the model (any status — CONFIRMED, INVALID or DELETED — any
+// revision) or a fresh regular leg emitted earlier in the same round — its
+// reference id is predictable because the reference allocates ids densely per
+// recorded leg and records nothing on a replay or a conflict — which the drain
+// decides first by id order, so the edit or delete meets it CONFIRMED or INVALID
+// (never PENDING, whose deferral is unreachable through the insertion path: an
+// edit-class row cannot reference an uncommitted target). status is the
+// settled status, or "" for a fresh (same-round PENDING) leg.
 type editCandidate struct {
 	id       int64
 	ext      string
 	revision int32
+	status   model.OpStatus
+}
+
+// targetClass names the candidate's state for the delete-class tally.
+func (c editCandidate) targetClass() string {
+	switch {
+	case c.status == "":
+		return "del_target_fresh"
+	case c.status == model.OpInvalid:
+		return "del_target_invalid"
+	case c.status == model.OpDeleted:
+		return "del_target_deleted"
+	case c.revision > 1:
+		return "del_target_edited"
+	default:
+		return "del_target_confirmed"
+	}
+}
+
+// hasDelete reports whether a request carries a delete item.
+func hasDelete(req api.InsertRequest) bool {
+	for _, op := range req.Operations {
+		if op.DeleteOf != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // Round produces the next batch of moves, shaped by the current model state m
 // (confirmed balances for limit changes, confirmed operations for reversals,
-// regular operations for edits). It is called once per drain cycle, so reversals
+// regular operations for edits and deletes). It is called once per drain cycle, so reversals
 // and limit changes always act on settled (drained) state. n is the target number
 // of moves.
 func (g *Generator) Round(m *Model, n int) []Action {
@@ -241,14 +336,14 @@ func (g *Generator) Round(m *Model, n int) []Action {
 
 	var editable []editCandidate
 	for _, op := range m.editTargets() {
-		editable = append(editable, editCandidate{id: op.ID, ext: m.accountsByID[op.AccountID].ExternalID, revision: op.Revision})
+		editable = append(editable, editCandidate{id: op.ID, ext: m.accountsByID[op.AccountID].ExternalID, revision: op.Revision, status: op.Status})
 	}
 	// nextID predicts the reference id of the next fresh leg emitted this round.
 	nextID := m.nextOpID + 1
 	fresh := func(req api.InsertRequest) {
 		g.history = append(g.history, req)
 		for _, op := range req.Operations {
-			if op.EditOf == nil {
+			if op.EditOf == nil && op.DeleteOf == nil {
 				editable = append(editable, editCandidate{id: nextID, ext: op.ExternalID, revision: 1})
 			}
 			nextID++
@@ -260,20 +355,37 @@ func (g *Generator) Round(m *Model, n int) []Action {
 		switch {
 		case roll < 8 && len(g.history) > 0:
 			// Exact idempotent replay (G6).
-			actions = append(actions, Action{
-				Kind: actReplay, ExpectReplay: true,
-				Req: g.history[g.rng.Intn(len(g.history))],
-			})
+			prior := g.history[g.rng.Intn(len(g.history))]
+			a := Action{Kind: actReplay, ExpectReplay: true, Req: prior}
+			if hasDelete(prior) {
+				a.Classes = []string{"del_replay"}
+			}
+			actions = append(actions, a)
 
 		case roll < 14 && len(g.history) > 0:
-			// Same key, mutated payload → conflict, changes nothing (G6).
+			// Same key, mutated payload → conflict, changes nothing (G6). A delete
+			// item carries only its target and guard, so its payload is perturbed
+			// through the guard (a delete with an account would be malformed, not a
+			// conflict); every other item shape takes an account perturbation.
 			prior := g.history[g.rng.Intn(len(g.history))]
 			legs := append([]api.InsertOp(nil), prior.Operations...)
-			legs[0].ExternalID += "-x" // perturb payload without risking amount 0
-			actions = append(actions, Action{
+			if legs[0].DeleteOf != nil {
+				rev := int32(1)
+				if legs[0].ExpectedRevision != nil {
+					rev = *legs[0].ExpectedRevision + 1
+				}
+				legs[0].ExpectedRevision = &rev
+			} else {
+				legs[0].ExternalID += "-x" // perturb payload without risking amount 0
+			}
+			a := Action{
 				Kind: actConflict, ExpectConflict: true,
 				Req: api.InsertRequest{IdempotencyKey: prior.IdempotencyKey, Operations: legs},
-			})
+			}
+			if hasDelete(prior) {
+				a.Classes = []string{"del_conflict"}
+			}
+			actions = append(actions, a)
 
 		case roll < 30 && len(targets) > 0:
 			// Reverse a confirmed operation. Popping the target from the local slice
@@ -314,13 +426,30 @@ func (g *Generator) Round(m *Model, n int) []Action {
 			fresh(req)
 			actions = append(actions, Action{Kind: actEdit, Req: req})
 
-		case roll < 64 && len(editable) > 0:
+		case roll < 62 && len(editable) > 0:
+			// A single delete of a regular operation (ADR-0011): the same target
+			// classes as an edit — CONFIRMED, edited, INVALID, DELETED, same-round
+			// fresh — with expected_revision hits and misses.
+			req, classes := g.deleteRequest(editable[g.rng.Intn(len(editable))])
+			fresh(req)
+			actions = append(actions, Action{Kind: actDelete, Req: req, Classes: classes})
+
+		case roll < 70 && len(editable) > 0:
 			// A group of edits — distinct targets, since two items may not edit one
 			// operation — optionally mixed with new operations (ADR-0010: grouped
 			// edits are literally groups, netted per account, all-or-nothing).
 			req := g.editGroupRequest(editable)
 			fresh(req)
 			actions = append(actions, Action{Kind: actEditGroup, Req: req})
+
+		case roll < 78 && len(editable) > 0:
+			// A group of deletes — distinct targets across every kind, since two
+			// items may not target one operation — optionally mixed with edits and
+			// new operations (ADR-0011: grouped deletes are literally groups, one
+			// virtual leg each, netted per account, all-or-nothing).
+			req, classes := g.deleteGroupRequest(editable)
+			fresh(req)
+			actions = append(actions, Action{Kind: actDeleteGroup, Req: req, Classes: classes})
 
 		default:
 			// A fresh single or group.
@@ -362,15 +491,94 @@ func (g *Generator) editItem(c editCandidate) api.InsertOp {
 	if op.Amount == 0 && op.EffectiveAt.IsZero() && op.ExternalID == "" {
 		op.Amount = g.smallAmount() // an edit must change something
 	}
+	op.ExpectedRevision = g.expectedRevision(c)
+	return op
+}
+
+// expectedRevision draws the optional optimistic guard of an edit or delete of
+// c: a third of the time the revision known now (a hit unless an earlier edit of
+// the same target in this round applies first), a sixth of the time one or two
+// past it (a STALE_REVISION miss), otherwise none.
+func (g *Generator) expectedRevision(c editCandidate) *int32 {
 	switch g.rng.Intn(6) {
 	case 0, 1:
 		rev := c.revision
-		op.ExpectedRevision = &rev
+		return &rev
 	case 2:
 		rev := c.revision + 1 + int32(g.rng.Intn(2))
-		op.ExpectedRevision = &rev
+		return &rev
 	}
-	return op
+	return nil
+}
+
+// deleteRequest builds one single delete registration of c (ADR-0011): the
+// target and, with the same odds as an edit, an expected_revision hit or miss.
+// Nothing else — a delete item carries no account, amount or instant. It also
+// returns the item's delete classes for the tally.
+func (g *Generator) deleteRequest(c editCandidate) (api.InsertRequest, []string) {
+	item, classes := g.deleteItem(c)
+	return api.InsertRequest{IdempotencyKey: g.nextKey(), Operations: []api.InsertOp{item}}, classes
+}
+
+// deleteItem builds one delete item of c and names its guard and target classes.
+func (g *Generator) deleteItem(c editCandidate) (api.InsertOp, []string) {
+	target := c.id
+	op := api.InsertOp{OwnerID: g.owner, DeleteOf: &target, ExpectedRevision: g.expectedRevision(c)}
+	guard := "del_guard_none"
+	switch {
+	case op.ExpectedRevision != nil && *op.ExpectedRevision == c.revision:
+		guard = "del_guard_hit"
+	case op.ExpectedRevision != nil:
+		guard = "del_guard_miss"
+	}
+	return op, []string{guard, c.targetClass()}
+}
+
+// deleteGroupRequest builds one group of 1..3 deletes of distinct candidates —
+// each shaped exactly like a single delete (deleteItem) — and, half the time
+// (always when there is one delete, so the group is never the single form),
+// 0..2 edits of further distinct candidates (editItem) and/or 1..2 new
+// operations (newItem) interleaved anywhere, so mixed groups net a delete's
+// virtual leg against edits and fresh legs on the same accounts. A group of one
+// delete plus one edit or new operation is the smallest mixed unit; a pure
+// group has at least two deletes. It also returns the delete classes of every
+// delete item for the tally.
+func (g *Generator) deleteGroupRequest(editable []editCandidate) (api.InsertRequest, []string) {
+	nDel := 1 + g.rng.Intn(3)
+	if nDel > len(editable) {
+		nDel = len(editable)
+	}
+	nEdits, nNew := 0, 0
+	if nDel == 1 || g.rng.Intn(2) == 0 {
+		nEdits = g.rng.Intn(3)
+		if nEdits > len(editable)-nDel {
+			nEdits = len(editable) - nDel
+		}
+		if nEdits == 0 || g.rng.Intn(2) == 0 {
+			nNew = 1 + g.rng.Intn(2)
+		}
+	}
+	if nDel == 1 && nEdits == 0 && nNew == 0 {
+		nNew = 1 // never the single form
+	}
+	// Distinct targets across deletes and edits: draw without replacement.
+	perm := g.rng.Perm(len(editable))
+	ops := make([]api.InsertOp, 0, nDel+nEdits+nNew)
+	var classes []string
+	for _, i := range perm[:nDel] {
+		item, cs := g.deleteItem(editable[i])
+		ops = append(ops, item)
+		classes = append(classes, cs...)
+	}
+	for _, i := range perm[nDel : nDel+nEdits] {
+		at := g.rng.Intn(len(ops) + 1)
+		ops = append(ops[:at], append([]api.InsertOp{g.editItem(editable[i])}, ops[at:]...)...)
+	}
+	for i := 0; i < nNew; i++ {
+		at := g.rng.Intn(len(ops) + 1) // anywhere in the group, kinds interleaved
+		ops = append(ops[:at], append([]api.InsertOp{g.newItem()}, ops[at:]...)...)
+	}
+	return api.InsertRequest{IdempotencyKey: g.nextKey(), Operations: ops}, classes
 }
 
 // editGroupRequest builds one group of 1..3 edits of distinct candidates — each
@@ -471,7 +679,7 @@ func (g *Generator) applyToModel(m *Model, a Action) error {
 			return fmt.Errorf("conflict expected, got success")
 		}
 		return nil
-	default: // actInsert, actReversal, actEdit, actEditGroup
+	default: // actInsert, actReversal, actEdit, actEditGroup, actDelete, actDeleteGroup
 		if _, err := m.Insert(a.Req); err != nil {
 			return fmt.Errorf("insert errored: %w", err)
 		}

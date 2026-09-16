@@ -29,6 +29,8 @@ const (
 	OpPending           = model.OpPending
 	OpConfirmed         = model.OpConfirmed
 	OpInvalid           = model.OpInvalid
+	OpApplied           = model.OpApplied
+	OpDeleted           = model.OpDeleted
 	TxPending           = model.TxPending
 	TxCommitted         = model.TxCommitted
 	TxRejected          = model.TxRejected
@@ -72,6 +74,8 @@ func (d *DB) GetStatement(ctx context.Context, ownerID int64, externalID string,
 
 // GetOperation reads a committed operation's decision state and rejection detail.
 // Unknown and foreign-owner IDs both return ErrNotFound. PENDING is a valid state.
+// A DELETED operation keeps its last values and reports DeletedAt/DeletedBy; an
+// edit or delete registration reports EditOf or DeleteOf (never both).
 func (d *DB) GetOperation(ctx context.Context, ownerID, operationID int64) (*OperationOutcome, error) {
 	return read(ctx, d, func(tx pgx.Tx) (*OperationOutcome, error) { return ledger.GetOperation(ctx, tx, ownerID, operationID) })
 }

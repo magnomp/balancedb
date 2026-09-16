@@ -89,14 +89,15 @@ type opRow struct {
 	TxID             *int64
 	HasKey           bool
 	Revision         int32
+	IsDelete         bool
 }
 
 func readOp(t *testing.T, pool *pgxpool.Pool, id int64) opRow {
 	t.Helper()
 	var r opRow
 	err := pool.QueryRow(context.Background(), `SELECT account_id, amount, effective_at, status, edit_of, expected_revision,
-		reversal_of, transaction_id, idempotency_key IS NOT NULL, revision FROM operations WHERE id = $1`, id).
-		Scan(&r.AccountID, &r.Amount, &r.EffectiveAt, &r.Status, &r.EditOf, &r.ExpectedRevision, &r.ReversalOf, &r.TxID, &r.HasKey, &r.Revision)
+		reversal_of, transaction_id, idempotency_key IS NOT NULL, revision, is_delete FROM operations WHERE id = $1`, id).
+		Scan(&r.AccountID, &r.Amount, &r.EffectiveAt, &r.Status, &r.EditOf, &r.ExpectedRevision, &r.ReversalOf, &r.TxID, &r.HasKey, &r.Revision, &r.IsDelete)
 	if err != nil {
 		t.Fatalf("read op %d: %v", id, err)
 	}
@@ -153,7 +154,7 @@ func TestInsertEditSingleRegistersPending(t *testing.T) {
 	if row.Amount != -1200 || row.AccountID != targetRow.AccountID || !row.EffectiveAt.Equal(t1) {
 		t.Fatalf("edit row state not resolved from target: %+v (target %+v)", row, targetRow)
 	}
-	if !row.HasKey || row.TxID != nil || row.ReversalOf != nil || row.Revision != 1 {
+	if !row.HasKey || row.TxID != nil || row.ReversalOf != nil || row.Revision != 1 || row.IsDelete {
 		t.Fatalf("edit row metadata wrong: %+v", row)
 	}
 	// The target is untouched at submission.
@@ -234,9 +235,15 @@ func TestInsertEditTargetNotFoundOwnerScoped(t *testing.T) {
 	if !errors.Is(err, ledger.ErrEditTargetNotFound) {
 		t.Fatalf("foreign target: err = %v, want ErrEditTargetNotFound", err)
 	}
-	// The message names only the id: foreign and unknown are indistinguishable
-	// apart from the id itself.
-	if want := fmt.Sprintf("%v: %d", ledger.ErrEditTargetNotFound, target); err.Error() != want {
+	// The message names only the item kind and the id: foreign and unknown are
+	// indistinguishable apart from the id itself (the wrapper is a TargetError).
+	notFound := func(id int64) string {
+		return (&ledger.TargetError{Kind: ledger.TargetEdit, Target: id, Err: ledger.ErrEditTargetNotFound}).Error()
+	}
+	if want := notFound(target); err.Error() != want {
+		t.Fatalf("foreign target message = %q, want %q", err, want)
+	}
+	if want := fmt.Sprintf("%v: edit of %d", ledger.ErrEditTargetNotFound, target); err.Error() != want {
 		t.Fatalf("foreign target message = %q, want %q", err, want)
 	}
 
@@ -248,7 +255,7 @@ func TestInsertEditTargetNotFoundOwnerScoped(t *testing.T) {
 	if !errors.Is(err, ledger.ErrEditTargetNotFound) {
 		t.Fatalf("unknown target: err = %v, want ErrEditTargetNotFound", err)
 	}
-	if want := fmt.Sprintf("%v: %d", ledger.ErrEditTargetNotFound, unknown); err.Error() != want {
+	if want := notFound(unknown); err.Error() != want {
 		t.Fatalf("unknown target message = %q, want %q", err, want)
 	}
 	if n := count(t, pool, "operations"); n != 1 {

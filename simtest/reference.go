@@ -21,13 +21,18 @@ const DefaultMaxGroupSize = 10
 // the decision (a reversal is an ordinary operation validated against limits,
 // spec §5.4/N3).
 //
-// EditOf set marks an edit registration (ADR-0010): AccountID, Amount and
-// EffectiveAt then hold the full proposed state resolved at registration, and
-// ExpectedRevision the optional optimistic guard. On a regular operation Revision
-// is the current revision (1 until the first applied edit); it is unused (1) on
-// edit rows. An applied edit overwrites its target's current columns in place —
-// the timeline then orders the target by its new effective_at with its original
-// id — and appends the superseded state to Model.revisions.
+// EditOf set marks an edit-class registration (ADR-0010): on a plain edit
+// AccountID, Amount and EffectiveAt hold the full proposed state resolved at
+// registration; on a delete (IsDelete, ADR-0011 — the storage marker edit_of +
+// is_delete, mirrored here) they are the informational copy of the target at
+// submission, which no decision reads. ExpectedRevision is the optional
+// optimistic guard of either kind. On a regular operation Revision is the current
+// revision (1 until the first applied edit); it is unused (1) on edit-class rows.
+// An applied edit overwrites its target's current columns in place — the timeline
+// then orders the target by its new effective_at with its original id — and
+// appends the superseded state to Model.revisions. An applied delete flips its
+// target CONFIRMED → DELETED and stamps DeletedBy on it; the target's last values
+// and Revision stay, and nothing is appended.
 type refOp struct {
 	ID               int64
 	AccountID        int64
@@ -37,8 +42,25 @@ type refOp struct {
 	TransactionID    *int64
 	Status           model.OpStatus
 	EditOf           *int64
+	IsDelete         bool
 	ExpectedRevision *int32
 	Revision         int32
+	DeletedBy        *int64
+}
+
+// isDelete reports whether the row is a delete registration.
+func (op *refOp) isDelete() bool { return op.EditOf != nil && op.IsDelete }
+
+// outcome renders the row as the ledger's OpOutcome: the target under DeleteOf
+// for a delete registration, under EditOf for a plain edit, neither otherwise.
+func (op *refOp) outcome() api.OpOutcome {
+	o := api.OpOutcome{ID: op.ID, Status: string(op.Status)}
+	if op.isDelete() {
+		o.DeleteOf = op.EditOf
+	} else {
+		o.EditOf = op.EditOf
+	}
+	return o
 }
 
 // refRevision is one superseded state of a regular operation — a row of
@@ -80,6 +102,10 @@ type Model struct {
 	// AllowEdits mirrors config.allow_edits (ADR-0010): false refuses new edit
 	// registrations with ledger.ErrEditsDisabled; registered edits are still decided.
 	AllowEdits bool
+	// AllowDeletes mirrors config.allow_deletes (ADR-0011), independent of
+	// AllowEdits: false refuses new delete registrations with
+	// ledger.ErrDeletesDisabled; registered deletes are still decided.
+	AllowDeletes bool
 
 	// IDs are allocated at insertion, but only committed rows can be decided.
 	// Independent host transactions may expose higher IDs first (ADR-0008).
@@ -119,6 +145,7 @@ func NewModel() *Model {
 	return &Model{
 		MaxGroupSize: DefaultMaxGroupSize,
 		AllowEdits:   true,
+		AllowDeletes: true,
 		uncommitted:  make(map[int64]bool),
 		accounts:     make(map[accountKey]int64),
 		accountsByID: make(map[int64]*refAccount),
@@ -164,7 +191,7 @@ func (m *Model) OpCount() int { return len(m.ops) }
 // Existing schedules use Insert for immediately committed registration.
 func (m *Model) BeginRegistration(req api.InsertRequest) (*api.InsertResult, error) {
 	for _, op := range req.Operations {
-		if op.EditOf != nil && op.ExternalID == "" {
+		if (op.EditOf != nil || op.DeleteOf != nil) && op.ExternalID == "" {
 			continue // the account comes from the target
 		}
 		if _, ok := m.accounts[accountKey{ownerID: op.OwnerID, externalID: op.ExternalID}]; !ok {
@@ -218,10 +245,11 @@ func (m *Model) RollbackRegistration(result *api.InsertResult) {
 // api.ErrInvalidIdempotencyKey, api.ErrMixedOwners, api.ErrGroupTooLarge,
 // api.ErrPayloadConflict, api.ErrZeroAmount, and the ledger edit sentinels).
 //
-// Edit items (ADR-0010) follow internal/ledger.Insert: structural checks before
-// anything else, the allow_edits policy, hashing as sent, then an owner-scoped
-// target lookup that fills the omitted fields — all before the first row is
-// recorded, so a bad target in the last item of a group records nothing.
+// Edit items (ADR-0010) and delete items (ADR-0011) follow internal/ledger.Insert:
+// structural checks before anything else, the allow_edits / allow_deletes
+// policies, hashing as sent, then an owner-scoped target lookup that fills the
+// omitted edit fields (or a delete's informational copy) — all before the first
+// row is recorded, so a bad target in the last item of a group records nothing.
 func (m *Model) Insert(req api.InsertRequest) (*api.InsertResult, error) {
 	if len(req.Operations) == 0 {
 		return nil, api.ErrNoOperations
@@ -235,7 +263,7 @@ func (m *Model) Insert(req api.InsertRequest) (*api.InsertResult, error) {
 			return nil, api.ErrMixedOwners
 		}
 	}
-	hasEdits, err := validateEditItems(req.Operations)
+	hasEdits, hasDeletes, err := validateTargetItems(req.Operations)
 	if err != nil {
 		return nil, err
 	}
@@ -245,11 +273,14 @@ func (m *Model) Insert(req api.InsertRequest) (*api.InsertResult, error) {
 	if hasEdits && !m.AllowEdits {
 		return nil, ledger.ErrEditsDisabled
 	}
+	if hasDeletes && !m.AllowDeletes {
+		return nil, ledger.ErrDeletesDisabled
+	}
 	for _, op := range req.Operations {
-		if op.EditOf == nil && op.Amount == 0 {
+		if op.EditOf == nil && op.DeleteOf == nil && op.Amount == 0 {
 			// Mirrors the operations.amount CHECK, which the DB enforces atomically
 			// for the whole insert — so nothing is recorded. (On an edit item a zero
-			// amount means "unchanged".)
+			// amount means "unchanged"; a delete item carries no amount at all.)
 			return nil, fmt.Errorf("%w", api.ErrZeroAmount)
 		}
 	}
@@ -268,37 +299,48 @@ func (m *Model) Insert(req api.InsertRequest) (*api.InsertResult, error) {
 	return m.insertGroup(req.IdempotencyKey, rows, hash)
 }
 
-// validateEditItems mirrors internal/ledger.validateEditItems: the structural
-// edit checks that need no state — reversal_of on an edit, expected_revision
-// below 1, an edit that changes nothing, two items editing one target.
-func validateEditItems(ops []api.InsertOp) (hasEdits bool, err error) {
+// validateTargetItems mirrors internal/ledger.validateTargetItems: the
+// structural edit-class checks that need no state — reversal_of on an edit, any
+// extra field on a delete, expected_revision below 1, an edit that changes
+// nothing, two items naming one target (edits and deletes share the seen set).
+func validateTargetItems(ops []api.InsertOp) (hasEdits, hasDeletes bool, err error) {
 	seen := make(map[int64]struct{})
 	for _, op := range ops {
-		if op.EditOf == nil {
+		if op.EditOf == nil && op.DeleteOf == nil {
 			continue
 		}
-		hasEdits = true
-		target := *op.EditOf
-		if op.ReversalOf != nil {
-			return true, fmt.Errorf("%w: target %d", ledger.ErrEditWithReversal, target)
+		var target int64
+		if op.DeleteOf != nil {
+			hasDeletes = true
+			target = *op.DeleteOf
+			if op.EditOf != nil || op.ReversalOf != nil || op.ExternalID != "" || op.Amount != 0 || !op.EffectiveAt.IsZero() {
+				return hasEdits, hasDeletes, fmt.Errorf("%w: target %d", ledger.ErrDeleteWithFields, target)
+			}
+		} else {
+			hasEdits = true
+			target = *op.EditOf
+			if op.ReversalOf != nil {
+				return hasEdits, hasDeletes, fmt.Errorf("%w: target %d", ledger.ErrEditWithReversal, target)
+			}
 		}
 		if op.ExpectedRevision != nil && *op.ExpectedRevision < 1 {
-			return true, fmt.Errorf("%w: got %d", ledger.ErrInvalidExpectedRevision, *op.ExpectedRevision)
+			return hasEdits, hasDeletes, fmt.Errorf("%w: got %d", ledger.ErrInvalidExpectedRevision, *op.ExpectedRevision)
 		}
-		if op.ExternalID == "" && op.Amount == 0 && op.EffectiveAt.IsZero() {
-			return true, fmt.Errorf("%w: target %d", ledger.ErrEditChangesNothing, target)
+		if op.DeleteOf == nil && op.ExternalID == "" && op.Amount == 0 && op.EffectiveAt.IsZero() {
+			return hasEdits, hasDeletes, fmt.Errorf("%w: target %d", ledger.ErrEditChangesNothing, target)
 		}
 		if _, dup := seen[target]; dup {
-			return true, fmt.Errorf("%w: %d", ledger.ErrDuplicateEditTarget, target)
+			return hasEdits, hasDeletes, fmt.Errorf("%w: %d", ledger.ErrDuplicateEditTarget, target)
 		}
 		seen[target] = struct{}{}
 	}
-	return hasEdits, nil
+	return hasEdits, hasDeletes, nil
 }
 
 // writeOp is one item ready to be recorded, mirroring the ledger's writeOp:
 // AccountID is set when the account is already known (a resolved edit whose
-// account is unchanged), otherwise (OwnerID, ExternalID) is upserted at write.
+// account is unchanged, or a delete), otherwise (OwnerID, ExternalID) is
+// upserted at write. A delete carries EditOf = the target and IsDelete.
 type writeOp struct {
 	OwnerID          int64
 	ExternalID       string
@@ -307,26 +349,40 @@ type writeOp struct {
 	EffectiveAt      time.Time
 	ReversalOf       *int64
 	EditOf           *int64
+	IsDelete         bool
 	ExpectedRevision *int32
 }
 
-// prepareOps resolves every edit item against its target — owner-scoped and
-// visibility-aware (an uncommitted target is not found, exactly as the ledger's
-// SELECT cannot see it) — filling the omitted fields, before anything is
-// recorded. Regular items pass through unchanged.
+// prepareOps resolves every edit-class item against its target — owner-scoped
+// and visibility-aware (an uncommitted target is not found, exactly as the
+// ledger's SELECT cannot see it) — filling an edit's omitted fields or a delete's
+// informational copy, before anything is recorded. The target's status is
+// deliberately not checked (a DELETED, INVALID or PENDING target is a
+// decision-time outcome). Regular items pass through unchanged.
 func (m *Model) prepareOps(ops []api.InsertOp) ([]writeOp, error) {
 	out := make([]writeOp, len(ops))
 	for i, op := range ops {
-		if op.EditOf == nil {
+		if op.EditOf == nil && op.DeleteOf == nil {
 			out[i] = writeOp{OwnerID: op.OwnerID, ExternalID: op.ExternalID, Amount: op.Amount, EffectiveAt: op.EffectiveAt, ReversalOf: op.ReversalOf}
 			continue
 		}
-		target, ok := m.ops[*op.EditOf]
-		if !ok || m.uncommitted[*op.EditOf] || m.ownerOf(target.AccountID) != op.OwnerID {
-			return nil, fmt.Errorf("%w: %d", ledger.ErrEditTargetNotFound, *op.EditOf)
+		targetID := op.EditOf
+		if op.DeleteOf != nil {
+			targetID = op.DeleteOf
+		}
+		target, ok := m.ops[*targetID]
+		if !ok || m.uncommitted[*targetID] || m.ownerOf(target.AccountID) != op.OwnerID {
+			return nil, fmt.Errorf("%w: %d", ledger.ErrEditTargetNotFound, *targetID)
 		}
 		if target.EditOf != nil {
-			return nil, fmt.Errorf("%w: %d", ledger.ErrEditTargetNotOperation, *op.EditOf)
+			return nil, fmt.Errorf("%w: %d", ledger.ErrEditTargetNotOperation, *targetID)
+		}
+		if op.DeleteOf != nil {
+			out[i] = writeOp{
+				OwnerID: op.OwnerID, AccountID: target.AccountID, Amount: target.Amount, EffectiveAt: target.EffectiveAt,
+				EditOf: op.DeleteOf, IsDelete: true, ExpectedRevision: op.ExpectedRevision,
+			}
+			continue
 		}
 		w := writeOp{
 			OwnerID: op.OwnerID, AccountID: target.AccountID, Amount: op.Amount, EffectiveAt: op.EffectiveAt,
@@ -363,7 +419,7 @@ func (m *Model) insertSingle(key string, op writeOp, hash []byte) (*api.InsertRe
 		}
 		existing := m.ops[rec.id]
 		return &api.InsertResult{
-			Operations: []api.OpOutcome{{ID: existing.ID, Status: string(existing.Status), EditOf: existing.EditOf}},
+			Operations: []api.OpOutcome{existing.outcome()},
 			Replayed:   true,
 		}, nil
 	}
@@ -372,11 +428,11 @@ func (m *Model) insertSingle(key string, op writeOp, hash []byte) (*api.InsertRe
 	m.nextOpID++
 	rec := &refOp{
 		ID: m.nextOpID, AccountID: accountID, Amount: op.Amount, EffectiveAt: op.EffectiveAt, ReversalOf: op.ReversalOf,
-		Status: model.OpPending, EditOf: op.EditOf, ExpectedRevision: op.ExpectedRevision, Revision: 1,
+		Status: model.OpPending, EditOf: op.EditOf, IsDelete: op.IsDelete, ExpectedRevision: op.ExpectedRevision, Revision: 1,
 	}
 	m.ops[rec.ID] = rec
 	m.singleByKey[key] = keyedRecord{id: rec.ID, hash: hash}
-	return &api.InsertResult{Operations: []api.OpOutcome{{ID: rec.ID, Status: string(model.OpPending), EditOf: op.EditOf}}}, nil
+	return &api.InsertResult{Operations: []api.OpOutcome{rec.outcome()}}, nil
 }
 
 func (m *Model) insertGroup(key string, ops []writeOp, hash []byte) (*api.InsertResult, error) {
@@ -387,7 +443,7 @@ func (m *Model) insertGroup(key string, ops []writeOp, hash []byte) (*api.Insert
 		tx := m.txs[rec.id]
 		outcomes := make([]api.OpOutcome, len(tx.LegIDs))
 		for i, id := range tx.LegIDs {
-			outcomes[i] = api.OpOutcome{ID: id, Status: string(m.ops[id].Status), EditOf: m.ops[id].EditOf}
+			outcomes[i] = m.ops[id].outcome()
 		}
 		txID := tx.ID
 		return &api.InsertResult{
@@ -407,11 +463,11 @@ func (m *Model) insertGroup(key string, ops []writeOp, hash []byte) (*api.Insert
 		txID := tx.ID
 		rec := &refOp{
 			ID: m.nextOpID, AccountID: accountID, Amount: op.Amount, EffectiveAt: op.EffectiveAt, ReversalOf: op.ReversalOf,
-			TransactionID: &txID, Status: model.OpPending, EditOf: op.EditOf, ExpectedRevision: op.ExpectedRevision, Revision: 1,
+			TransactionID: &txID, Status: model.OpPending, EditOf: op.EditOf, IsDelete: op.IsDelete, ExpectedRevision: op.ExpectedRevision, Revision: 1,
 		}
 		m.ops[rec.ID] = rec
 		tx.LegIDs = append(tx.LegIDs, rec.ID)
-		outcomes = append(outcomes, api.OpOutcome{ID: rec.ID, Status: string(model.OpPending), EditOf: op.EditOf})
+		outcomes = append(outcomes, rec.outcome())
 	}
 	m.txs[tx.ID] = tx
 	m.groupByKey[key] = keyedRecord{id: tx.ID, hash: hash}
@@ -496,12 +552,15 @@ func (m *Model) CheckG6() error {
 	return nil
 }
 
-// confirmedReversalTargets returns the ids of confirmed operations that have no
-// live (non-INVALID) reversal yet, so a fresh reversal of them inserts cleanly
-// under the one-live-reversal-per-op unique index (idx_ops_reversal). This is the
-// candidate set the generator draws reversals (and double-reversals) from; a
-// reversal that was itself rejected leaves its original eligible again
-// (reversal-after-reject retry).
+// confirmedReversalTargets returns the ids of confirmed — or deleted (N7: a
+// reversal of a DELETED operation is an ordinary operation, ADR-0011) —
+// operations that have no live (non-INVALID) reversal yet, so a fresh reversal of
+// them inserts cleanly under the one-live-reversal-per-op unique index
+// (idx_ops_reversal; a DELETED reversal still counts as live, exactly as the
+// index's status <> 'INVALID' predicate does). This is the candidate set the
+// generator draws reversals (and double-reversals) from; a reversal that was
+// itself rejected leaves its original eligible again (reversal-after-reject
+// retry).
 func (m *Model) confirmedReversalTargets() []*refOp {
 	liveReversed := make(map[int64]bool)
 	for _, op := range m.ops {
@@ -512,7 +571,7 @@ func (m *Model) confirmedReversalTargets() []*refOp {
 	var out []*refOp
 	for id := int64(1); id <= m.nextOpID; id++ {
 		op, ok := m.ops[id]
-		if !ok || op.Status != model.OpConfirmed || liveReversed[op.ID] {
+		if !ok || (op.Status != model.OpConfirmed && op.Status != model.OpDeleted) || liveReversed[op.ID] {
 			continue
 		}
 		out = append(out, op)
@@ -520,10 +579,11 @@ func (m *Model) confirmedReversalTargets() []*refOp {
 	return out
 }
 
-// editTargets returns every regular operation (never an edit registration) in id
-// order — the candidate set the generator draws edits from. Any status is
-// eligible: a CONFIRMED target decides on its limits, an INVALID one rejects with
-// TARGET_NOT_EDITABLE, and a PENDING one is decided first by id order.
+// editTargets returns every regular operation (never an edit or delete
+// registration) in id order — the candidate set the generator draws edits and
+// deletes from. Any status is eligible: a CONFIRMED target decides on its limits,
+// an INVALID or DELETED one rejects with TARGET_NOT_EDITABLE, and a PENDING one is
+// decided first by id order.
 func (m *Model) editTargets() []*refOp {
 	var out []*refOp
 	for id := int64(1); id <= m.nextOpID; id++ {
@@ -537,18 +597,23 @@ func (m *Model) editTargets() []*refOp {
 }
 
 // CheckEdits verifies the editing invariants (ADR-0010, spec Safety Invariants
-// 3–5): an edit registration is never CONFIRMED and, once APPLIED, is referenced
-// by exactly one revision of its target; every regular operation's history is
-// dense — revisions 1..revision−1, each superseded by an APPLIED edit of it.
+// 3–5): an edit-class registration (edit or delete) is never CONFIRMED or
+// DELETED; an APPLIED edit is referenced by exactly one revision of its target
+// and an APPLIED delete by none (a delete appends nothing); every regular
+// operation's history is dense — revisions 1..revision−1, each superseded by an
+// APPLIED edit of it — DELETED rows included, whose revision never moves again.
 func (m *Model) CheckEdits() error {
 	supersededBy := make(map[int64]int)
 	for id, op := range m.ops {
 		if op.EditOf != nil {
-			if op.Status == model.OpConfirmed {
-				return fmt.Errorf("edit %d is CONFIRMED; edits are only PENDING|APPLIED|INVALID", id)
+			if op.Status == model.OpConfirmed || op.Status == model.OpDeleted {
+				return fmt.Errorf("edit-class row %d is %s; edits and deletes are only PENDING|APPLIED|INVALID", id, op.Status)
 			}
 			if len(m.revisions[id]) != 0 {
-				return fmt.Errorf("edit %d has revisions of its own", id)
+				return fmt.Errorf("edit-class row %d has revisions of its own", id)
+			}
+			if op.DeletedBy != nil {
+				return fmt.Errorf("edit-class row %d carries deleted_by", id)
 			}
 			continue
 		}
@@ -561,7 +626,7 @@ func (m *Model) CheckEdits() error {
 				return fmt.Errorf("operation %d history not dense: row %d has revision %d", id, i, r.Revision)
 			}
 			edit, ok := m.ops[r.SupersededBy]
-			if !ok || edit.EditOf == nil || *edit.EditOf != id || edit.Status != model.OpApplied {
+			if !ok || edit.EditOf == nil || edit.isDelete() || *edit.EditOf != id || edit.Status != model.OpApplied {
 				return fmt.Errorf("operation %d revision %d superseded by %d, which is not an APPLIED edit of it", id, r.Revision, r.SupersededBy)
 			}
 			supersededBy[r.SupersededBy]++
@@ -572,11 +637,60 @@ func (m *Model) CheckEdits() error {
 			continue
 		}
 		want := 0
-		if op.Status == model.OpApplied {
+		if op.Status == model.OpApplied && !op.isDelete() {
 			want = 1
 		}
 		if supersededBy[id] != want {
-			return fmt.Errorf("edit %d (%s) supersedes %d revisions, want %d", id, op.Status, supersededBy[id], want)
+			return fmt.Errorf("edit-class row %d (%s) supersedes %d revisions, want %d", id, op.Status, supersededBy[id], want)
+		}
+	}
+	return nil
+}
+
+// CheckDeletes verifies the deletion invariants (ADR-0011, spec Safety
+// Invariants 2 and 7): a DELETED row is a regular operation stamped with exactly
+// the APPLIED delete registration that targets it, and every APPLIED delete
+// points at a row that is DELETED by it — so a DELETED row has exactly one
+// APPLIED delete and can never read CONFIRMED again (an APPLIED delete is
+// terminal, and no other status carries a stamp).
+func (m *Model) CheckDeletes() error {
+	appliedDeletes := make(map[int64]int) // target id → APPLIED deletes of it
+	for id, op := range m.ops {
+		if !op.isDelete() || op.Status != model.OpApplied {
+			continue
+		}
+		target := m.ops[*op.EditOf]
+		if target.Status != model.OpDeleted {
+			return fmt.Errorf("delete %d is APPLIED but its target %d is %s, want DELETED", id, target.ID, target.Status)
+		}
+		if target.DeletedBy == nil || *target.DeletedBy != id {
+			return fmt.Errorf("delete %d is APPLIED but target %d is deleted_by %v", id, target.ID, target.DeletedBy)
+		}
+		appliedDeletes[target.ID]++
+	}
+	for id, op := range m.ops {
+		if op.EditOf != nil {
+			continue
+		}
+		switch {
+		case op.Status == model.OpDeleted:
+			if op.DeletedBy == nil {
+				return fmt.Errorf("operation %d is DELETED without deleted_by", id)
+			}
+			del, ok := m.ops[*op.DeletedBy]
+			if !ok || !del.isDelete() || *del.EditOf != id || del.Status != model.OpApplied {
+				return fmt.Errorf("operation %d deleted_by %d, which is not an APPLIED delete of it", id, *op.DeletedBy)
+			}
+			if appliedDeletes[id] != 1 {
+				return fmt.Errorf("DELETED operation %d has %d APPLIED deletes, want exactly 1", id, appliedDeletes[id])
+			}
+		default:
+			if op.DeletedBy != nil {
+				return fmt.Errorf("operation %d is %s but carries deleted_by %d", id, op.Status, *op.DeletedBy)
+			}
+			if appliedDeletes[id] != 0 {
+				return fmt.Errorf("operation %d is %s but has %d APPLIED deletes — a DELETED row came back", id, op.Status, appliedDeletes[id])
+			}
 		}
 	}
 	return nil
@@ -622,10 +736,15 @@ func (m *Model) ownerOf(accountID int64) int64 {
 
 // canonicalOps mirrors internal/ledger.canonicalOps: a regular item is a
 // CanonicalOp (frozen encoding); an edit item is a CanonicalEditOp whose omitted
-// fields stay nil — the hash covers the request as sent.
+// fields stay nil — the hash covers the request as sent; a delete item is a
+// CanonicalDeleteOp (target and guard only).
 func canonicalOps(ops []api.InsertOp) []any {
 	out := make([]any, len(ops))
 	for i, op := range ops {
+		if op.DeleteOf != nil {
+			out[i] = model.CanonicalDeleteOp{OwnerID: op.OwnerID, DeleteOf: *op.DeleteOf, ExpectedRevision: op.ExpectedRevision}
+			continue
+		}
 		if op.EditOf == nil {
 			out[i] = model.CanonicalOp{
 				OwnerID:     op.OwnerID,

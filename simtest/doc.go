@@ -10,20 +10,24 @@
 //     crossings and exact-timestamp ties, reversals (double-reversals and
 //     reversal-after-reject retries), edits (ADR-0010: single, grouped and mixed
 //     with new operations; amount, account and day-crossing instant changes,
-//     expected_revision guards, CONFIRMED / INVALID / already-edited / same-round
-//     PENDING targets), state-aware limit changes, and idempotent
-//     replays/conflicts — through the in-memory sequential reference model across
-//     1,000+ seeds under `make test`, asserting G1/G2/G4/G6, the editing
-//     invariants (edits never CONFIRMED, dense append-only histories) and G3
-//     reproducibility, and printing the action mix (every edit class must occur).
+//     expected_revision guards, CONFIRMED / INVALID / already-edited / DELETED /
+//     same-round PENDING targets), deletes (ADR-0011: single, grouped and mixed
+//     with edits and new operations, the same target classes and guards),
+//     state-aware limit changes, and idempotent replays/conflicts — through the
+//     in-memory sequential reference model across 1,000+ seeds under `make test`,
+//     asserting G1/G2/G4/G6, the editing invariants (edits never CONFIRMED, dense
+//     append-only histories), the deletion invariants (a DELETED row has exactly
+//     one APPLIED delete and never reads CONFIRMED again) and G3 reproducibility,
+//     and printing the action mix (every edit and delete class must occur).
 //   - Fidelity: the DB-backed tests (build tag `simtest`, run by `make simtest`)
 //     drive the real processor over throwaway schemas and assert the database equals
-//     the reference model — statuses, current columns, revisions and the
-//     append-only operation_revisions rows, transactions, balances, timelines and
-//     snapshots — interleaved with fault injection: batch-boundary crashes
-//     (sim_db_test.go), competing-leader failover, zombie-leader stale-lease writes,
-//     and the Guard-3 version-race stressor (sim_faults_test.go), all with edits in
-//     the mix; the ADR-0008 visibility schedules (registration_db_test.go) include
+//     the reference model — statuses (DELETED included), current columns,
+//     revisions, deletion stamps and the append-only operation_revisions rows,
+//     transactions, balances, timelines and snapshots — interleaved with fault
+//     injection: batch-boundary crashes (sim_db_test.go), competing-leader
+//     failover, zombie-leader stale-lease writes, and the Guard-3 version-race
+//     stressor (sim_faults_test.go), all with edits and deletes in the mix; the
+//     ADR-0008 visibility schedules (registration_db_test.go) include
 //     an edit registered against a held-open, then PENDING, target. Because
 //     identity ids do not line up (idempotent replays consume Postgres IDENTITY
 //     values the reference does not), the harness compares through an explicit

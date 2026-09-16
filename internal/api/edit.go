@@ -159,7 +159,7 @@ func (s *Server) loadEditOutcome(ctx context.Context, editID, targetID, ownerID 
 // scoped to the requesting owner.
 type OperationHistoryInput struct {
 	OwnerID string `header:"X-Owner-Id" required:"true" doc:"Owner scope (§2)."`
-	ID      int64  `path:"id" doc:"Operation (registration) id. Edit registration ids are not operations and yield 404."`
+	ID      int64  `path:"id" doc:"Operation (registration) id. Edit and delete registration ids are not operations and yield 404."`
 }
 
 // RevisionEntry is one state an operation has held. The current revision has no
@@ -174,20 +174,38 @@ type RevisionEntry struct {
 	SupersededBy *int64     `json:"superseded_by,omitempty" doc:"Registration id of the APPLIED edit that superseded this revision; absent on the current revision."`
 }
 
-// PendingEdit is an edit registration against the operation that has not been
-// decided yet; its fields are the proposed state as resolved at submission.
+// Registration kinds the history lists carry (ADR-0011): an entry is either an
+// edit or a delete of the operation.
+const (
+	kindEdit   = string(TargetEdit)
+	kindDelete = string(TargetDelete)
+)
+
+// registrationKind names an edit-class row's kind from its is_delete marker.
+func registrationKind(isDelete bool) string {
+	if isDelete {
+		return kindDelete
+	}
+	return kindEdit
+}
+
+// PendingEdit is an edit or delete registration against the operation that has
+// not been decided yet; its fields are the proposed state as resolved at
+// submission (for a delete, the target's values at submission, informational).
 type PendingEdit struct {
-	ID               int64     `json:"id" doc:"Registration id of the edit."`
+	ID               int64     `json:"id" doc:"Registration id of the edit or delete."`
+	Kind             string    `json:"kind" enum:"edit,delete" doc:"Registration kind: edit | delete."`
 	Account          string    `json:"account"`
 	Amount           Amount    `json:"amount"`
 	EffectiveAt      time.Time `json:"effective_at"`
 	ExpectedRevision *int32    `json:"expected_revision,omitempty"`
 }
 
-// RejectedEdit is an edit registration against the operation that ended INVALID,
-// with its decision instant and machine-readable rejection.
+// RejectedEdit is an edit or delete registration against the operation that
+// ended INVALID, with its decision instant and machine-readable rejection.
 type RejectedEdit struct {
-	ID               int64            `json:"id" doc:"Registration id of the edit."`
+	ID               int64            `json:"id" doc:"Registration id of the edit or delete."`
+	Kind             string           `json:"kind" enum:"edit,delete" doc:"Registration kind: edit | delete."`
 	Account          string           `json:"account"`
 	Amount           Amount           `json:"amount"`
 	EffectiveAt      time.Time        `json:"effective_at"`
@@ -197,17 +215,20 @@ type RejectedEdit struct {
 }
 
 // OperationHistoryOutput is an operation's append-only history: every revision in
-// order (the last one is current), plus the edits still pending against it and
-// the ones rejected. Applied edits are not listed separately — each superseded
-// revision names the edit that applied it.
+// order (the last one is current), plus the edits and deletes still pending
+// against it and the ones rejected. Applied edits are not listed separately —
+// each superseded revision names the edit that applied it; the applied delete,
+// if any, is named by deleted_by (ADR-0011).
 type OperationHistoryOutput struct {
 	Body struct {
 		OperationID     int64           `json:"operation_id"`
-		Status          string          `json:"status" doc:"Operation status: PENDING | CONFIRMED | INVALID."`
+		Status          string          `json:"status" doc:"Operation status: PENDING | CONFIRMED | INVALID | DELETED."`
 		CurrentRevision int32           `json:"current_revision"`
-		Revisions       []RevisionEntry `json:"revisions" doc:"Ordered by revision; the last entry is the current state."`
-		PendingEdits    []PendingEdit   `json:"pending_edits" doc:"Undecided edits targeting this operation, in registration-id order."`
-		RejectedEdits   []RejectedEdit  `json:"rejected_edits" doc:"Rejected (INVALID) edits targeting this operation, in registration-id order."`
+		DeletedAt       *time.Time      `json:"deleted_at,omitempty" doc:"Present only when DELETED: the instant the delete was applied."`
+		DeletedBy       *int64          `json:"deleted_by,omitempty" doc:"Present only when DELETED: the registration id of the APPLIED delete."`
+		Revisions       []RevisionEntry `json:"revisions" doc:"Ordered by revision; the last entry is the current state (the last values, once DELETED)."`
+		PendingEdits    []PendingEdit   `json:"pending_edits" doc:"Undecided edits and deletes targeting this operation, in registration-id order."`
+		RejectedEdits   []RejectedEdit  `json:"rejected_edits" doc:"Rejected (INVALID) edits and deletes targeting this operation, in registration-id order."`
 	}
 }
 
@@ -216,8 +237,9 @@ type OperationHistoryOutput struct {
 // Invariant 3 — asserted by a source-level test).
 const (
 	// The current row of a regular operation, owner-scoped. edit_of is selected so
-	// an edit registration id can be refused (404) without a second query.
-	selectHistoryHead = `SELECT o.status, o.revision, o.edit_of, a.external_id, o.amount, o.effective_at, o.registered_at, o.revised_at
+	// an edit or delete registration id can be refused (404) without a second
+	// query; the deletion markers are set together once DELETED (ADR-0011).
+	selectHistoryHead = `SELECT o.status, o.revision, o.edit_of, a.external_id, o.amount, o.effective_at, o.registered_at, o.revised_at, o.deleted_at, o.deleted_by
 FROM operations o JOIN accounts a ON a.id = o.account_id
 WHERE o.id = $1 AND a.owner_id = $2`
 
@@ -227,9 +249,11 @@ FROM operation_revisions r JOIN accounts a ON a.id = r.account_id
 WHERE r.operation_id = $1
 ORDER BY r.revision`
 
-	// Undecided and rejected edits against the operation (idx_ops_edit_of). Applied
-	// edits are reachable through operation_revisions.superseded_by instead.
-	selectEditsOf = `SELECT o.id, a.external_id, o.amount, o.effective_at, o.expected_revision, o.status, o.confirmed_at, o.invalidation_reason
+	// Undecided and rejected edits and deletes against the operation
+	// (idx_ops_edit_of; is_delete tells the kinds apart). Applied edits are
+	// reachable through operation_revisions.superseded_by instead, the applied
+	// delete through deleted_by.
+	selectEditsOf = `SELECT o.id, o.is_delete, a.external_id, o.amount, o.effective_at, o.expected_revision, o.status, o.confirmed_at, o.invalidation_reason
 FROM operations o JOIN accounts a ON a.id = o.account_id
 WHERE o.edit_of = $1 AND o.status IN ('PENDING', 'INVALID')
 ORDER BY o.id`
@@ -250,12 +274,15 @@ func (s *Server) getOperationHistory(ctx context.Context, in *OperationHistoryIn
 		effectiveAt  time.Time
 		registeredAt time.Time
 		revisedAt    *time.Time
+		deletedAt    *time.Time
+		deletedBy    *int64
 	)
 	err = s.pool.QueryRow(ctx, selectHistoryHead, in.ID, ownerID).
-		Scan(&status, &revision, &editOf, &account, &amount, &effectiveAt, &registeredAt, &revisedAt)
+		Scan(&status, &revision, &editOf, &account, &amount, &effectiveAt, &registeredAt, &revisedAt, &deletedAt, &deletedBy)
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && editOf != nil) {
-		// Unknown, another owner's, or an edit registration: all indistinguishable
-		// to the caller by design (§2 — never leak another owner's ids).
+		// Unknown, another owner's, or an edit/delete registration (both carry
+		// edit_of): all indistinguishable to the caller by design (§2 — never leak
+		// another owner's ids).
 		return nil, huma.Error404NotFound("operation not found")
 	}
 	if err != nil {
@@ -289,6 +316,11 @@ func (s *Server) getOperationHistory(ctx context.Context, in *OperationHistoryIn
 	out.Body.OperationID = in.ID
 	out.Body.Status = status
 	out.Body.CurrentRevision = revision
+	if deletedAt != nil {
+		at := deletedAt.UTC()
+		out.Body.DeletedAt = &at
+	}
+	out.Body.DeletedBy = deletedBy
 	out.Body.Revisions = revisions
 	out.Body.PendingEdits = pending
 	out.Body.RejectedEdits = rejected
@@ -325,9 +357,10 @@ func (s *Server) readRevisions(ctx context.Context, opID int64) ([]RevisionEntry
 	return out, rows.Err()
 }
 
-// readEditsOf splits the undecided and rejected edits targeting an operation into
-// the two history lists, both in registration-id order. Slices are never nil so
-// the JSON always carries the arrays.
+// readEditsOf splits the undecided and rejected edits and deletes targeting an
+// operation into the two history lists, both in registration-id order, each
+// entry tagged with its kind. Slices are never nil so the JSON always carries
+// the arrays.
 func (s *Server) readEditsOf(ctx context.Context, opID int64) ([]PendingEdit, []RejectedEdit, error) {
 	rows, err := s.pool.Query(ctx, selectEditsOf, opID)
 	if err != nil {
@@ -340,6 +373,7 @@ func (s *Server) readEditsOf(ctx context.Context, opID int64) ([]PendingEdit, []
 	for rows.Next() {
 		var (
 			id          int64
+			isDelete    bool
 			account     string
 			amount      int64
 			effectiveAt time.Time
@@ -348,14 +382,15 @@ func (s *Server) readEditsOf(ctx context.Context, opID int64) ([]PendingEdit, []
 			decidedAt   *time.Time
 			reason      *string
 		)
-		if err := rows.Scan(&id, &account, &amount, &effectiveAt, &expected, &status, &decidedAt, &reason); err != nil {
+		if err := rows.Scan(&id, &isDelete, &account, &amount, &effectiveAt, &expected, &status, &decidedAt, &reason); err != nil {
 			return nil, nil, err
 		}
+		kind := registrationKind(isDelete)
 		if status == string(model.OpPending) {
-			pending = append(pending, PendingEdit{ID: id, Account: account, Amount: Amount(amount), EffectiveAt: effectiveAt.UTC(), ExpectedRevision: expected})
+			pending = append(pending, PendingEdit{ID: id, Kind: kind, Account: account, Amount: Amount(amount), EffectiveAt: effectiveAt.UTC(), ExpectedRevision: expected})
 			continue
 		}
-		r := RejectedEdit{ID: id, Account: account, Amount: Amount(amount), EffectiveAt: effectiveAt.UTC(), ExpectedRevision: expected, Rejection: parseRejection(reason)}
+		r := RejectedEdit{ID: id, Kind: kind, Account: account, Amount: Amount(amount), EffectiveAt: effectiveAt.UTC(), ExpectedRevision: expected, Rejection: parseRejection(reason)}
 		if decidedAt != nil {
 			r.DecidedAt = decidedAt.UTC()
 		}

@@ -8,18 +8,18 @@ import (
 )
 
 // This file extends the sequential reference model with the processor's decision
-// semantics — singles (spec §6 validation, §8.2 processing), groups (§8.3) and
-// edits, single or grouped (ADR-0010) — and confirmed-balance evolution. It
-// mirrors internal/processor in memory so the DB-backed tiers can assert the
-// database against it and check G1 (final balance within limits) after every
-// decision.
+// semantics — singles (spec §6 validation, §8.2 processing), groups (§8.3),
+// edits, single or grouped (ADR-0010), and deletes (ADR-0011) — and
+// confirmed-balance evolution. It mirrors internal/processor in memory so the
+// DB-backed tiers can assert the database against it and check G1 (final balance
+// within limits) after every decision.
 
 // Decision is the outcome the reference model computes for one processing step —
 // either a single operation or a whole group, decided at its first leg by
 // registration order.
 //
 // For a single: OpID is the operation, TxID is nil, Status is CONFIRMED|INVALID
-// (APPLIED|INVALID for an edit registration). For a group: TxID is the
+// (APPLIED|INVALID for an edit or delete registration). For a group: TxID is the
 // transaction, OpID is 0, LegIDs lists the legs in registration order, Status is
 // the terminal status of its regular legs (CONFIRMED|INVALID; edit legs of a
 // committed group read APPLIED), and TxStatus is the transaction status
@@ -65,9 +65,9 @@ func (m *Model) AccountBalance(ownerID int64, externalID string) int64 {
 // ADR-0008) and returns its decision. A single is decided on its own;
 // a group leg triggers the whole group's decision at that first leg, and the
 // group's remaining legs are then no longer PENDING (skipped by status). A unit
-// with an edit whose target is still PENDING — a single edit, or a group with
-// such an edit leg — is deferred as a whole: skipped, left PENDING, exactly as
-// the processor skips it and moves on (ADR-0010). It reports ok=false when no
+// with an edit or delete whose target is still PENDING — a single, or a group
+// with such a leg — is deferred as a whole: skipped, left PENDING, exactly as
+// the processor skips it and moves on (ADR-0010/0011). It reports ok=false when no
 // decidable PENDING operation remains. Ids are dense (identity columns), so
 // scanning 1..nextOpID visits operations exactly in registration order.
 func (m *Model) ProcessNext() (Decision, bool) {
@@ -98,7 +98,8 @@ func (m *Model) ProcessNext() (Decision, bool) {
 	return Decision{}, false
 }
 
-// targetPending reports whether op is an edit whose target is still PENDING.
+// targetPending reports whether op is an edit or delete whose target is still
+// PENDING.
 func (m *Model) targetPending(op *refOp) bool {
 	return op.EditOf != nil && m.ops[*op.EditOf].Status == model.OpPending
 }
@@ -118,8 +119,12 @@ func (m *Model) ProcessAll() []Decision {
 
 // decide applies the binary validation (spec §6) to one operation, flips its
 // status (once — facts are never mutated afterwards), and evolves the account's
-// confirmed balance on accept. An edit registration is decided by decideEdit.
+// confirmed balance on accept. An edit registration is decided by decideEdit, a
+// delete registration by decideDelete.
 func (m *Model) decide(op *refOp) Decision {
+	if op.isDelete() {
+		return m.decideDelete(op)
+	}
 	if op.EditOf != nil {
 		return m.decideEdit(op)
 	}
@@ -176,9 +181,50 @@ func (m *Model) decideEdit(op *refOp) Decision {
 	return Decision{OpID: op.ID, Status: model.OpApplied}
 }
 
-// checkTarget mirrors internal/processor.checkTarget for one edit whose target
-// is not PENDING: an INVALID target rejects with TARGET_NOT_EDITABLE, a mismatched
-// expected_revision with STALE_REVISION; nil means decidable on its limits.
+// decideDelete mirrors internal/processor.processSingleDeleteTx (ADR-0011): the
+// target must be CONFIRMED (INVALID or DELETED → TARGET_NOT_EDITABLE; a PENDING
+// target is deferred by ProcessNext and never reaches here) and match
+// expected_revision (STALE_REVISION); then the delete is one virtual leg —
+// −current on the target's current account — validated against that account's
+// limits, a violation rejecting with LIMIT_VIOLATED. On accept the net is
+// applied, the target flips CONFIRMED → DELETED stamped with this delete, and the
+// delete flips to APPLIED; no revision is appended and the target's revision and
+// last values stay. On reject nothing but the delete's own status changes.
+func (m *Model) decideDelete(op *refOp) Decision {
+	if rej := m.checkTarget(op); rej != nil {
+		op.Status = model.OpInvalid
+		return Decision{OpID: op.ID, Status: model.OpInvalid, Reason: rej}
+	}
+
+	ids, net := m.netVirtualLegs([]*refOp{op})
+	if rej := m.firstViolation(ids, net); rej != nil {
+		op.Status = model.OpInvalid
+		return Decision{OpID: op.ID, Status: model.OpInvalid, Reason: rej}
+	}
+
+	for _, acctID := range ids {
+		m.accountsByID[acctID].Balance += net[acctID]
+	}
+	m.applyDelete(op)
+	return Decision{OpID: op.ID, Status: model.OpApplied}
+}
+
+// applyDelete records an accepted delete: the target flips CONFIRMED → DELETED
+// with DeletedBy = the delete, its last values and Revision untouched, nothing
+// appended to its history; the delete flips to APPLIED (the balance was already
+// moved by the caller).
+func (m *Model) applyDelete(op *refOp) {
+	target := m.ops[*op.EditOf]
+	deletedBy := op.ID
+	target.Status = model.OpDeleted
+	target.DeletedBy = &deletedBy
+	op.Status = model.OpApplied
+}
+
+// checkTarget mirrors internal/processor.checkTarget for one edit or delete
+// whose target is not PENDING: an INVALID or DELETED target rejects with
+// TARGET_NOT_EDITABLE, a mismatched expected_revision with STALE_REVISION; nil
+// means decidable on its limits.
 func (m *Model) checkTarget(op *refOp) *model.Rejection {
 	target := m.ops[*op.EditOf]
 	targetID := target.ID
@@ -196,7 +242,8 @@ func (m *Model) checkTarget(op *refOp) *model.Rejection {
 
 // netVirtualLegs nets a unit's virtual legs per account — one leg per regular
 // item, two per edit item (−current on the target's current account, +proposed
-// on the proposed one) — and returns the involved account ids ascending, the
+// on the proposed one), one per delete item (−current only; its own row's copy
+// is never read) — and returns the involved account ids ascending, the
 // processor's deterministic validation order (internal/processor.netLegs).
 func (m *Model) netVirtualLegs(items []*refOp) (ids []int64, net map[int64]int64) {
 	net = make(map[int64]int64, len(items))
@@ -210,6 +257,9 @@ func (m *Model) netVirtualLegs(items []*refOp) (ids []int64, net map[int64]int64
 		if op.EditOf != nil {
 			target := m.ops[*op.EditOf]
 			add(target.AccountID, -target.Amount)
+			if op.isDelete() {
+				continue
+			}
 		}
 		add(op.AccountID, op.Amount)
 	}
@@ -247,15 +297,16 @@ func (m *Model) applyEdit(op *refOp) {
 	op.Status = model.OpApplied
 }
 
-// decideGroup applies spec §8.3 to a whole group, edit legs included (ADR-0010):
-// every edit leg's target must be CONFIRMED and at the expected revision — the
-// first failing leg, in leg order, rejects the whole group with
-// TARGET_NOT_EDITABLE / STALE_REVISION (a PENDING target defers the group in
-// ProcessNext and never reaches here); then the legs' virtual legs are netted per
-// account and every involved account is validated in ascending id order, all-or-
-// nothing. All pass → every account's net is applied, every edit leg applies to
-// its target (history appended, current columns overwritten, APPLIED), every
-// regular leg flips to CONFIRMED and the transaction to COMMITTED. Any fail → the
+// decideGroup applies spec §8.3 to a whole group, edit and delete legs included
+// (ADR-0010/0011): every edit-class leg's target must be CONFIRMED and at the
+// expected revision — the first failing leg, in leg order, rejects the whole
+// group with TARGET_NOT_EDITABLE / STALE_REVISION (a PENDING target defers the
+// group in ProcessNext and never reaches here); then the legs' virtual legs are
+// netted per account and every involved account is validated in ascending id
+// order, all-or-nothing. All pass → every account's net is applied, every edit
+// leg applies to its target (history appended, current columns overwritten,
+// APPLIED), every delete leg flips its target DELETED (APPLIED), every regular
+// leg flips to CONFIRMED and the transaction to COMMITTED. Any fail → the
 // whole group flips to INVALID / REJECTED with the one shared reason (the first
 // offending account, ascending id, exactly as the processor picks it) and no
 // balance or target changes. Netting per account is sound because the whole
@@ -299,11 +350,14 @@ func (m *Model) decideGroup(tx *refTx) Decision {
 		m.accountsByID[acctID].Balance += net[acctID]
 	}
 	for _, op := range items {
-		if op.EditOf != nil {
+		switch {
+		case op.isDelete():
+			m.applyDelete(op)
+		case op.EditOf != nil:
 			m.applyEdit(op)
-			continue
+		default:
+			op.Status = model.OpConfirmed
 		}
-		op.Status = model.OpConfirmed
 	}
 	tx.Status = model.TxCommitted
 	return Decision{
@@ -317,13 +371,19 @@ func (m *Model) decideGroup(tx *refTx) Decision {
 // CheckG2 verifies the group-atomicity guarantee (spec §4.1): no group is ever
 // partially applied — every leg of a transaction holds exactly the status its
 // transaction's status implies (PENDING ↔ PENDING; COMMITTED ↔ CONFIRMED for a
-// regular leg, APPLIED for an edit leg; REJECTED ↔ INVALID). It returns an error
-// naming the first violation, or nil.
+// regular leg, APPLIED for an edit or delete leg; REJECTED ↔ INVALID). A regular
+// leg of a COMMITTED group may since have been DELETED by a later delete (group
+// membership is not a deletion unit, ADR-0011). It returns an error naming the
+// first violation, or nil.
 func (m *Model) CheckG2() error {
 	for txID, tx := range m.txs {
 		for _, legID := range tx.LegIDs {
 			op := m.ops[legID]
-			if want := legStatusFor(tx.Status, op.EditOf != nil); op.Status != want {
+			want := legStatusFor(tx.Status, op.EditOf != nil)
+			if op.Status == model.OpDeleted && want == model.OpConfirmed {
+				continue // a leg of a COMMITTED group deleted afterwards
+			}
+			if op.Status != want {
 				return fmt.Errorf("G2 violated: transaction %d (%s) has leg %d in status %s, want %s", txID, tx.Status, legID, op.Status, want)
 			}
 		}
@@ -332,7 +392,7 @@ func (m *Model) CheckG2() error {
 }
 
 // legStatusFor maps a transaction status to the status it implies for one leg:
-// a regular leg of a COMMITTED group is CONFIRMED, an edit leg APPLIED.
+// a regular leg of a COMMITTED group is CONFIRMED, an edit or delete leg APPLIED.
 func legStatusFor(txStatus model.TxStatus, isEdit bool) model.OpStatus {
 	switch txStatus {
 	case model.TxCommitted:

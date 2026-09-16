@@ -33,13 +33,19 @@ func envInt(name string, def int) int {
 // (including double-reversals and reversal-after-reject retries), edits — single,
 // grouped and mixed with new operations; amount, account and day-crossing instant
 // changes, expected_revision hits and misses, CONFIRMED / INVALID /
-// already-edited / same-round PENDING targets — state-aware limit changes, and
-// idempotent replays/conflicts. After every drain it asserts G1 (final balance
-// within limits), G2 (no partially-applied group), G4 (timeline order total and
-// unique), G6 (no duplicate rows), and the editing invariants (edits never
-// CONFIRMED, histories dense, one revision per applied edit). It prints the
-// action mix and fails if any edit class never occurred. Every failure prints
-// its seed.
+// already-edited / DELETED / same-round PENDING targets — deletes (ADR-0011:
+// single, grouped and mixed with edits and new operations; the same target
+// classes, guard hits and misses, replays and conflicts), state-aware limit
+// changes, and idempotent replays/conflicts. After
+// every drain it asserts G1 (final balance within limits), G2 (no
+// partially-applied group), G4 (timeline order total and unique), G6 (no
+// duplicate rows), the editing invariants (edits never CONFIRMED, histories
+// dense, one revision per applied edit) and the deletion invariants (a DELETED
+// row has exactly one APPLIED delete and never reads CONFIRMED again). It prints
+// the action mix and fails if any edit or delete kind — single, pure group,
+// mixed group — or any fine-grained delete class (UT-043: guard none / hit /
+// miss, target CONFIRMED / edited / INVALID / DELETED / same-round fresh,
+// replay, conflict) never occurred. Every failure prints its seed.
 func TestFullScenarioReference(t *testing.T) {
 	t.Parallel()
 	seeds := envInt("SIMTEST_SEEDS", 1200)
@@ -51,8 +57,11 @@ func TestFullScenarioReference(t *testing.T) {
 		}
 	}
 	t.Logf("action mix over %d seeds: %s", seeds, mix)
-	if missing := mix.missingEdits(); missing != nil {
+	if missing := mix.missingClasses(); missing != nil {
 		t.Fatalf("the schedule never emitted %v (mix %s)", missing, mix)
+	}
+	if missing := mix.missingDeleteClasses(); missing != nil {
+		t.Fatalf("the schedule never emitted the delete classes %v (mix %s)", missing, mix)
 	}
 }
 
@@ -90,8 +99,8 @@ func runFullScenarioReference(t *testing.T, seed int64, mix actionMix) bool {
 	return true
 }
 
-// checkReferenceInvariants asserts G1, G2, G4, G6 and the editing invariants
-// against the reference model.
+// checkReferenceInvariants asserts G1, G2, G4, G6 and the editing and deletion
+// invariants against the reference model.
 func checkReferenceInvariants(t *testing.T, m *Model, seed int64) bool {
 	t.Helper()
 	if err := m.CheckG1(); err != nil {
@@ -107,6 +116,10 @@ func checkReferenceInvariants(t *testing.T, m *Model, seed int64) bool {
 		return false
 	}
 	if err := m.CheckEdits(); err != nil {
+		t.Errorf("seed %d: %v", seed, err)
+		return false
+	}
+	if err := m.CheckDeletes(); err != nil {
 		t.Errorf("seed %d: %v", seed, err)
 		return false
 	}

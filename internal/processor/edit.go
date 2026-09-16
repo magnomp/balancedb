@@ -159,11 +159,12 @@ func (p *Processor) readTarget(ctx context.Context, tx pgx.Tx, targetID int64) (
 	return t, nil
 }
 
-// checkTarget applies the target-state rules of ADR-0010 to an edit of targetID:
-// a PENDING target defers the unit (errDeferred); a target that is not CONFIRMED
-// (INVALID — terminal) rejects with TARGET_NOT_EDITABLE; an expected_revision
-// that no longer matches rejects with STALE_REVISION. A nil rejection and nil
-// error mean the edit may be decided on its limits.
+// checkTarget applies the target-state rules of ADR-0010/0011 to an edit or a
+// delete of targetID: a PENDING target defers the unit (errDeferred); a target
+// that is not CONFIRMED (INVALID or DELETED — both terminal) rejects with
+// TARGET_NOT_EDITABLE; an expected_revision that no longer matches rejects with
+// STALE_REVISION. A nil rejection and nil error mean the unit may be decided on
+// its limits.
 func checkTarget(targetID int64, t targetState, expected *int32) (*model.Rejection, error) {
 	switch model.OpStatus(t.Status) {
 	case model.OpPending:
@@ -256,10 +257,11 @@ func (p *Processor) applyEdit(ctx context.Context, tx pgx.Tx, op pendingOp, t ta
 	return notifyOp(ctx, tx, op.ID)
 }
 
-// rejectEdit rejects an edit registration: Guard 2 flips it to INVALID (terminal)
-// with the machine-readable reason and its decision instant. Nothing else is
-// written — no balance, no snapshot, no revision, and the target keeps its
-// current row untouched.
+// rejectEdit rejects an edit-class registration — a plain edit or a delete
+// (ADR-0011): Guard 2 flips it to INVALID (terminal) with the machine-readable
+// reason and its decision instant. Nothing else is written — no balance, no
+// snapshot, no revision, and the target keeps its current row untouched. The
+// decision is counted under the row's own kind.
 func (p *Processor) rejectEdit(ctx context.Context, tx pgx.Tx, op pendingOp, reason model.Rejection) error {
 	detail, err := reason.Marshal()
 	if err != nil {
@@ -272,9 +274,18 @@ func (p *Processor) rejectEdit(ctx context.Context, tx pgx.Tx, op pendingOp, rea
 	if tag.RowsAffected() != 1 {
 		return errGuardMiss
 	}
-	p.recordDecision(obs.KindEdit, obs.OutcomeInvalid)
+	p.recordDecision(op.decisionKind(), obs.OutcomeInvalid)
 
 	return notifyOp(ctx, tx, op.ID)
+}
+
+// decisionKind is the §13 decision-counter kind of an edit-class row: delete for
+// a delete registration, edit for a plain edit.
+func (op pendingOp) decisionKind() string {
+	if op.isDelete() {
+		return obs.KindDelete
+	}
+	return obs.KindEdit
 }
 
 // snapshotDay is the UTC calendar-day bucket of a snapshot row (spec §5.2): the

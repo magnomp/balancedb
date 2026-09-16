@@ -38,6 +38,7 @@ import (
 	"github.com/magnomp/balancedb/internal/db"
 	"github.com/magnomp/balancedb/internal/dbtest"
 	"github.com/magnomp/balancedb/internal/lease"
+	"github.com/magnomp/balancedb/internal/model"
 	"github.com/magnomp/balancedb/internal/processor"
 )
 
@@ -257,9 +258,9 @@ func (h *harness) apply(t *testing.T, a Action) {
 	}
 }
 
-// translate returns a copy of req with each op's reversal_of and edit_of remapped
-// from the reference op id the generator chose to the real database op id it must
-// reference.
+// translate returns a copy of req with each op's reversal_of, edit_of and
+// delete_of remapped from the reference op id the generator chose to the real
+// database op id it must reference.
 func (h *harness) translate(req api.InsertRequest) api.InsertRequest {
 	ops := make([]api.InsertOp, len(req.Operations))
 	copy(ops, req.Operations)
@@ -271,6 +272,10 @@ func (h *harness) translate(req api.InsertRequest) api.InsertRequest {
 		if ops[i].EditOf != nil {
 			dbID := h.refToDBOp[*ops[i].EditOf]
 			ops[i].EditOf = &dbID
+		}
+		if ops[i].DeleteOf != nil {
+			dbID := h.refToDBOp[*ops[i].DeleteOf]
+			ops[i].DeleteOf = &dbID
 		}
 	}
 	req.Operations = ops
@@ -355,10 +360,13 @@ func pendingCount(t *testing.T, pool *pgxpool.Pool) int {
 // assertG2 checks the group-atomicity invariant directly against the database:
 // every leg of every transaction holds exactly the status its transaction's
 // status implies — PENDING ↔ PENDING; COMMITTED ↔ CONFIRMED for a regular leg,
-// APPLIED for an edit leg (ADR-0010); REJECTED ↔ INVALID. This is the property
-// invariant queries protect (spec §4.1 G2) — impossible to observe a partially
-// applied group, including one whose edit legs applied without its regular legs
-// confirming or vice versa.
+// APPLIED for an edit or delete leg (ADR-0010/0011); REJECTED ↔ INVALID. A
+// regular leg of a COMMITTED group may since have been DELETED by a later delete
+// (group membership is not a deletion unit, ADR-0011): a DELETED leg must then
+// carry its deletion stamps, and a DELETED leg is never allowed under any other
+// transaction status. This is the property invariant queries protect (spec §4.1
+// G2) — impossible to observe a partially applied group, including one whose
+// edit legs applied without its regular legs confirming or vice versa.
 func assertG2(t *testing.T, pool *pgxpool.Pool, seed int64) {
 	t.Helper()
 	rows, err := pool.Query(context.Background(),
@@ -369,6 +377,8 @@ func assertG2(t *testing.T, pool *pgxpool.Pool, seed int64) {
 		                      WHEN 'COMMITTED' THEN CASE WHEN o.edit_of IS NULL THEN 'CONFIRMED' ELSE 'APPLIED' END
 		                      WHEN 'REJECTED'  THEN 'INVALID'
 		                    END
+		    AND NOT (t.status = 'COMMITTED' AND o.edit_of IS NULL AND o.status = 'DELETED'
+		             AND o.deleted_by IS NOT NULL AND o.deleted_at IS NOT NULL)
 		  ORDER BY t.id, o.id`)
 	if err != nil {
 		t.Fatalf("seed %d: G2 query: %v", seed, err)
@@ -391,9 +401,9 @@ func assertG2(t *testing.T, pool *pgxpool.Pool, seed int64) {
 }
 
 // dbOp is one operations row as the fidelity comparison reads it: status plus
-// the current columns an applied edit overwrites (ADR-0010) and the edit
-// linkage. EffectiveAt is compared with Equal, so it lives outside the
-// comparable core.
+// the current columns an applied edit overwrites (ADR-0010), the edit-class
+// linkage and kind, and the deletion stamps (ADR-0011). EffectiveAt is compared
+// with Equal, so it lives outside the comparable core.
 type dbOp struct {
 	status    string
 	accountID int64
@@ -401,6 +411,9 @@ type dbOp struct {
 	effective time.Time
 	revision  int32
 	editOf    *int64
+	isDelete  bool
+	deletedBy *int64
+	deletedAt *time.Time
 }
 
 // dbRevision is one operation_revisions row as the fidelity comparison reads it.
@@ -413,14 +426,17 @@ type dbRevision struct {
 }
 
 // assertMatches compares the drained database against the sequential reference
-// model, through the id map: every operation's status, current columns
-// (account, amount, effective_at), revision and edit linkage (G3, ADR-0010), every
-// operation's append-only history in operation_revisions (dense, superseded by
-// the mapped APPLIED edit), every transaction's status (G3), row counts (G6), and
-// every account's confirmed balance (G1). The reference is the oracle, so an
-// exact match proves the batched, possibly-crashed, possibly-contended run
-// produced the same outcomes as a sequential unbatched run — including that no
-// applied edit was lost or doubled and no rejected edit touched its target.
+// model, through the id map: every operation's status (DELETED included),
+// current columns (account, amount, effective_at), revision, edit-class linkage
+// and kind (edit_of, is_delete) and deletion stamps (deleted_by mapped through
+// refToDBOp, deleted_at present exactly on DELETED rows) (G3, ADR-0010/0011),
+// every operation's append-only history in operation_revisions (dense,
+// superseded by the mapped APPLIED edit), every transaction's status (G3), row
+// counts (G6), and every account's confirmed balance (G1). The reference is the
+// oracle, so an exact match proves the batched, possibly-crashed,
+// possibly-contended run produced the same outcomes as a sequential unbatched
+// run — including that no applied edit or delete was lost or doubled and no
+// rejected edit or delete touched its target.
 func (h *harness) assertMatches(t *testing.T, seed int64) {
 	t.Helper()
 	ctx := context.Background()
@@ -460,6 +476,18 @@ func (h *harness) assertMatches(t *testing.T, seed int64) {
 			t.Fatalf("seed %d: operation ref=%d db=%d is an edit in the db (of %d) but not in the reference", seed, refID, dbID, *got.editOf)
 		case op.EditOf != nil && (got.editOf == nil || *got.editOf != h.refToDBOp[*op.EditOf]):
 			t.Fatalf("seed %d: edit ref=%d db=%d edit_of db=%v reference(mapped)=%d", seed, refID, dbID, got.editOf, h.refToDBOp[*op.EditOf])
+		case got.isDelete != op.isDelete():
+			t.Fatalf("seed %d: operation ref=%d db=%d is_delete db=%v reference=%v", seed, refID, dbID, got.isDelete, op.isDelete())
+		}
+		// Deletion stamps (ADR-0011): deleted_by is the mapped APPLIED delete on a
+		// DELETED row and absent otherwise; deleted_at travels with it.
+		switch {
+		case op.DeletedBy == nil && (got.deletedBy != nil || got.deletedAt != nil):
+			t.Fatalf("seed %d: operation ref=%d db=%d carries deletion stamps (by %v at %v) but the reference has none", seed, refID, dbID, got.deletedBy, got.deletedAt)
+		case op.DeletedBy != nil && (got.deletedBy == nil || *got.deletedBy != h.refToDBOp[*op.DeletedBy] || got.deletedAt == nil):
+			t.Fatalf("seed %d: operation ref=%d db=%d deleted_by db=%v deleted_at db=%v reference(mapped)=%d", seed, refID, dbID, got.deletedBy, got.deletedAt, h.refToDBOp[*op.DeletedBy])
+		case (got.status == string(model.OpDeleted)) != (got.deletedBy != nil):
+			t.Fatalf("seed %d: operation ref=%d db=%d status %s with deleted_by %v", seed, refID, dbID, got.status, got.deletedBy)
 		}
 
 		// History: dense 1..revision−1, each row's state and superseding edit equal.
@@ -595,7 +623,7 @@ func (h *harness) assertSnapshots(t *testing.T, seed int64) {
 
 // scanOps reads every operations row into a map by id.
 func (h *harness) scanOps(ctx context.Context) (map[int64]dbOp, error) {
-	rows, err := h.pool.Query(ctx, `SELECT id, status, account_id, amount, effective_at, revision, edit_of FROM operations`)
+	rows, err := h.pool.Query(ctx, `SELECT id, status, account_id, amount, effective_at, revision, edit_of, is_delete, deleted_by, deleted_at FROM operations`)
 	if err != nil {
 		return nil, err
 	}
@@ -606,7 +634,7 @@ func (h *harness) scanOps(ctx context.Context) (map[int64]dbOp, error) {
 			id int64
 			o  dbOp
 		)
-		if err := rows.Scan(&id, &o.status, &o.accountID, &o.amount, &o.effective, &o.revision, &o.editOf); err != nil {
+		if err := rows.Scan(&id, &o.status, &o.accountID, &o.amount, &o.effective, &o.revision, &o.editOf, &o.isDelete, &o.deletedBy, &o.deletedAt); err != nil {
 			return nil, err
 		}
 		out[id] = o

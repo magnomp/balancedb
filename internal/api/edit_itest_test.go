@@ -391,8 +391,8 @@ func TestEditHistoryPendingAndRejectedLists(t *testing.T) {
 		t.Fatalf("history while pending = %v", h)
 	}
 	p := pend[0].(map[string]any)
-	wantKeys(t, "pending edit", p, "id", "account", "amount", "effective_at", "expected_revision")
-	if num(p["id"]) != e1 || p["account"] != "cash" || num(p["amount"]) != -1200 || p["effective_at"] != "2026-03-01T10:00:00Z" || num(p["expected_revision"]) != 1 {
+	wantKeys(t, "pending edit", p, "id", "kind", "account", "amount", "effective_at", "expected_revision")
+	if num(p["id"]) != e1 || p["kind"] != "edit" || p["account"] != "cash" || num(p["amount"]) != -1200 || p["effective_at"] != "2026-03-01T10:00:00Z" || num(p["expected_revision"]) != 1 {
 		t.Fatalf("pending edit = %v", p)
 	}
 
@@ -419,8 +419,8 @@ func TestEditHistoryPendingAndRejectedLists(t *testing.T) {
 		t.Fatalf("history after rejection = %v", h)
 	}
 	r := rej[0].(map[string]any)
-	wantKeys(t, "rejected edit", r, "id", "account", "amount", "effective_at", "expected_revision", "decided_at", "rejection")
-	if num(r["id"]) != e2 || num(r["amount"]) != 20 || num(r["expected_revision"]) != 1 {
+	wantKeys(t, "rejected edit", r, "id", "kind", "account", "amount", "effective_at", "expected_revision", "decided_at", "rejection")
+	if num(r["id"]) != e2 || r["kind"] != "edit" || num(r["amount"]) != 20 || num(r["expected_revision"]) != 1 {
 		t.Fatalf("rejected edit = %v", r)
 	}
 	if decided, _ := time.Parse(time.RFC3339Nano, r["decided_at"].(string)); decided.IsZero() || time.Since(decided) > time.Minute {

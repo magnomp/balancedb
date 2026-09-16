@@ -13,11 +13,12 @@ BalanceDB is a Postgres-backed ledger: clients insert money operations (singles 
 atomic groups) and a single elected leader selects visible committed work in ID
 order and validates final balances against configured min/max limits. Concurrent
 insertion commits can reorder decisions (ADR-0008). Confirmed operations can be
-edited in place with an append-only revision history (ADR-0010). The root `balancedb` package
-embeds insertion, migrations and
-the processor (ADR-0007; `docs/embedding.md`). One Go binary also runs as `api`,
-`processor`, or `migrate`; all SQL is
-hand-written against a configurable schema. **Read `docs/architecture-spec.md`
+edited in place with an append-only revision history (ADR-0010) and deleted to a
+terminal `DELETED` status that keeps the row for audit (ADR-0011); both are
+registrations decided by the leader, alone or inside a group. The root `balancedb`
+package embeds insertion, migrations and the processor (ADR-0007;
+`docs/embedding.md`). One Go binary also runs as `api`, `processor`, or `migrate`;
+all SQL is hand-written against a configurable schema. **Read `docs/architecture-spec.md`
 §2–§4 before any non-trivial change** — the consistency contract G1–G6 (spec §4.1)
 is the product; everything here exists to protect it.
 
@@ -29,16 +30,20 @@ you do.
 - **All three processing guards stay** (spec §7.2), each with its rowcount check, in
   *every* processor transaction: lease fence (Guard 1), conditional status flip
   (Guard 2), account-version CAS (Guard 3) — plus the revision CAS on every edit
-  target (ADR-0010). Any guard matching 0/mismatched rows ⇒ `ROLLBACK`, re-acquire
-  lease, continue. Never "optimize" a guard away.
-- **An operation's history is append-only (ADR-0010).** Status flips once —
-  regular rows `PENDING → CONFIRMED|INVALID`, edit rows `PENDING → APPLIED|INVALID`;
-  `INVALID`, `APPLIED` and (transactions) `REJECTED` are terminal. A CONFIRMED row's
+  target (ADR-0010) and the delete CAS on every delete target (ADR-0011). Any guard
+  matching 0/mismatched rows ⇒ `ROLLBACK`, re-acquire lease, continue. Never
+  "optimize" a guard away.
+- **An operation's history is append-only (ADR-0010, ADR-0011).** Status moves
+  forward only — regular rows `PENDING → CONFIRMED → DELETED` or `PENDING → INVALID`,
+  edit and delete rows `PENDING → APPLIED|INVALID`; `INVALID`, `APPLIED`, `DELETED`
+  and (transactions) `REJECTED` are terminal. A CONFIRMED row's
   `account_id`/`amount`/`effective_at` are overwritten *only* by the leader applying
   an edit under the revision CAS, appending the superseded state to
-  `operation_revisions` in the same transaction. Nothing ever updates or deletes
-  `operation_revisions`; `id`, `transaction_id`, `reversal_of`, `registered_at` are
-  immutable forever.
+  `operation_revisions` in the same transaction; `status = 'DELETED'`, `deleted_by`
+  and `deleted_at` are written *only* by the leader applying a delete under the same
+  CAS, once, with no revision appended. Nothing ever physically deletes from
+  `operations` or updates/deletes `operation_revisions`; `id`, `transaction_id`,
+  `reversal_of`, `registered_at` are immutable forever.
 - **Money is `int64` minor units end to end.** No floats, no `float64` JSON
   decoding, ever. All amount parsing goes through the one designated helper in
   `internal/model` — nothing else touches the conversion (spec §5.1, plan §0).
@@ -102,12 +107,12 @@ Packages marked *(Mn)* are not built yet — the map is the stable target.
 - `config` — env parsing + validation of `BALANCEDB_*` (plan §0). **built**
 - `db` — pgxpool, `search_path`, ping-on-boot, write transactions + consistent read snapshots (plan §0, ADR-0009). **built**
 - `migrate` — embedded migrations + purpose-built runner (spec §5.2, ADR-0001). **built**
-- `model` — row types (incl. `operation_revisions`), status enums, reason codes, the one amount helper, payload hashing (spec §5). **built**
-- `ledger` — shared accounts, insertion, idempotency, edit registration + `allow_edits`, balances/statements and outcomes (spec §6/§9/§10, ADR-0007–0010). **built**
+- `model` — row types (incl. `operation_revisions`, the `is_delete`/`deleted_*` columns), status enums, reason codes, the one amount helper, payload hashing (spec §5). **built**
+- `ledger` — shared accounts, insertion, idempotency, edit/delete registration + `allow_edits`/`allow_deletes`, balances/statements and outcomes (spec §6/§9/§10, ADR-0007–0011). **built**
 - `lease` — leader lease acquire/renew/release (spec §7.1). **built**
-- `processor` — main loop, single/group/edit processing, the three guards + revision CAS, deferral, batching (spec §7–§8, ADR-0010). **built**
+- `processor` — main loop, single/group/edit/delete processing (delete legs in any group mix), the three guards + revision CAS + delete CAS, deferral, batching (spec §7–§8, ADR-0010/0011). **built**
 - `snapshot` — snapshot upsert + cascade update (spec §8.4). **built**
-- `api` — Huma/chi HTTP handlers for every §10 endpoint incl. `PATCH /operations/{id}` + `/history` (ADR-0003/0009), shared ledger insertion + synchronous waiting (ADR-0002/0007). **built**
+- `api` — Huma/chi HTTP handlers for every §10 endpoint incl. `PATCH`/`DELETE /operations/{id}` + `/history` (ADR-0003/0009–0011), shared ledger insertion + synchronous waiting (ADR-0002/0007). **built**
 - `notify` — LISTEN/NOTIFY: work doorbell (api/processor) + outcome fan-out (spec §11, ADR-0002). **built**
 - `obs` — metrics registry, health endpoints, HTTP middleware, slow-query tracer (spec §13). **built**
 

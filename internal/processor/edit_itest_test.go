@@ -43,10 +43,13 @@ type opState struct {
 	revision   int32
 	revisedAt  *time.Time
 	editOf     *int64
+	isDelete   bool
 	expected   *int32
 	confirmed  *time.Time
 	reason     *string
 	registered time.Time
+	deletedBy  *int64
+	deletedAt  *time.Time
 	xmin       string
 }
 
@@ -54,11 +57,11 @@ func readOpState(t *testing.T, pool *pgxpool.Pool, id int64) opState {
 	t.Helper()
 	var s opState
 	err := pool.QueryRow(context.Background(),
-		`SELECT status, account_id, amount, effective_at, revision, revised_at, edit_of, expected_revision,
-		        confirmed_at, invalidation_reason, registered_at, xmin::text
+		`SELECT status, account_id, amount, effective_at, revision, revised_at, edit_of, is_delete, expected_revision,
+		        confirmed_at, invalidation_reason, registered_at, deleted_by, deleted_at, xmin::text
 		   FROM operations WHERE id = $1`, id).
-		Scan(&s.status, &s.accountID, &s.amount, &s.effective, &s.revision, &s.revisedAt, &s.editOf, &s.expected,
-			&s.confirmed, &s.reason, &s.registered, &s.xmin)
+		Scan(&s.status, &s.accountID, &s.amount, &s.effective, &s.revision, &s.revisedAt, &s.editOf, &s.isDelete, &s.expected,
+			&s.confirmed, &s.reason, &s.registered, &s.deletedBy, &s.deletedAt, &s.xmin)
 	if err != nil {
 		t.Fatalf("read op %d: %v", id, err)
 	}
@@ -153,8 +156,8 @@ func fetchPendingOp(t *testing.T, pool *pgxpool.Pool, id int64) pendingOp {
 	t.Helper()
 	op := pendingOp{ID: id}
 	if err := pool.QueryRow(context.Background(),
-		`SELECT account_id, amount, effective_at, edit_of, expected_revision FROM operations WHERE id = $1`, id).
-		Scan(&op.AccountID, &op.Amount, &op.EffectiveAt, &op.EditOf, &op.ExpectedRevision); err != nil {
+		`SELECT account_id, amount, effective_at, edit_of, is_delete, expected_revision FROM operations WHERE id = $1`, id).
+		Scan(&op.AccountID, &op.Amount, &op.EffectiveAt, &op.EditOf, &op.IsDelete, &op.ExpectedRevision); err != nil {
 		t.Fatalf("read pending op %d: %v", id, err)
 	}
 	return op
@@ -170,8 +173,9 @@ func drainAll(t *testing.T, p *Processor) {
 
 // assertSnapshotsRecomputed checks every snapshot row of an account against a
 // recomputation from CONFIRMED rows: the cumulative sum of amounts whose
-// effective_at UTC day is on or before the snapshot day (spec §8.4). Edit rows
-// are never CONFIRMED, so they never enter the sum.
+// effective_at UTC day is on or before the snapshot day (spec §8.4). Edit and
+// delete rows are never CONFIRMED and a DELETED row is no longer CONFIRMED, so
+// none of them enters the sum.
 func assertSnapshotsRecomputed(t *testing.T, pool *pgxpool.Pool, acct int64) {
 	t.Helper()
 	ctx := context.Background()
@@ -1007,6 +1011,7 @@ func TestNoRevisionMutationSQL(t *testing.T) {
 		"guardFlipLegsInvalid": guardFlipLegsInvalid, "guardFlipTxCommitted": guardFlipTxCommitted,
 		"guardFlipTxRejected": guardFlipTxRejected, "guardFlipEditLegsApplied": guardFlipEditLegsApplied,
 		"guardFlipEditLegsInvalid": guardFlipEditLegsInvalid, "selectGroupLegs": selectGroupLegs,
+		"guardDeleteCAS": guardDeleteCAS, "fetchPendingWork": fetchPendingWork,
 	} {
 		up := strings.ToUpper(sql)
 		if strings.Contains(up, "OPERATION_REVISIONS") && !strings.HasPrefix(strings.TrimSpace(up), "INSERT") {

@@ -64,7 +64,8 @@ func (s *Server) waitForOutcome(ctx context.Context, ownerID int64, res *InsertR
 }
 
 // awaitDecision is the synchronous-wait loop shared by every waiting endpoint
-// (POST /transactions and PATCH /operations/{id}, ADR-0010): register a waiter for
+// (POST /transactions, PATCH /operations/{id} — ADR-0010 — and
+// DELETE /operations/{id} — ADR-0011): register a waiter for
 // key → one immediate status check (closes the lost-wakeup race where the decision
 // committed before registration) → select over the outcome notification, a
 // status-poll ticker (durability fallback), and the wait deadline. load reads the
@@ -170,7 +171,8 @@ func (s *Server) waitBudget(ctx context.Context, waitMs int) (time.Duration, err
 
 // loadSingleOutcome reads a single operation's current status (owner-scoped) into a
 // response body and reports whether it is terminal (decided). Replayed carries the
-// insert's replay flag through unchanged, as does the item's edit_of (immutable).
+// insert's replay flag through unchanged, as does the item's edit_of/delete_of
+// (immutable).
 func (s *Server) loadSingleOutcome(ctx context.Context, single OpOutcome, ownerID int64, replayed bool) (*CreateTransactionOutput, bool, error) {
 	var (
 		status string
@@ -182,14 +184,14 @@ func (s *Server) loadSingleOutcome(ctx context.Context, single OpOutcome, ownerI
 	}
 	out := &CreateTransactionOutput{}
 	out.Body.Replayed = replayed
-	out.Body.Operations = []OperationOutcome{{ID: single.ID, Status: status, EditOf: single.EditOf}}
+	out.Body.Operations = []OperationOutcome{{ID: single.ID, Status: status, EditOf: single.EditOf, DeleteOf: single.DeleteOf}}
 	return out, status != string(model.OpPending), nil
 }
 
 // loadGroupOutcome reads a group's current status and its per-leg statuses
 // (owner-scoped) into a response body and reports whether the group is terminal
-// (COMMITTED or REJECTED). Legs carry edit_of so an edit item's outcome names its
-// target exactly as the insert response did.
+// (COMMITTED or REJECTED). Legs carry edit_of/delete_of so an edit or delete
+// item's outcome names its target exactly as the insert response did.
 func (s *Server) loadGroupOutcome(ctx context.Context, txID, ownerID int64, replayed bool) (*CreateTransactionOutput, bool, error) {
 	value, err := db.Read(ctx, s.pool, func(tx pgx.Tx) (*ledger.TransactionOutcome, error) {
 		return ledger.GetTransaction(ctx, tx, ownerID, txID)
@@ -203,7 +205,7 @@ func (s *Server) loadGroupOutcome(ctx context.Context, txID, ownerID int64, repl
 	out.Body.Replayed = replayed
 	out.Body.Operations = make([]OperationOutcome, len(value.Operations))
 	for i, op := range value.Operations {
-		out.Body.Operations[i] = OperationOutcome{ID: op.ID, Status: string(op.Status), EditOf: op.EditOf}
+		out.Body.Operations[i] = OperationOutcome{ID: op.ID, Status: string(op.Status), EditOf: op.EditOf, DeleteOf: op.DeleteOf}
 	}
 	return out, value.Status != model.TxPending, nil
 }
