@@ -9,10 +9,17 @@ import (
 // stable: clients switch on it.
 type ReasonCode string
 
-// ReasonLimitViolated is the only rejection cause in the current contract — a
-// candidate that would push an account's final balance outside its limits
-// (spec §6).
-const ReasonLimitViolated ReasonCode = "LIMIT_VIOLATED"
+const (
+	// ReasonLimitViolated — a candidate (operation, group, or edit's virtual legs)
+	// would push an account's final balance outside its limits (spec §6).
+	ReasonLimitViolated ReasonCode = "LIMIT_VIOLATED"
+	// ReasonTargetNotEditable — an edit whose target is INVALID at decision time
+	// (ADR-0010). Terminal targets cannot be revised; the client re-submits.
+	ReasonTargetNotEditable ReasonCode = "TARGET_NOT_EDITABLE"
+	// ReasonStaleRevision — an edit carrying expected_revision that no longer
+	// matches the target's current revision at decision time (ADR-0010).
+	ReasonStaleRevision ReasonCode = "STALE_REVISION"
+)
 
 // LimitSide names which configured bound a rejection crossed.
 type LimitSide string
@@ -27,13 +34,21 @@ const (
 // carries enough for a budgeting UI to render "envelope short by 12.00" directly:
 // the offending account's external id, the bound crossed, and by how much.
 //
-// The processor (M5/M6) writes it; the API (M7) reads it. It is defined here so
-// both sides share one shape. Shortfall is a positive magnitude in minor units.
+// The processor writes it; the API reads it. It is defined here so both sides
+// share one shape. Shortfall is a positive magnitude in minor units.
+//
+// Only Code is always present. LIMIT_VIOLATED fills Account/LimitSide/Shortfall
+// (all non-zero, so its stored JSON is unchanged by omitempty). The edit codes
+// (ADR-0010) fill OperationID — the edit target — and STALE_REVISION adds the
+// expected and actual revisions.
 type Rejection struct {
-	Code      ReasonCode `json:"code"`
-	Account   string     `json:"account"`
-	LimitSide LimitSide  `json:"limit_side"`
-	Shortfall int64      `json:"shortfall"`
+	Code             ReasonCode `json:"code"`
+	Account          string     `json:"account,omitempty"`
+	LimitSide        LimitSide  `json:"limit_side,omitempty"`
+	Shortfall        int64      `json:"shortfall,omitempty"`
+	OperationID      *int64     `json:"operation_id,omitempty"`
+	ExpectedRevision *int32     `json:"expected_revision,omitempty"`
+	ActualRevision   *int32     `json:"actual_revision,omitempty"`
 }
 
 // Marshal renders the rejection as the JSON text stored in the reason columns.

@@ -5,10 +5,13 @@
 // database against the sequential reference model across the full scenario space
 // (the shared seeded generator in generate.go), interleaved with fault injection —
 // batch-boundary crashes (this file), competing-leader failover and zombie-leader
-// stale-lease writes (sim_faults_test.go). The reference model is the oracle; an
-// exact match after churn proves the three guards (spec §7.2) hold the consistency
-// contract G1–G6. Run via `make simtest` against TEST_DATABASE_URL; each test
-// self-isolates in a throwaway schema. Every failure prints its seed.
+// stale-lease writes (sim_faults_test.go) — with edits (single, grouped, mixed;
+// ADR-0010) in every schedule. The reference model is the oracle; an exact match
+// after churn — statuses, current columns, revisions and the append-only
+// operation_revisions rows included — proves the three guards (spec §7.2) plus
+// the revision CAS hold the consistency contract G1–G6. Run via `make simtest`
+// against TEST_DATABASE_URL; each test self-isolates in a throwaway schema.
+// Every failure prints its seed.
 //
 // Identity ids do NOT line up between the reference and the database: idempotent
 // replays and payload conflicts run `INSERT ... ON CONFLICT DO NOTHING`, which
@@ -16,8 +19,8 @@
 // first, assigns none. So the harness maintains an explicit reference→database id
 // map (built from each fresh insert's returned ids, in registration order) and
 // compares through it — the approach the M6 handoff flagged as the alternative to id
-// alignment. The map also translates a reversal's reversal_of (a reference op id) to
-// the real operation it must reference in the database.
+// alignment. The map also translates a reversal's reversal_of and an edit's edit_of
+// (reference op ids) to the real operations they must reference in the database.
 package simtest
 
 import (
@@ -62,6 +65,7 @@ type harness struct {
 	refToDBOp   map[int64]int64  // reference op id → database op id
 	refToDBTx   map[int64]int64  // reference transaction id → database transaction id
 	dbAcctByExt map[string]int64 // external id → database account id
+	mix         actionMix        // optional tally of the applied actions
 }
 
 // newHarness creates every schedule account (with limits) in both the database and
@@ -93,24 +97,29 @@ func newHarness(t *testing.T, pool *pgxpool.Pool, g *Generator) *harness {
 	return h
 }
 
-// TestSimFullScenarioMatchReference is the primary fidelity check: randomized
-// schedules across the full scenario space (limits, singles, groups, aggressive
-// back/future-dating with day crossings and timestamp ties, reversals including
-// double-reversals and reversal-after-reject retries, limit changes, idempotent
-// replays/conflicts) run through the real batched processor, then the database is
-// asserted equal to the sequential reference model: G1 (every confirmed balance
-// within limits and equal to the reference), G2 (no group partially applied), G3
-// (every operation and transaction reaches the reference outcome), G4 (timeline
-// order stable and identical to the reference), plus the snapshot cascade invariant
-// (the latest daily snapshot equals the confirmed balance) and G6 (no duplicate
-// rows). Every failure prints its seed.
+// TestSimFullScenarioMatchReference (SIM-002) is the primary fidelity check:
+// randomized schedules across the full scenario space (limits, singles, groups,
+// aggressive back/future-dating with day crossings and timestamp ties, reversals
+// including double-reversals and reversal-after-reject retries, edits — single,
+// grouped and mixed — limit changes, idempotent replays/conflicts) run through
+// the real batched processor, then the database is asserted equal to the
+// sequential reference model: G1 (every confirmed balance within limits and
+// equal to the reference), G2 (no group partially applied), G3 (every operation
+// and transaction reaches the reference outcome; every operation's current
+// columns, revision and append-only history match), G4 (timeline order stable
+// and identical to the reference, current effective_at included), plus the
+// snapshot cascade invariant (the latest daily snapshot equals the confirmed
+// balance) and G6 (no duplicate rows). It prints the action mix. Every failure
+// prints its seed.
 func TestSimFullScenarioMatchReference(t *testing.T) {
 	seeds := envInt("SIMTEST_DB_SEEDS", 12)
+	mix := actionMix{}
 	for i := 0; i < seeds; i++ {
 		seed := int64(4_000_000 + i)
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			pool := dbtest.NewSchema(t)
 			h := newHarness(t, pool, NewGenerator(seed))
+			h.mix = mix
 			setSimConfig(t, pool, 5, 5000, 50)
 
 			for r := 0; r < dbRounds; r++ {
@@ -131,6 +140,7 @@ func TestSimFullScenarioMatchReference(t *testing.T) {
 			}
 		})
 	}
+	reportMix(t, seeds, mix)
 }
 
 // TestSimBatchCrashEqualsSequential proves batching is crash-safe under the full
@@ -142,11 +152,14 @@ func TestSimFullScenarioMatchReference(t *testing.T) {
 // restart boundary. Every failure prints its seed.
 func TestSimBatchCrashEqualsSequential(t *testing.T) {
 	seeds := envInt("SIMTEST_CRASH_SEEDS", 4)
+	mix := actionMix{}
+	defer func() { reportMix(t, seeds, mix) }()
 	for i := 0; i < seeds; i++ {
 		seed := int64(9_000_000 + i)
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			pool := dbtest.NewSchema(t)
 			h := newHarness(t, pool, NewGenerator(seed))
+			h.mix = mix
 			// Small batches → more batch boundaries → more chances to crash mid-batch.
 			setSimConfig(t, pool, 3, 5000, 4)
 
@@ -175,6 +188,9 @@ func TestSimBatchCrashEqualsSequential(t *testing.T) {
 func (h *harness) apply(t *testing.T, a Action) {
 	t.Helper()
 	ctx := context.Background()
+	if h.mix != nil {
+		h.mix.add(a)
+	}
 
 	if a.Kind == actSetLimits {
 		if err := h.m.SetLimits(simOwnerID, a.Limits.ExternalID, a.Limits.Min, a.Limits.Max); err != nil {
@@ -241,8 +257,9 @@ func (h *harness) apply(t *testing.T, a Action) {
 	}
 }
 
-// translate returns a copy of req with each op's reversal_of remapped from the
-// reference op id the generator chose to the real database op id it must reference.
+// translate returns a copy of req with each op's reversal_of and edit_of remapped
+// from the reference op id the generator chose to the real database op id it must
+// reference.
 func (h *harness) translate(req api.InsertRequest) api.InsertRequest {
 	ops := make([]api.InsertOp, len(req.Operations))
 	copy(ops, req.Operations)
@@ -250,6 +267,10 @@ func (h *harness) translate(req api.InsertRequest) api.InsertRequest {
 		if ops[i].ReversalOf != nil {
 			dbID := h.refToDBOp[*ops[i].ReversalOf]
 			ops[i].ReversalOf = &dbID
+		}
+		if ops[i].EditOf != nil {
+			dbID := h.refToDBOp[*ops[i].EditOf]
+			ops[i].EditOf = &dbID
 		}
 	}
 	req.Operations = ops
@@ -331,83 +352,138 @@ func pendingCount(t *testing.T, pool *pgxpool.Pool) int {
 	return n
 }
 
-// assertG2 checks the group-atomicity invariant directly against the database: no
-// transaction has legs in more than one status, and every transaction's status
-// agrees with its legs' status. This is the property invariant queries protect
-// (spec §4.1 G2) — impossible to observe a partially applied group.
+// assertG2 checks the group-atomicity invariant directly against the database:
+// every leg of every transaction holds exactly the status its transaction's
+// status implies — PENDING ↔ PENDING; COMMITTED ↔ CONFIRMED for a regular leg,
+// APPLIED for an edit leg (ADR-0010); REJECTED ↔ INVALID. This is the property
+// invariant queries protect (spec §4.1 G2) — impossible to observe a partially
+// applied group, including one whose edit legs applied without its regular legs
+// confirming or vice versa.
 func assertG2(t *testing.T, pool *pgxpool.Pool, seed int64) {
 	t.Helper()
-	ctx := context.Background()
-	rows, err := pool.Query(ctx,
-		`SELECT transaction_id, count(DISTINCT status)
-		   FROM operations WHERE transaction_id IS NOT NULL
-		  GROUP BY transaction_id HAVING count(DISTINCT status) > 1`)
+	rows, err := pool.Query(context.Background(),
+		`SELECT t.id, t.status, o.id, o.status, o.edit_of IS NOT NULL
+		   FROM transactions t JOIN operations o ON o.transaction_id = t.id
+		  WHERE o.status <> CASE t.status
+		                      WHEN 'PENDING'   THEN 'PENDING'
+		                      WHEN 'COMMITTED' THEN CASE WHEN o.edit_of IS NULL THEN 'CONFIRMED' ELSE 'APPLIED' END
+		                      WHEN 'REJECTED'  THEN 'INVALID'
+		                    END
+		  ORDER BY t.id, o.id`)
 	if err != nil {
 		t.Fatalf("seed %d: G2 query: %v", seed, err)
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var txID int64
-		var n int
-		if err := rows.Scan(&txID, &n); err != nil {
+		var (
+			txID, opID int64
+			ts, os     string
+			isEdit     bool
+		)
+		if err := rows.Scan(&txID, &ts, &opID, &os, &isEdit); err != nil {
 			t.Fatalf("seed %d: G2 scan: %v", seed, err)
 		}
-		t.Fatalf("seed %d: G2 violated — transaction %d has legs in %d distinct statuses", seed, txID, n)
+		t.Fatalf("seed %d: G2 violated — transaction %d (%s) has leg %d (edit=%v) in status %s", seed, txID, ts, opID, isEdit, os)
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatalf("seed %d: G2 iterate: %v", seed, err)
 	}
+}
 
-	// Transaction status must agree with its legs' single status.
-	mismatch, err := pool.Query(ctx,
-		`SELECT t.id, t.status, min(o.status)
-		   FROM transactions t JOIN operations o ON o.transaction_id = t.id
-		  GROUP BY t.id, t.status
-		 HAVING (t.status = 'PENDING'   AND min(o.status) <> 'PENDING')
-		     OR (t.status = 'COMMITTED' AND min(o.status) <> 'CONFIRMED')
-		     OR (t.status = 'REJECTED'  AND min(o.status) <> 'INVALID')`)
-	if err != nil {
-		t.Fatalf("seed %d: G2 agreement query: %v", seed, err)
-	}
-	defer mismatch.Close()
-	for mismatch.Next() {
-		var id int64
-		var ts, os string
-		if err := mismatch.Scan(&id, &ts, &os); err != nil {
-			t.Fatalf("seed %d: G2 agreement scan: %v", seed, err)
-		}
-		t.Fatalf("seed %d: G2 violated — transaction %d status %s disagrees with leg status %s", seed, id, ts, os)
-	}
-	if err := mismatch.Err(); err != nil {
-		t.Fatalf("seed %d: G2 agreement iterate: %v", seed, err)
-	}
+// dbOp is one operations row as the fidelity comparison reads it: status plus
+// the current columns an applied edit overwrites (ADR-0010) and the edit
+// linkage. EffectiveAt is compared with Equal, so it lives outside the
+// comparable core.
+type dbOp struct {
+	status    string
+	accountID int64
+	amount    int64
+	effective time.Time
+	revision  int32
+	editOf    *int64
+}
+
+// dbRevision is one operation_revisions row as the fidelity comparison reads it.
+type dbRevision struct {
+	revision     int32
+	accountID    int64
+	amount       int64
+	effective    time.Time
+	supersededBy int64
 }
 
 // assertMatches compares the drained database against the sequential reference
-// model, through the id map: every operation's status (G3), every transaction's
-// status (G3), row counts (G6), and every account's confirmed balance (G1). The
-// reference is the oracle, so an exact match proves the batched, possibly-crashed,
-// possibly-contended run produced the same outcomes as a sequential unbatched run.
+// model, through the id map: every operation's status, current columns
+// (account, amount, effective_at), revision and edit linkage (G3, ADR-0010), every
+// operation's append-only history in operation_revisions (dense, superseded by
+// the mapped APPLIED edit), every transaction's status (G3), row counts (G6), and
+// every account's confirmed balance (G1). The reference is the oracle, so an
+// exact match proves the batched, possibly-crashed, possibly-contended run
+// produced the same outcomes as a sequential unbatched run — including that no
+// applied edit was lost or doubled and no rejected edit touched its target.
 func (h *harness) assertMatches(t *testing.T, seed int64) {
 	t.Helper()
 	ctx := context.Background()
 
-	// Operations: read all real statuses, compare each reference op through the map.
-	dbStatus, err := scanStatuses(ctx, h.pool, `SELECT id, status FROM operations`)
+	// Operations: read every real row, compare each reference op through the map.
+	dbOps, err := h.scanOps(ctx)
 	if err != nil {
 		t.Fatalf("seed %d: read operations: %v", seed, err)
 	}
-	if len(dbStatus) != len(h.m.ops) {
-		t.Fatalf("seed %d: db has %d operations, reference has %d (G6)", seed, len(dbStatus), len(h.m.ops))
+	if len(dbOps) != len(h.m.ops) {
+		t.Fatalf("seed %d: db has %d operations, reference has %d (G6)", seed, len(dbOps), len(h.m.ops))
 	}
+	dbRevs, err := h.scanRevisions(ctx)
+	if err != nil {
+		t.Fatalf("seed %d: read operation_revisions: %v", seed, err)
+	}
+	nRevs := 0
 	for refID, op := range h.m.ops {
 		dbID, ok := h.refToDBOp[refID]
 		if !ok {
 			t.Fatalf("seed %d: reference op %d has no database mapping", seed, refID)
 		}
-		if got := dbStatus[dbID]; got != string(op.Status) {
-			t.Fatalf("seed %d: operation ref=%d db=%d status db=%s reference=%s (G3)", seed, refID, dbID, got, op.Status)
+		got, ok := dbOps[dbID]
+		if !ok {
+			t.Fatalf("seed %d: reference op %d maps to db op %d, which does not exist", seed, refID, dbID)
 		}
+		if got.status != string(op.Status) {
+			t.Fatalf("seed %d: operation ref=%d db=%d status db=%s reference=%s (G3)", seed, refID, dbID, got.status, op.Status)
+		}
+		wantAcct := h.dbAcctByExt[h.m.accountsByID[op.AccountID].ExternalID]
+		if got.accountID != wantAcct || got.amount != op.Amount || !got.effective.Equal(op.EffectiveAt) || got.revision != op.Revision {
+			t.Fatalf("seed %d: operation ref=%d db=%d current state db={acct %d, %d, %v, rev %d} reference={acct %d, %d, %v, rev %d}",
+				seed, refID, dbID, got.accountID, got.amount, got.effective, got.revision, wantAcct, op.Amount, op.EffectiveAt, op.Revision)
+		}
+		switch {
+		case op.EditOf == nil && got.editOf != nil:
+			t.Fatalf("seed %d: operation ref=%d db=%d is an edit in the db (of %d) but not in the reference", seed, refID, dbID, *got.editOf)
+		case op.EditOf != nil && (got.editOf == nil || *got.editOf != h.refToDBOp[*op.EditOf]):
+			t.Fatalf("seed %d: edit ref=%d db=%d edit_of db=%v reference(mapped)=%d", seed, refID, dbID, got.editOf, h.refToDBOp[*op.EditOf])
+		}
+
+		// History: dense 1..revision−1, each row's state and superseding edit equal.
+		want := h.m.revisions[refID]
+		gotRevs := dbRevs[dbID]
+		nRevs += len(gotRevs)
+		if len(gotRevs) != len(want) {
+			t.Fatalf("seed %d: operation ref=%d db=%d has %d history rows, reference %d", seed, refID, dbID, len(gotRevs), len(want))
+		}
+		for i, r := range want {
+			g := gotRevs[i]
+			wantAcct := h.dbAcctByExt[h.m.accountsByID[r.AccountID].ExternalID]
+			if g.revision != r.Revision || g.accountID != wantAcct || g.amount != r.Amount || !g.effective.Equal(r.EffectiveAt) || g.supersededBy != h.refToDBOp[r.SupersededBy] {
+				t.Fatalf("seed %d: operation ref=%d db=%d revision %d db=%+v reference={rev %d, acct %d, %d, %v, by %d}",
+					seed, refID, dbID, r.Revision, g, r.Revision, wantAcct, r.Amount, r.EffectiveAt, h.refToDBOp[r.SupersededBy])
+			}
+		}
+	}
+	total := 0
+	for _, rs := range dbRevs {
+		total += len(rs)
+	}
+	if total != nRevs {
+		t.Fatalf("seed %d: db has %d operation_revisions rows, %d belong to mapped operations", seed, total, nRevs)
 	}
 
 	// Transactions.
@@ -447,12 +523,13 @@ func (h *harness) assertMatches(t *testing.T, seed int64) {
 	}
 }
 
-// assertG4 checks the deterministic, immutable ordering guarantee (spec §4.1): for
-// every account the database's timeline — operations ordered by (effective_at, id) —
-// is identical to the reference model's (mapped through the id table). Identity ids
-// are monotonic in insertion order, so the map preserves relative order and the tie
-// break on equal effective_at agrees; statuses change during processing, but
-// effective_at and id never do, so the order is stable.
+// assertG4 checks the deterministic ordering guarantee (spec §4.1): for every
+// account the database's timeline — operations ordered by (effective_at, id) — is
+// identical to the reference model's (mapped through the id table). Identity ids
+// are monotonic in insertion order, so the map preserves relative order and the
+// tie break on equal effective_at agrees; statuses change during processing and
+// an applied edit may move an operation's effective_at or account (ADR-0010), but
+// both sides apply the same edits, so the current timelines must still agree.
 func (h *harness) assertG4(t *testing.T, seed int64) {
 	t.Helper()
 	ctx := context.Background()
@@ -514,6 +591,51 @@ func (h *harness) assertSnapshots(t *testing.T, seed int64) {
 			t.Fatalf("seed %d: account %s latest snapshot balance %d != confirmed balance %d", seed, ext, bal, want)
 		}
 	}
+}
+
+// scanOps reads every operations row into a map by id.
+func (h *harness) scanOps(ctx context.Context) (map[int64]dbOp, error) {
+	rows, err := h.pool.Query(ctx, `SELECT id, status, account_id, amount, effective_at, revision, edit_of FROM operations`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[int64]dbOp)
+	for rows.Next() {
+		var (
+			id int64
+			o  dbOp
+		)
+		if err := rows.Scan(&id, &o.status, &o.accountID, &o.amount, &o.effective, &o.revision, &o.editOf); err != nil {
+			return nil, err
+		}
+		out[id] = o
+	}
+	return out, rows.Err()
+}
+
+// scanRevisions reads every operation_revisions row, grouped by operation and
+// ordered by revision.
+func (h *harness) scanRevisions(ctx context.Context) (map[int64][]dbRevision, error) {
+	rows, err := h.pool.Query(ctx,
+		`SELECT operation_id, revision, account_id, amount, effective_at, superseded_by
+		   FROM operation_revisions ORDER BY operation_id, revision`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[int64][]dbRevision)
+	for rows.Next() {
+		var (
+			opID int64
+			r    dbRevision
+		)
+		if err := rows.Scan(&opID, &r.revision, &r.accountID, &r.amount, &r.effective, &r.supersededBy); err != nil {
+			return nil, err
+		}
+		out[opID] = append(out[opID], r)
+	}
+	return out, rows.Err()
 }
 
 // scanStatuses reads an (id, status) query into a map.

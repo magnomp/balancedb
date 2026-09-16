@@ -28,4 +28,17 @@
 // (spec §8.5): up to batch_size operations' worth per DB transaction, guards
 // evaluated per decision, a whole-batch rollback on any miss and a reprocess that is
 // idempotent by construction (the Guard 2 conditional flips no-op on decided rows).
+//
+// An edit registration (edit_of set, ADR-0010) sits in the same queue and is
+// decided as two virtual legs (−current, +proposed) netted per account under the
+// same three guards plus a revision CAS on the target; on accept the edit row
+// flips PENDING→APPLIED, the superseded state is appended to operation_revisions
+// and the target's current columns are overwritten. A group may carry edit legs
+// next to regular ones: every leg expands into virtual legs, the net is validated
+// per account, Guard 2 flips regular legs to CONFIRMED and edit legs to APPLIED
+// (split by edit_of, rowcounts summing to the leg count), each edit target gets
+// its history row and revision CAS, and Guard 3 runs once per account; a target
+// that ended INVALID or is not at the expected revision rejects the whole group.
+// A unit whose edit target is still PENDING is deferred — skipped, left PENDING,
+// counted — and the batch continues.
 package processor

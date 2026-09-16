@@ -1097,3 +1097,152 @@ only the overview's ordering description to match ADR-0008; request/response sha
 are unchanged. Local review covered schema/savepoint restoration, owner isolation,
 CAS retry/revalidation, exact large amounts, paging, and concurrent snapshot reads.
 No dependencies, migrations, processor guards, or insertion coordination changed.
+
+## Operation editing — 2026-09-16
+
+Shipped (feature spec `.compozy/tasks/operation-editing/`, tasks 01–06; ADR-0010
+`docs/decisions/0010-operation-editing.md`, accepted): confirmed operations can be
+edited in place — `amount`, `effective_at`, `account` (same owner) — with an
+append-only revision history, as single edits (`PATCH /operations/{id}`), grouped
+or mixed items of `POST /transactions` (`edit_of`, optional `expected_revision`),
+and through the embedded core (`InsertOp.EditOf`/`ExpectedRevision`). An edit is a
+registration row in `operations` (same id sequence, PENDING queue, idempotency and
+grouping); the leader decides it as two virtual legs (`−old`, `+new`) netted per
+account under the three guards plus a fourth rowcount-checked write, the revision
+CAS on the target, appending the superseded state to `operation_revisions` in the
+same transaction. `GET /operations/{id}` gains the current state + `revision`,
+`GET /operations/{id}/history` is the audit trail (revisions + pending + rejected
+edits), statement entries and group legs carry `revision`/`edit_of`. `apiVersion`
+is 1.1.0. Migration `0002_operation_edits.sql` is additive (no row rewritten;
+IT-002 asserts unchanged `xmin`). Hot-reloaded `config.allow_edits` (default true)
+keeps a cell on the reversal-only contract.
+
+Decisions (details in ADR-0010 and the task memory files under
+`.compozy/tasks/operation-editing/memory/`):
+- CLAUDE.md inviolable #2 restated from "never mutated" to "history append-only";
+  #1 gains the revision CAS. Spec header note, Principle 5, G4 ("moved by a
+  confirmed edit"), new N7 (edits and reversals do not track each other),
+  §5.2–§5.4, §7.2, §8.2–§8.4, §10.2–§10.3, §12, §13 refined.
+- Idempotency hashing: `model.HashPayload` takes `[]any` of `CanonicalOp` |
+  `CanonicalEditOp`; legacy payloads encode byte-identically (golden hash
+  `f5bceba8…48ee8`, UT-001). Edits hash the request *as sent* (omitted fields stay
+  omitted), while the stored edit row carries the fully resolved proposed state.
+- Ledger validation order: structural edit checks (zero DB calls) → one config
+  query (`max_group_size`, `allow_edits`) → hash → resolve every edit target
+  (owner-scoped, read-only) → write. A bad target in the last item of a group
+  writes nothing. `ErrEditChangesNothing` fires structurally, before the target
+  lookup. Seven `errors.Is`-able sentinels, re-exported from the root package and
+  `internal/api`.
+- Processor: `netAndReadAccounts` works over virtual legs for singles, edits and
+  groups; Guard 3 CAS runs for every involved account even at net 0; group Guard 2
+  flips are split by `edit_of IS NULL / IS NOT NULL`, each rowcount-checked against
+  its own class. Two edits of one target in a batch are decided sequentially in one
+  transaction. Same-bucket snapshot coalescing: one apply of the delta, or none for a
+  zero delta (`snapshot_rows_touched` observed once per edit).
+- Deferral (edit reaches the leader while its target is still PENDING) is
+  implemented and counted (`balancedb_edit_deferrals_total`), with a drain cursor so
+  a deferred head never starves later work — but it is **unreachable through real
+  inserts**: the `edit_of` FK refuses an uncommitted target outright (no FK wait),
+  and a later-committed edit always has a higher id. Group deferral is checked
+  before any rejection so leg order never changes the outcome. IT-042 /
+  `TestGroupDeferredWhileTargetPending` drive it through `processBatch`; SIM-003
+  asserts the refusal.
+- Decided edit rows (APPLIED **and** INVALID) stamp `confirmed_at` as their decision
+  instant (history `decided_at`); regular INVALID rows keep it NULL as before.
+- HTTP: PATCH and POST structural checks run before any DB access (nil-pool unit
+  tests); PATCH maps an unknown/foreign target to `404`, the same case in a group
+  item is `422 edit target N not found`; `403` when editing is disabled. Replay with
+  `wait_ms > 0` and a decided edit returns `200` (mirrors POST /transactions).
+  `POST /transactions` item schema now has `account`/`amount`/`effective_at`
+  optional (edit items may omit them); the handler refuses a *new* item missing one
+  with `400` — previously the schema's `422` (recorded in ADR-0010; release note).
+- OpenAPI: `Rejection.account/limit_side/shortfall` became optional (`omitempty`;
+  the new codes `TARGET_NOT_EDITABLE`/`STALE_REVISION` cannot carry them).
+  `oasdiff breaking` against the pre-feature baseline reports exactly nine
+  `response-property-became-optional` — accepted in ADR-0010 (`LIMIT_VIOLATED` JSON
+  is byte-identical). Everything else is additive (2 endpoints, optional
+  request/response properties).
+- Simulation: the generator emits single edits (`actEdit`) and grouped/mixed edits
+  (`actEditGroup`); the reference mirrors ledger registration and both decision paths
+  (`decideEdit`, `decideGroup` with edit legs); every tier prints its action mix and
+  fails if any edit class is absent; the fidelity tier compares current columns,
+  `revision`, `edit_of` and every `operation_revisions` row through the id map
+  (ADR-0006 updated).
+- Docs (this task): README "Editing operations" section, behavioral `config` knob
+  table with `allow_edits`, metric rows (`decisions_total{kind=edit}`,
+  `edit_deferrals_total`), simulation coverage; spec consistency pass (§8.3 Guard 2
+  wording matched to the code, §10.1 item shape pointer, §12 deferral row);
+  CLAUDE.md §1/§4/§5 refreshed (119 lines, AGENTS.md symlink intact);
+  `docs/embedding.md` had gained its edit section in task 05.
+
+Validation — full gate set on the final tree (all tasks 01–06 applied), fresh
+throwaway `postgres:17-alpine` on 127.0.0.1:55445, `GOFLAGS=-count=1` so nothing
+was served from the Go test cache (a first pass without it returned 21 cached
+packages in under a second — not evidence):
+- `make lint` → `0 issues.` exit 0, 0.4s (gofumpt + golangci-lint go vet across
+  `itest`/`simtest` tags + `check-docs`).
+- `make test` → exit 0, 2.9s; in-memory breadth tier 1,200 seeds, action mix
+  `insert=86743 replay=19185 conflict=14168 reversal=33604 set_limits=29079
+  edit=33434 edit_group=7901 edit_group_mixed=15886`.
+- `make itest` → exit 0, 29.0s (api 28.2s, processor 6.5s, root 2.2s, ledger 1.9s,
+  lease 1.4s, migrate 1.2s, notify 0.7s, snapshot 0.4s).
+- `make simtest` → exit 0, 49.0s (`ok simtest 48.6s`: full-scenario DB fidelity,
+  batch-boundary crash, competing leaders, zombie leader, Guard-3 race, SIM-003
+  host-registration edit visibility).
+- `make openapi` → exit 2 at the **drift step only**: `api/openapi.yaml` is
+  regenerated but uncommitted, so `git diff --quiet` vs the index fails by
+  construction until the feature is committed (tasks 01/04/05 saw the same). The two
+  facts the gate protects were proven directly: `make openapi-gen` is idempotent
+  (sha256 `a28c86f5c7574482…` before and after), and `oasdiff breaking
+  HEAD:api/openapi.yaml → api/openapi.yaml` = the 9 accepted Rejection relaxations,
+  0 others (exit 0 — the Makefile passes no `--fail-on`, so the check is
+  informational). Expected to be green on the first `make openapi` after commit.
+- Every task's own evidence (unit/integration/simulation IDs) is listed per task in
+  `.compozy/tasks/operation-editing/memory/task_0N.md`; all were re-run here as part
+  of the full suites above.
+
+Deferred/known issues:
+- `go build ./...` fails in `simtest` at HEAD and after this feature (the non-test
+  file `generate.go` uses `ptr`/`uuid` helpers defined in `_test.go` files; the
+  package only ever compiles with tests). `go vet`/`make lint` (which vet with test
+  files) and every `make` gate are unaffected. Pre-existing; a small cleanup for
+  whoever next touches `simtest`.
+- `oasdiff breaking` is still not wired into CI (M13 deferral) and, locally, does not
+  fail `make openapi` (no `--fail-on`). If a future change wants it blocking, add
+  `--fail-on ERR` and an exclusion (or a regenerated baseline) for the nine accepted
+  Rejection relaxations first.
+- The processor never reads `allow_edits` (by design: registered edits are always
+  decided); the ledger reads it in its own `selectConfig` into a local. The
+  `model.Config.AllowEdits` field exists but no `readConfig` scans it yet.
+- Deferral remains a defensive path with no organic reproduction; keep IT-042 and
+  `TestGroupDeferredWhileTargetPending` as its only proof.
+
+Notes for next agents:
+- Release notes for 1.1.0: PATCH/history endpoints and `edit_of` items are additive;
+  `Rejection` optional fields; **behavior change** — a `POST /transactions` new item
+  missing `account`/`amount`/`effective_at` is now `400` (was `422`); migration 0002
+  is additive and forward-only, safe under both upgrade paths (README).
+- Adding migration `0003+`: bump `latestVersion` in
+  `internal/migrate/migrate_itest_test.go`.
+- Any change to `HashPayload` must keep the UT-001 golden hash; any change to
+  `model.Rejection` needs `make openapi-gen` + commit of `api/openapi.yaml`.
+- `simtest/reference.go:canonicalOps` must stay a mirror of
+  `internal/ledger/insert.go:canonicalOps`.
+- The `outcomes` NOTIFY channel is per database: itest listeners must skip foreign
+  payloads because packages run in parallel against one `TEST_DATABASE_URL`.
+- Environment: toolchain bootstrap is `export PATH="$HOME/sdk/go/bin:$HOME/go/bin:$HOME/bin:$PATH"`
+  (go 1.25, make, gofumpt, golangci-lint v2.5.0); `oasdiff` is now installed in
+  `$HOME/go/bin` (`go install github.com/oasdiff/oasdiff@latest`, task 04). No
+  Postgres listens on 5432 here; every task used a throwaway `postgres:17-alpine`
+  container (ports 55440–55445) and removed it afterwards — this task's
+  `balancedb-task06-pg` on 55445 included. The unrelated Postgres/compose containers
+  on this box were left untouched. The whole feature is uncommitted on `master`;
+  commit and PR belong to the next surface.
+
+Rebase note (2026-09-16): this work was rebased onto the merged embedded account and
+query API (ADR-0009), which is why editing is ADR-0010. The edit fields (`edit_of`,
+`expected_revision`, `revision`, current `account`/`amount`/`effective_at`) were
+folded into the shared `ledger.OperationOutcome` / `TransactionOutcome` /
+`StatementEntry` types so HTTP and embedded Go read them from one query core; the
+API-side SQL that task 04 had added for those reads was dropped in favour of it.
+All gates were re-run green on the rebased tree.

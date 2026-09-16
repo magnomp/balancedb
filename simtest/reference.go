@@ -20,14 +20,35 @@ const DefaultMaxGroupSize = 10
 // (G4: order by (effective_at, id)) and its reversal metadata; neither influences
 // the decision (a reversal is an ordinary operation validated against limits,
 // spec §5.4/N3).
+//
+// EditOf set marks an edit registration (ADR-0010): AccountID, Amount and
+// EffectiveAt then hold the full proposed state resolved at registration, and
+// ExpectedRevision the optional optimistic guard. On a regular operation Revision
+// is the current revision (1 until the first applied edit); it is unused (1) on
+// edit rows. An applied edit overwrites its target's current columns in place —
+// the timeline then orders the target by its new effective_at with its original
+// id — and appends the superseded state to Model.revisions.
 type refOp struct {
-	ID            int64
-	AccountID     int64
-	Amount        int64
-	EffectiveAt   time.Time
-	ReversalOf    *int64
-	TransactionID *int64
-	Status        model.OpStatus
+	ID               int64
+	AccountID        int64
+	Amount           int64
+	EffectiveAt      time.Time
+	ReversalOf       *int64
+	TransactionID    *int64
+	Status           model.OpStatus
+	EditOf           *int64
+	ExpectedRevision *int32
+	Revision         int32
+}
+
+// refRevision is one superseded state of a regular operation — a row of
+// operation_revisions — appended when an edit applies and never changed again.
+type refRevision struct {
+	Revision     int32
+	AccountID    int64
+	Amount       int64
+	EffectiveAt  time.Time
+	SupersededBy int64
 }
 
 // refTx is one recorded group transaction.
@@ -56,6 +77,9 @@ type refAccount struct {
 // is the source of truth later milestones assert the database against.
 type Model struct {
 	MaxGroupSize int
+	// AllowEdits mirrors config.allow_edits (ADR-0010): false refuses new edit
+	// registrations with ledger.ErrEditsDisabled; registered edits are still decided.
+	AllowEdits bool
 
 	// IDs are allocated at insertion, but only committed rows can be decided.
 	// Independent host transactions may expose higher IDs first (ADR-0008).
@@ -69,6 +93,9 @@ type Model struct {
 	accountsByID map[int64]*refAccount
 	ops          map[int64]*refOp
 	txs          map[int64]*refTx
+	// revisions holds each regular operation's superseded states in revision
+	// order (operation_revisions), appended only by an applied edit.
+	revisions map[int64][]refRevision
 
 	// Idempotency indexes, keyed by idempotency key. singleByKey stores the
 	// operation id + payload hash of a single; groupByKey the transaction id +
@@ -91,11 +118,13 @@ type keyedRecord struct {
 func NewModel() *Model {
 	return &Model{
 		MaxGroupSize: DefaultMaxGroupSize,
+		AllowEdits:   true,
 		uncommitted:  make(map[int64]bool),
 		accounts:     make(map[accountKey]int64),
 		accountsByID: make(map[int64]*refAccount),
 		ops:          make(map[int64]*refOp),
 		txs:          make(map[int64]*refTx),
+		revisions:    make(map[int64][]refRevision),
 		singleByKey:  make(map[string]keyedRecord),
 		groupByKey:   make(map[string]keyedRecord),
 	}
@@ -135,6 +164,9 @@ func (m *Model) OpCount() int { return len(m.ops) }
 // Existing schedules use Insert for immediately committed registration.
 func (m *Model) BeginRegistration(req api.InsertRequest) (*api.InsertResult, error) {
 	for _, op := range req.Operations {
+		if op.EditOf != nil && op.ExternalID == "" {
+			continue // the account comes from the target
+		}
 		if _, ok := m.accounts[accountKey{ownerID: op.OwnerID, externalID: op.ExternalID}]; !ok {
 			return nil, fmt.Errorf("reference: visibility schedule requires preexisting accounts")
 		}
@@ -184,7 +216,12 @@ func (m *Model) RollbackRegistration(result *api.InsertResult) {
 // Insert replays one insertion and returns the same shape of result the real
 // inserter returns, including the same sentinel errors (api.ErrNoOperations,
 // api.ErrInvalidIdempotencyKey, api.ErrMixedOwners, api.ErrGroupTooLarge,
-// api.ErrPayloadConflict, api.ErrZeroAmount).
+// api.ErrPayloadConflict, api.ErrZeroAmount, and the ledger edit sentinels).
+//
+// Edit items (ADR-0010) follow internal/ledger.Insert: structural checks before
+// anything else, the allow_edits policy, hashing as sent, then an owner-scoped
+// target lookup that fills the omitted fields — all before the first row is
+// recorded, so a bad target in the last item of a group records nothing.
 func (m *Model) Insert(req api.InsertRequest) (*api.InsertResult, error) {
 	if len(req.Operations) == 0 {
 		return nil, api.ErrNoOperations
@@ -198,13 +235,21 @@ func (m *Model) Insert(req api.InsertRequest) (*api.InsertResult, error) {
 			return nil, api.ErrMixedOwners
 		}
 	}
+	hasEdits, err := validateEditItems(req.Operations)
+	if err != nil {
+		return nil, err
+	}
 	if len(req.Operations) > m.MaxGroupSize {
 		return nil, fmt.Errorf("%w: %d operations, max %d", api.ErrGroupTooLarge, len(req.Operations), m.MaxGroupSize)
 	}
+	if hasEdits && !m.AllowEdits {
+		return nil, ledger.ErrEditsDisabled
+	}
 	for _, op := range req.Operations {
-		if op.Amount == 0 {
+		if op.EditOf == nil && op.Amount == 0 {
 			// Mirrors the operations.amount CHECK, which the DB enforces atomically
-			// for the whole insert — so nothing is recorded.
+			// for the whole insert — so nothing is recorded. (On an edit item a zero
+			// amount means "unchanged".)
 			return nil, fmt.Errorf("%w", api.ErrZeroAmount)
 		}
 	}
@@ -213,42 +258,136 @@ func (m *Model) Insert(req api.InsertRequest) (*api.InsertResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(req.Operations) == 1 {
-		return m.insertSingle(req, hash)
+	rows, err := m.prepareOps(req.Operations)
+	if err != nil {
+		return nil, err
 	}
-	return m.insertGroup(req, hash)
+	if len(rows) == 1 {
+		return m.insertSingle(req.IdempotencyKey, rows[0], hash)
+	}
+	return m.insertGroup(req.IdempotencyKey, rows, hash)
 }
 
-func (m *Model) insertSingle(req api.InsertRequest, hash []byte) (*api.InsertResult, error) {
-	if rec, ok := m.singleByKey[req.IdempotencyKey]; ok {
+// validateEditItems mirrors internal/ledger.validateEditItems: the structural
+// edit checks that need no state — reversal_of on an edit, expected_revision
+// below 1, an edit that changes nothing, two items editing one target.
+func validateEditItems(ops []api.InsertOp) (hasEdits bool, err error) {
+	seen := make(map[int64]struct{})
+	for _, op := range ops {
+		if op.EditOf == nil {
+			continue
+		}
+		hasEdits = true
+		target := *op.EditOf
+		if op.ReversalOf != nil {
+			return true, fmt.Errorf("%w: target %d", ledger.ErrEditWithReversal, target)
+		}
+		if op.ExpectedRevision != nil && *op.ExpectedRevision < 1 {
+			return true, fmt.Errorf("%w: got %d", ledger.ErrInvalidExpectedRevision, *op.ExpectedRevision)
+		}
+		if op.ExternalID == "" && op.Amount == 0 && op.EffectiveAt.IsZero() {
+			return true, fmt.Errorf("%w: target %d", ledger.ErrEditChangesNothing, target)
+		}
+		if _, dup := seen[target]; dup {
+			return true, fmt.Errorf("%w: %d", ledger.ErrDuplicateEditTarget, target)
+		}
+		seen[target] = struct{}{}
+	}
+	return hasEdits, nil
+}
+
+// writeOp is one item ready to be recorded, mirroring the ledger's writeOp:
+// AccountID is set when the account is already known (a resolved edit whose
+// account is unchanged), otherwise (OwnerID, ExternalID) is upserted at write.
+type writeOp struct {
+	OwnerID          int64
+	ExternalID       string
+	AccountID        int64
+	Amount           int64
+	EffectiveAt      time.Time
+	ReversalOf       *int64
+	EditOf           *int64
+	ExpectedRevision *int32
+}
+
+// prepareOps resolves every edit item against its target — owner-scoped and
+// visibility-aware (an uncommitted target is not found, exactly as the ledger's
+// SELECT cannot see it) — filling the omitted fields, before anything is
+// recorded. Regular items pass through unchanged.
+func (m *Model) prepareOps(ops []api.InsertOp) ([]writeOp, error) {
+	out := make([]writeOp, len(ops))
+	for i, op := range ops {
+		if op.EditOf == nil {
+			out[i] = writeOp{OwnerID: op.OwnerID, ExternalID: op.ExternalID, Amount: op.Amount, EffectiveAt: op.EffectiveAt, ReversalOf: op.ReversalOf}
+			continue
+		}
+		target, ok := m.ops[*op.EditOf]
+		if !ok || m.uncommitted[*op.EditOf] || m.ownerOf(target.AccountID) != op.OwnerID {
+			return nil, fmt.Errorf("%w: %d", ledger.ErrEditTargetNotFound, *op.EditOf)
+		}
+		if target.EditOf != nil {
+			return nil, fmt.Errorf("%w: %d", ledger.ErrEditTargetNotOperation, *op.EditOf)
+		}
+		w := writeOp{
+			OwnerID: op.OwnerID, AccountID: target.AccountID, Amount: op.Amount, EffectiveAt: op.EffectiveAt,
+			EditOf: op.EditOf, ExpectedRevision: op.ExpectedRevision,
+		}
+		if op.ExternalID != "" {
+			w.AccountID = 0
+			w.ExternalID = op.ExternalID
+		}
+		if op.Amount == 0 {
+			w.Amount = target.Amount
+		}
+		if op.EffectiveAt.IsZero() {
+			w.EffectiveAt = target.EffectiveAt
+		}
+		out[i] = w
+	}
+	return out, nil
+}
+
+// accountIDFor resolves the account a row is recorded against: the id already
+// carried by the item, otherwise the on-demand upsert of (owner, external_id).
+func (m *Model) accountIDFor(op writeOp) int64 {
+	if op.AccountID != 0 {
+		return op.AccountID
+	}
+	return m.upsertAccount(op.OwnerID, op.ExternalID)
+}
+
+func (m *Model) insertSingle(key string, op writeOp, hash []byte) (*api.InsertResult, error) {
+	if rec, ok := m.singleByKey[key]; ok {
 		if !bytes.Equal(rec.hash, hash) {
 			return nil, api.ErrPayloadConflict
 		}
-		op := m.ops[rec.id]
+		existing := m.ops[rec.id]
 		return &api.InsertResult{
-			Operations: []api.OpOutcome{{ID: op.ID, Status: string(op.Status)}},
+			Operations: []api.OpOutcome{{ID: existing.ID, Status: string(existing.Status), EditOf: existing.EditOf}},
 			Replayed:   true,
 		}, nil
 	}
 
-	op := req.Operations[0]
-	accountID := m.upsertAccount(op.OwnerID, op.ExternalID)
+	accountID := m.accountIDFor(op)
 	m.nextOpID++
-	rec := &refOp{ID: m.nextOpID, AccountID: accountID, Amount: op.Amount, EffectiveAt: op.EffectiveAt, ReversalOf: op.ReversalOf, Status: model.OpPending}
+	rec := &refOp{
+		ID: m.nextOpID, AccountID: accountID, Amount: op.Amount, EffectiveAt: op.EffectiveAt, ReversalOf: op.ReversalOf,
+		Status: model.OpPending, EditOf: op.EditOf, ExpectedRevision: op.ExpectedRevision, Revision: 1,
+	}
 	m.ops[rec.ID] = rec
-	m.singleByKey[req.IdempotencyKey] = keyedRecord{id: rec.ID, hash: hash}
-	return &api.InsertResult{Operations: []api.OpOutcome{{ID: rec.ID, Status: string(model.OpPending)}}}, nil
+	m.singleByKey[key] = keyedRecord{id: rec.ID, hash: hash}
+	return &api.InsertResult{Operations: []api.OpOutcome{{ID: rec.ID, Status: string(model.OpPending), EditOf: op.EditOf}}}, nil
 }
 
-func (m *Model) insertGroup(req api.InsertRequest, hash []byte) (*api.InsertResult, error) {
-	if rec, ok := m.groupByKey[req.IdempotencyKey]; ok {
+func (m *Model) insertGroup(key string, ops []writeOp, hash []byte) (*api.InsertResult, error) {
+	if rec, ok := m.groupByKey[key]; ok {
 		if !bytes.Equal(rec.hash, hash) {
 			return nil, api.ErrPayloadConflict
 		}
 		tx := m.txs[rec.id]
 		outcomes := make([]api.OpOutcome, len(tx.LegIDs))
 		for i, id := range tx.LegIDs {
-			outcomes[i] = api.OpOutcome{ID: id, Status: string(m.ops[id].Status)}
+			outcomes[i] = api.OpOutcome{ID: id, Status: string(m.ops[id].Status), EditOf: m.ops[id].EditOf}
 		}
 		txID := tx.ID
 		return &api.InsertResult{
@@ -260,19 +399,22 @@ func (m *Model) insertGroup(req api.InsertRequest, hash []byte) (*api.InsertResu
 	}
 
 	m.nextTxID++
-	tx := &refTx{ID: m.nextTxID, OpCount: len(req.Operations), PayloadHash: hash, Status: model.TxPending}
-	outcomes := make([]api.OpOutcome, 0, len(req.Operations))
-	for _, op := range req.Operations {
-		accountID := m.upsertAccount(op.OwnerID, op.ExternalID)
+	tx := &refTx{ID: m.nextTxID, OpCount: len(ops), PayloadHash: hash, Status: model.TxPending}
+	outcomes := make([]api.OpOutcome, 0, len(ops))
+	for _, op := range ops {
+		accountID := m.accountIDFor(op)
 		m.nextOpID++
 		txID := tx.ID
-		rec := &refOp{ID: m.nextOpID, AccountID: accountID, Amount: op.Amount, EffectiveAt: op.EffectiveAt, ReversalOf: op.ReversalOf, TransactionID: &txID, Status: model.OpPending}
+		rec := &refOp{
+			ID: m.nextOpID, AccountID: accountID, Amount: op.Amount, EffectiveAt: op.EffectiveAt, ReversalOf: op.ReversalOf,
+			TransactionID: &txID, Status: model.OpPending, EditOf: op.EditOf, ExpectedRevision: op.ExpectedRevision, Revision: 1,
+		}
 		m.ops[rec.ID] = rec
 		tx.LegIDs = append(tx.LegIDs, rec.ID)
-		outcomes = append(outcomes, api.OpOutcome{ID: rec.ID, Status: string(model.OpPending)})
+		outcomes = append(outcomes, api.OpOutcome{ID: rec.ID, Status: string(model.OpPending), EditOf: op.EditOf})
 	}
 	m.txs[tx.ID] = tx
-	m.groupByKey[req.IdempotencyKey] = keyedRecord{id: tx.ID, hash: hash}
+	m.groupByKey[key] = keyedRecord{id: tx.ID, hash: hash}
 
 	txID := tx.ID
 	return &api.InsertResult{
@@ -378,6 +520,68 @@ func (m *Model) confirmedReversalTargets() []*refOp {
 	return out
 }
 
+// editTargets returns every regular operation (never an edit registration) in id
+// order — the candidate set the generator draws edits from. Any status is
+// eligible: a CONFIRMED target decides on its limits, an INVALID one rejects with
+// TARGET_NOT_EDITABLE, and a PENDING one is decided first by id order.
+func (m *Model) editTargets() []*refOp {
+	var out []*refOp
+	for id := int64(1); id <= m.nextOpID; id++ {
+		op, ok := m.ops[id]
+		if !ok || op.EditOf != nil {
+			continue
+		}
+		out = append(out, op)
+	}
+	return out
+}
+
+// CheckEdits verifies the editing invariants (ADR-0010, spec Safety Invariants
+// 3–5): an edit registration is never CONFIRMED and, once APPLIED, is referenced
+// by exactly one revision of its target; every regular operation's history is
+// dense — revisions 1..revision−1, each superseded by an APPLIED edit of it.
+func (m *Model) CheckEdits() error {
+	supersededBy := make(map[int64]int)
+	for id, op := range m.ops {
+		if op.EditOf != nil {
+			if op.Status == model.OpConfirmed {
+				return fmt.Errorf("edit %d is CONFIRMED; edits are only PENDING|APPLIED|INVALID", id)
+			}
+			if len(m.revisions[id]) != 0 {
+				return fmt.Errorf("edit %d has revisions of its own", id)
+			}
+			continue
+		}
+		revs := m.revisions[id]
+		if int32(len(revs)) != op.Revision-1 {
+			return fmt.Errorf("operation %d at revision %d has %d history rows, want %d", id, op.Revision, len(revs), op.Revision-1)
+		}
+		for i, r := range revs {
+			if r.Revision != int32(i+1) {
+				return fmt.Errorf("operation %d history not dense: row %d has revision %d", id, i, r.Revision)
+			}
+			edit, ok := m.ops[r.SupersededBy]
+			if !ok || edit.EditOf == nil || *edit.EditOf != id || edit.Status != model.OpApplied {
+				return fmt.Errorf("operation %d revision %d superseded by %d, which is not an APPLIED edit of it", id, r.Revision, r.SupersededBy)
+			}
+			supersededBy[r.SupersededBy]++
+		}
+	}
+	for id, op := range m.ops {
+		if op.EditOf == nil {
+			continue
+		}
+		want := 0
+		if op.Status == model.OpApplied {
+			want = 1
+		}
+		if supersededBy[id] != want {
+			return fmt.Errorf("edit %d (%s) supersedes %d revisions, want %d", id, op.Status, supersededBy[id], want)
+		}
+	}
+	return nil
+}
+
 // accountView is a read-only snapshot of an account the generator uses to build
 // state-aware limit changes (a new min/max must bracket the confirmed balance,
 // spec §6).
@@ -416,16 +620,40 @@ func (m *Model) ownerOf(accountID int64) int64 {
 	return 0
 }
 
-func canonicalOps(ops []api.InsertOp) []model.CanonicalOp {
-	out := make([]model.CanonicalOp, len(ops))
+// canonicalOps mirrors internal/ledger.canonicalOps: a regular item is a
+// CanonicalOp (frozen encoding); an edit item is a CanonicalEditOp whose omitted
+// fields stay nil — the hash covers the request as sent.
+func canonicalOps(ops []api.InsertOp) []any {
+	out := make([]any, len(ops))
 	for i, op := range ops {
-		out[i] = model.CanonicalOp{
-			OwnerID:     op.OwnerID,
-			Account:     op.ExternalID,
-			Amount:      op.Amount,
-			EffectiveAt: op.EffectiveAt,
-			ReversalOf:  op.ReversalOf,
+		if op.EditOf == nil {
+			out[i] = model.CanonicalOp{
+				OwnerID:     op.OwnerID,
+				Account:     op.ExternalID,
+				Amount:      op.Amount,
+				EffectiveAt: op.EffectiveAt,
+				ReversalOf:  op.ReversalOf,
+			}
+			continue
 		}
+		edit := model.CanonicalEditOp{
+			OwnerID:          op.OwnerID,
+			EditOf:           *op.EditOf,
+			ExpectedRevision: op.ExpectedRevision,
+		}
+		if op.ExternalID != "" {
+			account := op.ExternalID
+			edit.Account = &account
+		}
+		if op.Amount != 0 {
+			amount := op.Amount
+			edit.Amount = &amount
+		}
+		if !op.EffectiveAt.IsZero() {
+			at := op.EffectiveAt
+			edit.EffectiveAt = &at
+		}
+		out[i] = edit
 	}
 	return out
 }

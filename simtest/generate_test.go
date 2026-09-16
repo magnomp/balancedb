@@ -26,22 +26,33 @@ func envInt(name string, def int) int {
 	return def
 }
 
-// TestFullScenarioReference sweeps the full scenario space against the reference
-// model: limits (tight/loose/one-sided/unbounded), singles, groups (mixed sizes,
-// same-account multi-leg, non-zero-sum), aggressive back/future-dating with day
-// crossings and exact-timestamp ties, reversals (including double-reversals and
-// reversal-after-reject retries), state-aware limit changes, and idempotent
-// replays/conflicts. After every drain it asserts G1 (final balance within limits),
-// G2 (no partially-applied group), G4 (timeline order total and unique), and G6 (no
-// duplicate rows). Every failure prints its seed.
+// TestFullScenarioReference (SIM-001) sweeps the full scenario space against the
+// reference model: limits (tight/loose/one-sided/unbounded), singles, groups
+// (mixed sizes, same-account multi-leg, non-zero-sum), aggressive
+// back/future-dating with day crossings and exact-timestamp ties, reversals
+// (including double-reversals and reversal-after-reject retries), edits — single,
+// grouped and mixed with new operations; amount, account and day-crossing instant
+// changes, expected_revision hits and misses, CONFIRMED / INVALID /
+// already-edited / same-round PENDING targets — state-aware limit changes, and
+// idempotent replays/conflicts. After every drain it asserts G1 (final balance
+// within limits), G2 (no partially-applied group), G4 (timeline order total and
+// unique), G6 (no duplicate rows), and the editing invariants (edits never
+// CONFIRMED, histories dense, one revision per applied edit). It prints the
+// action mix and fails if any edit class never occurred. Every failure prints
+// its seed.
 func TestFullScenarioReference(t *testing.T) {
 	t.Parallel()
 	seeds := envInt("SIMTEST_SEEDS", 1200)
+	mix := actionMix{}
 	for i := 0; i < seeds; i++ {
 		seed := int64(2_000_000 + i)
-		if !runFullScenarioReference(t, seed) {
+		if !runFullScenarioReference(t, seed, mix) {
 			return // the helper reported the failing seed
 		}
+	}
+	t.Logf("action mix over %d seeds: %s", seeds, mix)
+	if missing := mix.missingEdits(); missing != nil {
+		t.Fatalf("the schedule never emitted %v (mix %s)", missing, mix)
 	}
 }
 
@@ -52,7 +63,7 @@ const (
 	movesPerRound = 25
 )
 
-func runFullScenarioReference(t *testing.T, seed int64) bool {
+func runFullScenarioReference(t *testing.T, seed int64, mix actionMix) bool {
 	t.Helper()
 	g := NewGenerator(seed)
 	m := NewModel()
@@ -65,6 +76,7 @@ func runFullScenarioReference(t *testing.T, seed int64) bool {
 
 	for r := 0; r < rounds; r++ {
 		for _, a := range g.Round(m, movesPerRound) {
+			mix.add(a)
 			if err := g.applyToModel(m, a); err != nil {
 				t.Errorf("seed %d round %d: %v", seed, r, err)
 				return false
@@ -78,7 +90,8 @@ func runFullScenarioReference(t *testing.T, seed int64) bool {
 	return true
 }
 
-// checkReferenceInvariants asserts G1, G2, G4, and G6 against the reference model.
+// checkReferenceInvariants asserts G1, G2, G4, G6 and the editing invariants
+// against the reference model.
 func checkReferenceInvariants(t *testing.T, m *Model, seed int64) bool {
 	t.Helper()
 	if err := m.CheckG1(); err != nil {
@@ -90,6 +103,10 @@ func checkReferenceInvariants(t *testing.T, m *Model, seed int64) bool {
 		return false
 	}
 	if err := m.CheckG6(); err != nil {
+		t.Errorf("seed %d: %v", seed, err)
+		return false
+	}
+	if err := m.CheckEdits(); err != nil {
 		t.Errorf("seed %d: %v", seed, err)
 		return false
 	}

@@ -104,7 +104,8 @@ One operation is a single; two or more operations form one atomic ledger group.
 All group operations must have the same `OwnerID`, and `max_group_size` applies.
 Amounts are `int64` minor units and must be nonzero. Accounts are created on demand
 with unbounded limits. Preconfigured accounts retain their limits. Account management and queries are
-available directly in Go as described below. HTTP endpoints use the same core.
+available directly in Go as described below; edits are registered through `Insert` too (next section).
+HTTP endpoints use the same core.
 
 Repeated keys with identical payloads return the original IDs and current status
 with `Replayed=true`. Different payloads return `ErrPayloadConflict`. Use
@@ -116,6 +117,70 @@ balance change was confirmed. A later INVALID operation or REJECTED group does
 not undo the host's committed payment row. Applications should represent that
 pending decision in their workflow. Never wait for a decision inside the inserting
 transaction: the processor cannot see its work until commit.
+
+## Edit an operation in a business transaction
+
+An item with `EditOf` set is an **edit registration** of that operation
+(ADR-0010): the leader applies it in place — same id, new `account`/`amount`/
+`effective_at`, `revision + 1` — and appends the superseded state to the
+append-only `operation_revisions` table. Zero-valued fields mean "unchanged";
+at least one of `Amount`, `EffectiveAt` and `ExternalID` must be set, and
+`ReversalOf` is not allowed on an edit item. The target must be a regular
+operation of the same owner; it is resolved inside the host transaction, so an
+uncommitted target from another transaction is simply not found.
+
+```go
+// Edit one leg inside the host transaction; zero-valued fields mean "unchanged".
+target := int64(41)
+res, err := ledger.Insert(ctx, tx, balancedb.InsertRequest{
+    IdempotencyKey: requestUUID,
+    Operations: []balancedb.InsertOp{
+        {OwnerID: 7, EditOf: &target, Amount: -1200},
+    },
+})
+// res.Operations[0].ID == 57, Status == "PENDING", EditOf == &target
+if err := tx.Commit(ctx); err != nil { return err }
+
+// Grouped: two edits plus a new operation, one atomic unit.
+rev := int32(1)
+res, err = ledger.Insert(ctx, tx, balancedb.InsertRequest{
+    IdempotencyKey: otherUUID,
+    Operations: []balancedb.InsertOp{
+        {OwnerID: 7, EditOf: &target, Amount: -1200},
+        {OwnerID: 7, EditOf: &other, EffectiveAt: newInstant, ExpectedRevision: &rev},
+        {OwnerID: 7, ExternalID: "cash", Amount: 300, EffectiveAt: effectiveAt},
+    },
+})
+```
+
+A single edit item is a single registration, identical to `PATCH /operations/{id}`.
+Two or more items — edits, new operations, or both — form one atomic group with
+exactly the implications a grouped insert has: one owner, `max_group_size`,
+all-or-nothing, and validation on the **net per account** of every change (an
+edit counts as −current +proposed). When decided, the group is `COMMITTED` (edit
+items `APPLIED`, new items `CONFIRMED`) or `REJECTED` (every item `INVALID` with
+one shared rejection: `LIMIT_VIOLATED`, `TARGET_NOT_EDITABLE` when a target
+ended INVALID, or `STALE_REVISION` when `ExpectedRevision` no longer matches).
+Two items may not edit the same operation. An edit registration is never
+CONFIRMED; it never appears in statements or balance sums — only its target does,
+at its current values. `OpOutcome.EditOf` names the target of an edit item.
+
+New exported sentinels, all `errors.Is`-able through the savepoint rollback (the
+host transaction stays usable after any of them): `ErrEditTargetNotFound`
+(unknown or another owner's), `ErrEditTargetNotOperation` (the target is itself
+an edit), `ErrDuplicateEditTarget`, `ErrEditChangesNothing`,
+`ErrInvalidExpectedRevision` (must be ≥ 1), `ErrEditsDisabled` (the cell's
+`config.allow_edits` is false — already registered edits are still decided) and
+`ErrEditWithReversal`. Replays follow the usual idempotency rules: the same key
+with the same edit returns the original id and its current status with
+`Replayed=true`.
+
+Registration success means the edit is **accepted for asynchronous decision**;
+the target keeps its current values until the leader applies it. Read the
+outcome later (`GET /operations/{edit id}`, the group, or the target's
+`/history`). Deciding an edit reads the target's current state, so an edit
+registered while its target is still PENDING is decided after the target, in id
+order.
 
 ## Accounts, balances, statements and outcomes
 

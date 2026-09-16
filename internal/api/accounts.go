@@ -81,6 +81,7 @@ type StatementEntry struct {
 	RunningBalance Amount    `json:"running_balance" doc:"Cumulative confirmed balance up to and including this operation, in timeline order."`
 	TransactionID  *int64    `json:"transaction_id,omitempty"`
 	ReversalOf     *int64    `json:"reversal_of,omitempty"`
+	Revision       int32     `json:"revision" doc:"Current revision of the operation: 1 for a never-edited operation."`
 }
 
 // StatementOutput is a page of the statement plus the cursor for the next page.
@@ -169,7 +170,7 @@ func (s *Server) getStatement(ctx context.Context, in *StatementInput) (*Stateme
 	out.Body.Account, out.Body.NextCursor = value.Account, value.NextCursor
 	out.Body.Entries = make([]StatementEntry, len(value.Entries))
 	for i, e := range value.Entries {
-		out.Body.Entries[i] = StatementEntry{ID: e.ID, Amount: Amount(e.Amount), EffectiveAt: e.EffectiveAt, RunningBalance: Amount(e.RunningBalance), TransactionID: e.TransactionID, ReversalOf: e.ReversalOf}
+		out.Body.Entries[i] = StatementEntry{ID: e.ID, Amount: Amount(e.Amount), EffectiveAt: e.EffectiveAt, RunningBalance: Amount(e.RunningBalance), TransactionID: e.TransactionID, ReversalOf: e.ReversalOf, Revision: e.Revision}
 	}
 	return out, nil
 }

@@ -11,13 +11,17 @@ import (
 // This file is the M10 seeded generator for the full spec §15 scenario space. It
 // emits rounds of Actions — inserts (singles and groups), idempotent replays,
 // payload-conflict retries, reversals (including double-reversals and
-// reversal-after-reject retries), and limit changes — drawn from a seeded PRNG and
-// shaped by the current reference-model state so every one is a valid, state-aware
-// move. The same Action stream drives the pure reference model (breadth: 1,000+
-// seeds under `make test`/`make simtest`) and, in lockstep, the real processor over
-// a throwaway schema (fidelity: the DB-backed tests behind the `simtest` build
-// tag). A generator is fully determined by its seed, so every failure reproduces
-// exactly from the seed the test prints.
+// reversal-after-reject retries), edits (ADR-0010: single, grouped and mixed
+// with new operations; amount, account and day-crossing effective_at changes,
+// expected_revision hits and misses, targets that are CONFIRMED, INVALID,
+// already edited, or still PENDING from the same round), and limit changes —
+// drawn from a seeded PRNG and shaped by the current
+// reference-model state so every one is a valid, state-aware move. The same Action
+// stream drives the pure reference model (breadth: 1,000+ seeds under `make test`/
+// `make simtest`) and, in lockstep, the real processor over a throwaway schema
+// (fidelity: the DB-backed tests behind the `simtest` build tag). A generator is
+// fully determined by its seed, so every failure reproduces exactly from the seed
+// the test prints.
 
 // simOwnerID is the single owner every schedule targets (one owner per cell keeps
 // the sharding invariant, spec §2, trivially satisfied).
@@ -54,7 +58,81 @@ const (
 	actConflict                    // same key, mutated payload (must conflict)
 	actReversal                    // a fresh single reversing a confirmed operation
 	actSetLimits                   // a state-aware limit change
+	actEdit                        // a fresh single edit of a regular operation (ADR-0010)
+	actEditGroup                   // a fresh group of edits, optionally mixed with new operations
 )
+
+// String names an action kind for the action-mix tally the tests print.
+func (k actionKind) String() string {
+	switch k {
+	case actInsert:
+		return "insert"
+	case actReplay:
+		return "replay"
+	case actConflict:
+		return "conflict"
+	case actReversal:
+		return "reversal"
+	case actSetLimits:
+		return "set_limits"
+	case actEdit:
+		return "edit"
+	case actEditGroup:
+		return "edit_group"
+	default:
+		return fmt.Sprintf("kind(%d)", int(k))
+	}
+}
+
+// Mixed reports whether an edit-group action also carries new operations.
+func (a Action) Mixed() bool {
+	if a.Kind != actEditGroup {
+		return false
+	}
+	for _, op := range a.Req.Operations {
+		if op.EditOf == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// actionMix tallies generated actions by kind (edit groups split into pure and
+// mixed) so a sweep can print — and assert — that every class of move, edits
+// included, is present in the schedule it just ran.
+type actionMix map[string]int
+
+func (x actionMix) add(a Action) {
+	name := a.Kind.String()
+	if a.Mixed() {
+		name = "edit_group_mixed"
+	}
+	x[name]++
+}
+
+// String renders the tally in a fixed order.
+func (x actionMix) String() string {
+	out := ""
+	for _, k := range []string{"insert", "replay", "conflict", "reversal", "set_limits", "edit", "edit_group", "edit_group_mixed"} {
+		if out != "" {
+			out += " "
+		}
+		out += fmt.Sprintf("%s=%d", k, x[k])
+	}
+	return out
+}
+
+// missingEdits names the edit classes absent from the tally, or nil when single
+// edits, pure edit groups and mixed groups all occurred.
+func (x actionMix) missingEdits() []string {
+	var missing []string
+	for _, k := range []string{"edit", "edit_group", "edit_group_mixed"} {
+		if x[k] == 0 {
+			missing = append(missing, k)
+		}
+	}
+	return missing
+}
 
 // Action is one generated move. For the insert-family kinds Req carries the
 // request; for actSetLimits Limits carries the change. ExpectReplay/ExpectConflict
@@ -138,14 +216,44 @@ func (g *Generator) smallAmount() int64 {
 	return a
 }
 
+// editCandidate is one regular operation an edit may target: a settled one from
+// the model (any status, any revision) or a fresh regular leg emitted earlier in
+// the same round — its reference id is predictable because the reference
+// allocates ids densely per recorded leg and records nothing on a replay or a
+// conflict — which the drain decides first by id order, so the edit meets it
+// CONFIRMED or INVALID (never PENDING, whose deferral is unreachable through the
+// insertion path: an edit row cannot reference an uncommitted target).
+type editCandidate struct {
+	id       int64
+	ext      string
+	revision int32
+}
+
 // Round produces the next batch of moves, shaped by the current model state m
-// (confirmed balances for limit changes, confirmed operations for reversals). It is
-// called once per drain cycle, so reversals and limit changes always act on settled
-// (drained) state. n is the target number of moves.
+// (confirmed balances for limit changes, confirmed operations for reversals,
+// regular operations for edits). It is called once per drain cycle, so reversals
+// and limit changes always act on settled (drained) state. n is the target number
+// of moves.
 func (g *Generator) Round(m *Model, n int) []Action {
 	actions := make([]Action, 0, n)
 	targets := m.confirmedReversalTargets()
 	views := m.accountViews()
+
+	var editable []editCandidate
+	for _, op := range m.editTargets() {
+		editable = append(editable, editCandidate{id: op.ID, ext: m.accountsByID[op.AccountID].ExternalID, revision: op.Revision})
+	}
+	// nextID predicts the reference id of the next fresh leg emitted this round.
+	nextID := m.nextOpID + 1
+	fresh := func(req api.InsertRequest) {
+		g.history = append(g.history, req)
+		for _, op := range req.Operations {
+			if op.EditOf == nil {
+				editable = append(editable, editCandidate{id: nextID, ext: op.ExternalID, revision: 1})
+			}
+			nextID++
+		}
+	}
 
 	for i := 0; i < n; i++ {
 		roll := g.rng.Intn(100)
@@ -192,7 +300,7 @@ func (g *Generator) Round(m *Model, n int) []Action {
 					ReversalOf:  &revOf,
 				}},
 			}
-			g.history = append(g.history, req)
+			fresh(req)
 			actions = append(actions, Action{Kind: actReversal, Req: req})
 
 		case roll < 40 && len(views) > 0:
@@ -200,13 +308,107 @@ func (g *Generator) Round(m *Model, n int) []Action {
 			v := views[g.rng.Intn(len(views))]
 			actions = append(actions, Action{Kind: actSetLimits, Limits: g.limitChangeFor(v)})
 
+		case roll < 54 && len(editable) > 0:
+			// A single edit of a regular operation (ADR-0010).
+			req := g.editRequest(editable[g.rng.Intn(len(editable))])
+			fresh(req)
+			actions = append(actions, Action{Kind: actEdit, Req: req})
+
+		case roll < 64 && len(editable) > 0:
+			// A group of edits — distinct targets, since two items may not edit one
+			// operation — optionally mixed with new operations (ADR-0010: grouped
+			// edits are literally groups, netted per account, all-or-nothing).
+			req := g.editGroupRequest(editable)
+			fresh(req)
+			actions = append(actions, Action{Kind: actEditGroup, Req: req})
+
 		default:
 			// A fresh single or group.
-			actions = append(actions, Action{Kind: actInsert, Req: g.freshRequest()})
-			g.history = append(g.history, actions[len(actions)-1].Req)
+			req := g.freshRequest()
+			fresh(req)
+			actions = append(actions, Action{Kind: actInsert, Req: req})
 		}
 	}
 	return actions
+}
+
+// editRequest builds one single edit registration of c (editItem): at least one of amount,
+// effective_at (aggressively day-crossing, via effTime) and account (a different
+// scenario account) changes — the omitted ones stay omitted so the ledger fills
+// them from the target and the hash covers the item as sent. With some
+// probability it carries expected_revision: the revision known now (a hit unless
+// an earlier edit of the same target in this round applies first) or one past it
+// (a STALE_REVISION miss).
+func (g *Generator) editRequest(c editCandidate) api.InsertRequest {
+	return api.InsertRequest{IdempotencyKey: g.nextKey(), Operations: []api.InsertOp{g.editItem(c)}}
+}
+
+// editItem builds one edit item of c (see editRequest for the shape).
+func (g *Generator) editItem(c editCandidate) api.InsertOp {
+	target := c.id
+	op := api.InsertOp{OwnerID: g.owner, EditOf: &target}
+	if g.rng.Intn(2) == 0 {
+		op.Amount = g.smallAmount()
+	}
+	if g.rng.Intn(3) == 0 {
+		op.EffectiveAt = g.effTime()
+	}
+	if g.rng.Intn(4) == 0 {
+		ext := scenarioAccounts[g.rng.Intn(len(scenarioAccounts))].ext
+		if ext != c.ext {
+			op.ExternalID = ext
+		}
+	}
+	if op.Amount == 0 && op.EffectiveAt.IsZero() && op.ExternalID == "" {
+		op.Amount = g.smallAmount() // an edit must change something
+	}
+	switch g.rng.Intn(6) {
+	case 0, 1:
+		rev := c.revision
+		op.ExpectedRevision = &rev
+	case 2:
+		rev := c.revision + 1 + int32(g.rng.Intn(2))
+		op.ExpectedRevision = &rev
+	}
+	return op
+}
+
+// editGroupRequest builds one group of 1..3 edits of distinct candidates — each
+// shaped exactly like a single edit (editItem) — and, half the time, 1..2 new
+// operations (newItem) in between, so mixed groups net an edit's virtual legs
+// against fresh legs on the same accounts. A group of one edit plus one new
+// operation is the smallest mixed unit; a lone edit is the single form, covered
+// by actEdit, so a group here always has at least two items.
+func (g *Generator) editGroupRequest(editable []editCandidate) api.InsertRequest {
+	nEdits := 1 + g.rng.Intn(3)
+	if nEdits > len(editable) {
+		nEdits = len(editable)
+	}
+	nNew := 0
+	if nEdits == 1 || g.rng.Intn(2) == 0 {
+		nNew = 1 + g.rng.Intn(2)
+	}
+	// Distinct targets: draw without replacement from a shuffled index.
+	perm := g.rng.Perm(len(editable))[:nEdits]
+	ops := make([]api.InsertOp, 0, nEdits+nNew)
+	for _, i := range perm {
+		ops = append(ops, g.editItem(editable[i]))
+	}
+	for i := 0; i < nNew; i++ {
+		at := g.rng.Intn(len(ops) + 1) // anywhere in the group, edits and new legs interleaved
+		ops = append(ops[:at], append([]api.InsertOp{g.newItem()}, ops[at:]...)...)
+	}
+	return api.InsertRequest{IdempotencyKey: g.nextKey(), Operations: ops}
+}
+
+// newItem builds one fresh regular operation item.
+func (g *Generator) newItem() api.InsertOp {
+	return api.InsertOp{
+		OwnerID:     g.owner,
+		ExternalID:  scenarioAccounts[g.rng.Intn(len(scenarioAccounts))].ext,
+		Amount:      g.smallAmount(),
+		EffectiveAt: g.effTime(),
+	}
 }
 
 // freshRequest builds a fresh single (1 leg) or group (2..4 legs, mixed accounts,
@@ -218,12 +420,7 @@ func (g *Generator) freshRequest() api.InsertRequest {
 	}
 	ops := make([]api.InsertOp, nLegs)
 	for i := range ops {
-		ops[i] = api.InsertOp{
-			OwnerID:     g.owner,
-			ExternalID:  scenarioAccounts[g.rng.Intn(len(scenarioAccounts))].ext,
-			Amount:      g.smallAmount(),
-			EffectiveAt: g.effTime(),
-		}
+		ops[i] = g.newItem()
 	}
 	return api.InsertRequest{IdempotencyKey: g.nextKey(), Operations: ops}
 }
@@ -274,7 +471,7 @@ func (g *Generator) applyToModel(m *Model, a Action) error {
 			return fmt.Errorf("conflict expected, got success")
 		}
 		return nil
-	default: // actInsert, actReversal
+	default: // actInsert, actReversal, actEdit, actEditGroup
 		if _, err := m.Insert(a.Req); err != nil {
 			return fmt.Errorf("insert errored: %w", err)
 		}

@@ -42,3 +42,8 @@ explains it, that is a bug in either the code or the log.
 - [0009 — Embedded account and query API](0009-embedded-account-and-query-api.md)
   — shared HTTP/Go account and query core, consistent read snapshots, and
   initial zero-balance validation on account creation.
+- [0010 — Operation editing](0010-operation-editing.md) — edits are registration rows
+  in `operations` decided by the leader as two virtual legs; the target's current row
+  is overwritten under a revision CAS and every superseded state is appended to
+  `operation_revisions`; the immutability inviolable is restated as "history
+  append-only".

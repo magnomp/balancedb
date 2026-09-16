@@ -6,6 +6,13 @@
 limits G3 to ID-ordered selection of committed work visible to each work query;
 overlapping insertion transactions may change decision order and acceptance.
 
+**Contract refinement — 2026-09-15:** [ADR-0010](decisions/0009-operation-editing.md)
+adds in-place editing: an edit is a registration row decided by the leader as two
+virtual legs; the target's current columns are overwritten under a revision CAS and
+every superseded state is appended to `operation_revisions`. Principle 5 becomes
+"history append-only", G4 gains the "moved by a confirmed edit" clause, N7 is added,
+and §5.2–§5.4, §7.2 and §8 gain the edit rules.
+
 ---
 
 ## 1. Purpose
@@ -62,7 +69,7 @@ The deployment unit is a **cell**. A cell serves a disjoint set of owners (users
 
 4. **Facts are written once; derivations are computed on read.** No back-pointers, no flags on existing rows, no stored values a query can derive.
 
-5. **Immutability.** Operations are never mutated after their facts are set. Cancellation is a new opposite operation.
+5. **Immutability of history (ADR-0010).** An operation's history is append-only: its registration id, `transaction_id`, `reversal_of` and `registered_at` never change, its status flips once, and every superseded state is kept forever in `operation_revisions`. The `operations` row is the *current projection*: a CONFIRMED operation's `account_id`, `amount` and `effective_at` may be overwritten only by the leader applying an edit registration under the revision CAS, in the same transaction that appends the superseded state. Cancellation is still a new opposite operation (reversal); correction is an edit.
 
 ## 4. Consistency Contract
 
@@ -76,7 +83,7 @@ Publish to client teams verbatim.
 
 - **G3 — Ordered visible work (ADR-0008).** Each work query selects committed PENDING operations visible to that query in ascending registration ID order. A group is selected at its first leg. Across overlapping insertion transactions, this does not guarantee global decision order by ID or commit time: lower IDs committed after a work query may be decided after higher IDs it already fetched. Acceptance can depend on transaction visibility and processor timing. Sequential insertion commits retain ID-ordered acceptance.
 
-- **G4 — Deterministic, immutable ordering.** Timeline order is `(effective_at, registration id)` — total, unique, fixed at insert.
+- **G4 — Deterministic, immutable ordering.** Timeline order is `(effective_at, registration id)` — total, unique, fixed at insert. An operation moves on the timeline only when a confirmed edit changes its `effective_at` (ADR-0010); it keeps its registration id as the tiebreaker, so the order stays total and unique.
 
 - **G5 — Eventual decision, no timeouts.** Every operation is eventually CONFIRMED or INVALID; nothing is ever aborted for taking too long.
 
@@ -95,6 +102,8 @@ Publish to client teams verbatim.
 - **N5 — Future-dated operations enter the final balance immediately upon confirmation** (and are invisible to point-in-time reads at "now"). BalanceDB does not schedule; the client inserts when the date arrives if scheduling semantics are wanted.
 
 - **N6 — No global decision ordering across overlapping insertion transactions (ADR-0008).** Inserting at the end of a short transaction reduces the risk of a later ID being decided first, but cannot eliminate it. A late commit never revisits terminal rejections, including rejected groups. Balance limits, group atomicity, and `(effective_at, id)` timeline ordering remain enforced.
+
+- **N7 — Reversals and edits do not track each other (ADR-0010).** `reversal_of` is inert metadata: editing an operation never adjusts a reversal that points at it, and editing a reversal never adjusts its original. A client that edits a reversed operation owns the follow-up.
 
 ## 5. Data Model
 
@@ -182,7 +191,23 @@ CREATE TABLE operations (
 
   registered_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-  confirmed_at        TIMESTAMPTZ NULL
+  confirmed_at        TIMESTAMPTZ NULL,       -- decision instant of CONFIRMED and APPLIED rows, and of INVALID edit rows
+
+  -- Editing (ADR-0010, migration 0002):
+
+  edit_of             BIGINT NULL REFERENCES operations(id),  -- set: this row is an edit registration of that operation
+
+  expected_revision   INT    NULL,            -- optional optimistic guard on an edit row (>= 1)
+
+  revision            INT    NOT NULL DEFAULT 1,  -- current revision of a regular operation (unused, 1, on edit rows)
+
+  revised_at          TIMESTAMPTZ NULL,       -- when the current revision became current (NULL = never edited)
+
+  CHECK (edit_of IS NULL OR reversal_of IS NULL),
+
+  CHECK (edit_of IS NULL OR edit_of <> id),
+
+  CHECK (expected_revision IS NULL OR expected_revision >= 1)
 
 );
 
@@ -201,6 +226,30 @@ CREATE UNIQUE INDEX idx_ops_reversal ON operations (reversal_of)
 CREATE UNIQUE INDEX idx_ops_idem ON operations (idempotency_key)
 
   WHERE idempotency_key IS NOT NULL;
+
+CREATE INDEX idx_ops_edit_of ON operations (edit_of) WHERE edit_of IS NOT NULL;  -- "which edits target X" (reads only)
+
+CREATE TABLE operation_revisions (   -- append-only: one row per SUPERSEDED state (ADR-0010)
+
+  operation_id  BIGINT NOT NULL REFERENCES operations(id),
+
+  revision      INT    NOT NULL,                 -- the revision being superseded
+
+  account_id    BIGINT NOT NULL REFERENCES accounts(id),
+
+  amount        BIGINT NOT NULL,
+
+  effective_at  TIMESTAMPTZ NOT NULL,
+
+  recorded_at   TIMESTAMPTZ NOT NULL,            -- when this revision became current
+
+  superseded_by BIGINT NOT NULL REFERENCES operations(id),  -- the APPLIED edit row
+
+  superseded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  PRIMARY KEY (operation_id, revision)
+
+);
 
 CREATE TABLE balance_snapshots (
 
@@ -236,7 +285,9 @@ CREATE TABLE config (             -- single row; hot-reloaded every cycle
 
   max_group_size    INT NOT NULL DEFAULT 10,
 
-  api_max_wait_ms   INT NOT NULL DEFAULT 30000
+  api_max_wait_ms   INT NOT NULL DEFAULT 30000,
+
+  allow_edits       BOOLEAN NOT NULL DEFAULT TRUE  -- FALSE refuses new edit registrations (ADR-0010)
 
 );
 
@@ -250,15 +301,23 @@ Operation:    PENDING ──► CONFIRMED            Transaction: PENDING ──
 
                       └─► INVALID  (terminal)                       └─► REJECTED (terminal)
 
+Edit registration (edit_of set, ADR-0010):
+
+              PENDING ──► APPLIED  (terminal)
+
+                      └─► INVALID  (terminal)
+
 ```
 
-`INVALID` / `REJECTED` are terminal; recovery is client re-submission. All operations of a group flip together with their transaction row, in one DB transaction.
+`INVALID` / `APPLIED` / `REJECTED` are terminal; recovery is client re-submission. All operations of a group flip together with their transaction row, in one DB transaction (`COMMITTED` means every regular leg CONFIRMED and every edit leg APPLIED). An edit registration is never CONFIRMED, so every read that selects CONFIRMED rows excludes edits without a query change. Applying an edit also bumps the target's `revision` and sets `revised_at`, the only post-decision change a regular row ever sees.
 
 ### 5.4 Ordering and reversals
 
 Timeline order is the composite key `(effective_at, id)` — deterministic, unique, free (the registration id already exists at insert). There is no rank generation, no linked list, and **no per-operation running-balance column**: running balances are derived on read (§9), which is what makes backdating cheap (§8.4).
 
 A reversal is an ordinary operation with the opposite amount, typically the original's `effective_at`, and `reversal_of` set at insertion — immutable metadata, unused by the engine. Nothing is ever written to the reversed operation; "was it reversed?" is derived by querying the index. The partial unique index blocks double reversal while allowing a retry after a *rejected* reversal.
+
+**Edits (ADR-0010).** An edit is a registration row with `edit_of = <target>` carrying the full proposed state (`account_id`, `amount`, `effective_at`; omitted fields are resolved from the target's current row at submission, so the hash covers the request as sent) and an optional `expected_revision`. The target must exist, belong to the same owner, and be a regular operation; one request may edit a given operation at most once; `reversal_of` is never set on an edit. Registration id, owner, `transaction_id`, `reversal_of` and `registered_at` are never editable. Editing and reversing are independent (N7): a client corrects by editing and cancels by reversing. When an applied edit changes `effective_at` the operation moves to its new timeline position with its original id as the tiebreaker (G4). `config.allow_edits = false` refuses new edit registrations; edits already registered are still decided.
 
 ## 6. Balances & Validation
 
@@ -328,6 +387,18 @@ COMMIT;
 
 ```
 
+Deciding an edit registration (ADR-0010) keeps all three guards — Guard 2 flips the edit row `PENDING → APPLIED` and Guard 3 runs per involved account with the net of the edit's virtual legs — and adds a fourth rowcount-checked write on the target, the **revision CAS**:
+
+```sql
+
+UPDATE operations SET account_id = :new, amount = :new, effective_at = :new,
+
+                      revision = revision + 1, revised_at = now()
+
+ WHERE id = :target AND revision = :revision_read AND status = 'CONFIRMED';   -- 0 rows? rollback
+
+```
+
 ## 8. Processing Algorithm
 
 ### 8.1 Main loop (leader only)
@@ -360,9 +431,20 @@ Work selection orders the committed rows visible to each query by registration I
 
 One DB transaction: read account (balance, version, limits) → binary validation → ACCEPT: apply (§8.4) and flip to CONFIRMED; REJECT: flip to INVALID with reason. No other states exist.
 
+**Edit registration (ADR-0010).** Same transaction shape, with the item expanded into two *virtual legs*. Read the target (`account_id, amount, effective_at, status, revision, registered_at, revised_at`):
+
+- target `PENDING` → the unit is **deferred**: skipped, left PENDING, counted (`balancedb_edit_deferrals_total`), and the batch continues with the next unit; the next select of the same drain starts past it so a deferred head-of-queue never starves later work, and the next cycle decides target and edit in id order. Only reachable when a work query sees an edit whose target it has not decided (overlapping insertion transactions, ADR-0008).
+- target `INVALID` → REJECT with `TARGET_NOT_EDITABLE{operation_id}`.
+- `expected_revision` set and ≠ `revision` → REJECT with `STALE_REVISION{operation_id, expected_revision, actual_revision}`.
+- otherwise the legs are `(−current_amount, current_account, current_effective_at)` and `(+new_amount, new_account, new_effective_at)`, netted per account; every involved account is read and validated in ascending id order (§6), the first violation rejecting with `LIMIT_VIOLATED`.
+
+ACCEPT: flip the edit row `PENDING → APPLIED` (Guard 2); append the superseded state to `operation_revisions` with `recorded_at = COALESCE(target.revised_at, target.registered_at)` and `superseded_by = <edit id>`; overwrite the target under the revision CAS (§7.2); apply each account's net under Guard 3; update snapshots per virtual leg with same-bucket coalescing (§8.4); NOTIFY `op:<edit id>`. REJECT: flip the edit row to INVALID with the reason — no balance, snapshot or revision write, the target untouched. Two edits of one target in one batch are decided sequentially in the same transaction; the second reads the first's result, so its CAS holds.
+
 ### 8.3 Group
 
 One DB transaction for the entire group: load all legs by `transaction_id` (the universe is complete — groups are inserted atomically, §10.1; cross-check `op_count`) → compute net per account → read and validate every involved account → all pass: apply every account's net (each under Guard 3), update snapshots for every leg, flip all legs to CONFIRMED and the transaction to COMMITTED; any fail: flip all legs to INVALID and the transaction to REJECTED with reason. **Group atomicity is simply the DB transaction** — there is no distributed protocol.
+
+**Edit legs (ADR-0010).** A group may mix edit registrations with regular legs. Every edit leg's target is read as in §8.2; any target still PENDING defers the whole group (every leg stays PENDING, one deferral counted, the drain cursor moves past all its legs); then, in leg order, a target that ended INVALID or is not at the leg's `expected_revision` rejects the whole group with `TARGET_NOT_EDITABLE` / `STALE_REVISION` — every leg INVALID with that one reason, no target touched. Otherwise the net per account is taken over all *virtual* legs (one per regular leg, two per edit leg) and validated as above. ACCEPT: Guard 2 flips regular legs `PENDING → CONFIRMED` and edit legs `PENDING → APPLIED` as two conditional updates split by `edit_of IS NULL / IS NOT NULL`, each rowcount-checked against its own class's leg count (so together they cover every leg), then the transaction to COMMITTED; for each edit leg, in leg order, the history row is appended and the target overwritten under the revision CAS (two legs never share a target — refused at registration); Guard 3 runs once per involved account with its net; snapshots update per regular leg and per coalesced edit-leg pair (§8.4); NOTIFY `tx:<id>`. REJECT: the same split flips to INVALID (a rejected edit leg stamps `confirmed_at` as its decision instant, like a rejected single edit) and the transaction to REJECTED. Either every regular leg is CONFIRMED and every edit leg APPLIED, or every leg is INVALID.
 
 ### 8.4 Applying amounts — snapshots
 
@@ -377,6 +459,8 @@ UPDATE balance_snapshots SET balance = balance + :v
 ```
 
 Cost: O(existing snapshot-days after the operation's day). The newest-timestamp common case touches zero rows (O(1)); a 30-day backdate touches ≤ 30 rows. Backdated and future-dated operations need no special code — the day arithmetic places them.
+
+**Edits — same-bucket coalescing (ADR-0010).** An edit's two virtual legs are collapsed before the snapshot writes when they land in the same bucket, i.e. the same account and the same UTC day of `effective_at` (a time change within the day keeps the bucket): a non-zero `new − old` becomes one apply of the delta at the new instant, so the cascade touches each later day once instead of twice; a zero delta writes no snapshot row at all. Different account or different UTC day keeps the two-apply form (`−old` at the old bucket, `+new` at the new one), each cascading over its own day range. Coalescing is an arithmetic identity on the daily cumulative balances; the Guard 3 net on the account is unaffected.
 
 ### 8.5 Batching
 
@@ -410,6 +494,8 @@ Idempotency-Key: <client-generated UUID>          (required)
 
   "wait_ms": 0 }
 
+-- an item may instead be an edit: { "edit_of": <op_id>, "expected_revision"?, "account"?, "amount"?, "effective_at"? }  (§10.3)
+
 ```
 
 - One request = one atomic unit. 1 operation → **single** (no transaction row; key stored on the operation). 2..`max_group_size` → **group** (transaction row + legs, one ACID insert). All legs must belong to **one owner** (the sharding invariant, §2) — enforced here.
@@ -426,7 +512,11 @@ Idempotency-Key: <client-generated UUID>          (required)
 
 GET /transactions/{id}      → group status + per-leg statuses
 
-GET /operations/{id}        → status; if INVALID: reason + offending account/limit detail
+GET /operations/{id}        → status, current account/amount/effective_at, revision (edit rows:
+                              edit_of, expected_revision, proposed state); if INVALID: reason + detail
+
+GET /operations/{id}/history → append-only revisions (oldest first, last = current) + pending and
+                              rejected edits (ADR-0010); 404 for an edit registration id
 
 GET /accounts/{ext}/balance             → final balance
 
@@ -441,6 +531,18 @@ PUT  /accounts/{ext}/limits             → §6 rules, version-guarded
 ```
 
 Rejections always carry a machine-readable reason and detail — a budgeting UI can render "envelope short by 12.00" directly from the API.
+
+### 10.3 Editing (ADR-0010)
+
+```
+
+PATCH /operations/{id}      { "amount"?, "effective_at"?, "account"?, "expected_revision"?, "wait_ms"? }
+
+```
+
+Registers one edit (`Idempotency-Key` required, same rules as §10.1); omitted fields are unchanged and at least one of the first three is required. Returns `{"edit": {id, status, operation_id, rejection?}, "replayed"}` — `202` immediately, or with `wait_ms > 0` the §10.1 wait on `op:<edit id>` → `200` with `APPLIED | INVALID`. Statement entries carry `revision`; edit registrations never appear in statements or balances. `403` when `config.allow_edits` is false; `404` for an unknown or another owner's target.
+
+**Grouped and mixed edits.** A `POST /transactions` item with `edit_of` (plus optional `expected_revision`) is an edit item; `account`, `amount` and `effective_at` are then optional (omitted = unchanged, at least one required) and `reversal_of` is not allowed. Items without `edit_of` are new operations exactly as before — the handler refuses one missing `account`, `amount` or `effective_at` with `400`. One request is one atomic unit with the §10.1 rules (one owner, `max_group_size`, all-or-nothing, net per account, §8.3); two items may not edit the same operation (`422`); an unknown or foreign target is `422` in this context; `403` when `config.allow_edits` is false. Outcomes carry `edit_of` on edit items; `GET /transactions/{id}` legs carry `edit_of` (edit legs) or `revision` (regular legs). A decided group is `COMMITTED` (edit items `APPLIED`, new items `CONFIRMED`) or `REJECTED` (every item `INVALID` with one shared rejection).
 
 ## 11. Scaling Model
 
@@ -472,6 +574,8 @@ Rejections always carry a machine-readable reason and detail — a budgeting UI 
 
 | Lost NOTIFY | A waiting API request | Covered by the polling fallback |
 
+| Edit reaches the leader before its target is decided (overlapping insertion transactions, ADR-0008/0009) | That unit is deferred, counted, left PENDING; work behind it proceeds | Decided in a later cycle in id order once the target is; nothing to operate |
+
 ## 13. Observability (per cell, from day one)
 
 | Metric | Why |
@@ -489,6 +593,10 @@ Rejections always carry a machine-readable reason and detail — a budgeting UI 
 | DB row-writes/s, WAL throughput, fsync latency | Distance to the cell ceiling |
 
 | NOTIFY→outcome lag | API wait health |
+
+| Decisions by kind and outcome (`single`/`group`/`edit` × `confirmed`/`invalid`/`committed`/`rejected`/`applied`) | Edit adoption and rejection mix (ADR-0010) |
+
+| Edit deferrals (`balancedb_edit_deferrals_total`) | A sustained rate means overlapping insertion transactions (ADR-0008); zero is the norm |
 
 ## 14. Key Rationale (why it is this way)
 

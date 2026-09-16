@@ -1,14 +1,21 @@
 package model
 
-// OpStatus is an operation's lifecycle state (spec §5.3). The only transitions
-// are PENDING → CONFIRMED and PENDING → INVALID; INVALID is terminal. Facts are
-// never mutated after they are set (CLAUDE.md inviolables).
+// OpStatus is an operation's lifecycle state (spec §5.3). A regular operation
+// transitions PENDING → CONFIRMED or PENDING → INVALID; an edit registration
+// (operations.edit_of set, ADR-0010) transitions PENDING → APPLIED or
+// PENDING → INVALID. APPLIED and INVALID are terminal. An operation's history is
+// append-only (CLAUDE.md inviolables): only the leader applying an edit may
+// overwrite a CONFIRMED row's current columns, under the revision CAS.
 type OpStatus string
 
 const (
 	OpPending   OpStatus = "PENDING"
 	OpConfirmed OpStatus = "CONFIRMED"
 	OpInvalid   OpStatus = "INVALID"
+	// OpApplied is reached by edit registrations only, never by regular
+	// operations, so every read that selects CONFIRMED rows excludes edits
+	// without a query change.
+	OpApplied OpStatus = "APPLIED"
 )
 
 // TxStatus is a group transaction's lifecycle state (spec §5.3). PENDING →

@@ -26,11 +26,22 @@ var (
 	ErrPayloadConflict       = ledger.ErrPayloadConflict
 	ErrZeroAmount            = ledger.ErrZeroAmount
 	ErrUnsupportedIsolation  = errors.New("balancedb: writes require READ COMMITTED")
+
+	// Edit registrations (InsertOp.EditOf, ADR-0010).
+	ErrEditTargetNotFound      = ledger.ErrEditTargetNotFound
+	ErrEditTargetNotOperation  = ledger.ErrEditTargetNotOperation
+	ErrDuplicateEditTarget     = ledger.ErrDuplicateEditTarget
+	ErrEditChangesNothing      = ledger.ErrEditChangesNothing
+	ErrInvalidExpectedRevision = ledger.ErrInvalidExpectedRevision
+	ErrEditsDisabled           = ledger.ErrEditsDisabled
+	ErrEditWithReversal        = ledger.ErrEditWithReversal
 )
 
 // Insert registers one single operation or an atomic group in a caller-owned
 // READ COMMITTED pgx transaction in this cell's database. Accounts are created on
-// demand with unbounded limits. No REST call or pool checkout occurs.
+// demand with unbounded limits. No REST call or pool checkout occurs. An item
+// with EditOf set registers an edit of that operation (zero-valued fields mean
+// "unchanged"); the leader decides it like any other registration.
 //
 // A savepoint contains all ledger writes and schema changes; an error rolls it
 // back, allowing the host to handle the error without accidentally committing a

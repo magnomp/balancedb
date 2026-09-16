@@ -225,13 +225,19 @@ func TestHTTPFloatAmountRejected(t *testing.T) {
 	}
 }
 
+// A new operation missing one of account/amount/effective_at is refused with
+// 400 by the handler (ADR-0009: the schema leaves the three optional so edit
+// items can omit them; the handler re-imposes them on non-edit items).
 func TestHTTPMissingFieldRejected(t *testing.T) {
 	_, ts, _ := newTestServer(t)
 	// Missing "amount".
 	body := `{"operations":[{"account":"w","effective_at":"2026-08-22T12:00:00Z"}]}`
 	resp, b := doReq(t, ts, http.MethodPost, "/transactions", "1", keyN(21), body)
-	if resp.StatusCode != http.StatusUnprocessableEntity {
-		t.Fatalf("missing amount: status = %d, want 422; body %s", resp.StatusCode, b)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing amount: status = %d, want 400; body %s", resp.StatusCode, b)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "problem+json") {
+		t.Fatalf("missing amount: content-type = %q, want RFC7807 problem+json", ct)
 	}
 }
 

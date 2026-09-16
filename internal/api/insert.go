@@ -23,6 +23,15 @@ var (
 	ErrGroupTooLarge         = ledger.ErrGroupTooLarge
 	ErrPayloadConflict       = ledger.ErrPayloadConflict
 	ErrZeroAmount            = ledger.ErrZeroAmount
+
+	// Edit items (ADR-0009).
+	ErrEditTargetNotFound      = ledger.ErrEditTargetNotFound
+	ErrEditTargetNotOperation  = ledger.ErrEditTargetNotOperation
+	ErrDuplicateEditTarget     = ledger.ErrDuplicateEditTarget
+	ErrEditChangesNothing      = ledger.ErrEditChangesNothing
+	ErrInvalidExpectedRevision = ledger.ErrInvalidExpectedRevision
+	ErrEditsDisabled           = ledger.ErrEditsDisabled
+	ErrEditWithReversal        = ledger.ErrEditWithReversal
 )
 
 // Insert registers work using the shared core. The caller must roll back tx on

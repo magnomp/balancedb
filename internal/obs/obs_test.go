@@ -43,6 +43,7 @@ func TestNewMetricsRegistersTheSpecSet(t *testing.T) {
 		"balancedb_leadership_changes_total",
 		"balancedb_leader",
 		"balancedb_decisions_total",
+		"balancedb_edit_deferrals_total",
 		"balancedb_snapshot_rows_touched",
 		"balancedb_doorbell_wakeup_lag_seconds",
 		"balancedb_api_wait_seconds",

@@ -117,6 +117,79 @@ components:
         - operations
         - replayed
       type: object
+    EditOperationInputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - https://example.com/schemas/EditOperationInputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        account:
+          description: "External id of an account of the same owner; created on demand with unbounded limits. Omitted: unchanged."
+          minLength: 1
+          type: string
+        amount:
+          description: "New amount (non-zero). Omitted: unchanged."
+          format: int64
+          type: integer
+        effective_at:
+          description: "New timeline instant (RFC 3339), past or future. Omitted: unchanged."
+          format: date-time
+          type: string
+        expected_revision:
+          description: "Optional optimistic guard (>= 1): the edit is rejected with STALE_REVISION unless the operation is at exactly this revision when the edit is decided."
+          format: int32
+          type: integer
+        wait_ms:
+          description: "Optional synchronous wait budget in milliseconds, same semantics as POST /transactions: 0 or omitted returns 202 immediately; > 0 waits up to this many ms (capped by api_max_wait_ms) for the decision — 200 with the decided status if it lands in time, otherwise 202 with the current (still PENDING) state."
+          format: int64
+          minimum: 0
+          type: integer
+      type: object
+    EditOutcome:
+      additionalProperties: false
+      properties:
+        id:
+          description: Registration id of the edit; GET /operations/{id} reads it back.
+          format: int64
+          type: integer
+        operation_id:
+          description: The edited operation (the id in the request path).
+          format: int64
+          type: integer
+        rejection:
+          $ref: "#/components/schemas/Rejection"
+          description: Machine-readable rejection detail; present only when the edit is INVALID.
+        status:
+          description: "Edit status: PENDING | APPLIED | INVALID."
+          type: string
+      required:
+        - id
+        - status
+        - operation_id
+      type: object
+    EditOutputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - https://example.com/schemas/EditOutputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        edit:
+          $ref: "#/components/schemas/EditOutcome"
+        replayed:
+          description: True when this request replayed an existing idempotency key and wrote no new rows (G6).
+          type: boolean
+      required:
+        - edit
+        - replayed
+      type: object
     ErrorDetail:
       additionalProperties: false
       properties:
@@ -210,14 +283,37 @@ components:
           format: uri
           readOnly: true
           type: string
+        account:
+          description: Account external id (current value; for an edit, the proposed one).
+          type: string
+        amount:
+          description: Signed amount in minor units (e.g. cents); positive is a credit, negative a debit. Integer only — fractional or exponent values are rejected. Values are int64 and may exceed JavaScript's safe-integer range (2^53); clients that use JS numbers can lose precision and should treat the field as a string or bigint.
+          format: int64
+          type: integer
+        edit_of:
+          description: "Present only on an edit registration: the operation it edits."
+          format: int64
+          type: integer
+        effective_at:
+          description: Timeline instant (current value; for an edit, the proposed one).
+          format: date-time
+          type: string
+        expected_revision:
+          description: Present only on an edit registration that carries an optimistic guard.
+          format: int32
+          type: integer
         id:
           format: int64
           type: integer
         rejection:
           $ref: "#/components/schemas/Rejection"
-          description: Machine-readable rejection detail; present only when the operation is INVALID.
+          description: Machine-readable rejection detail; present only when the row is INVALID.
+        revision:
+          description: Current revision of a regular operation (1 until its first applied edit); absent on an edit registration.
+          format: int32
+          type: integer
         status:
-          description: "Operation status: PENDING | CONFIRMED | INVALID."
+          description: "Operation status: PENDING | CONFIRMED | INVALID; an edit registration is PENDING | APPLIED | INVALID."
           type: string
         transaction_id:
           description: Group transaction id if this operation is a group leg; absent for a single.
@@ -226,6 +322,9 @@ components:
       required:
         - id
         - status
+        - account
+        - amount
+        - effective_at
       type: object
     GetTransactionOutputBody:
       additionalProperties: false
@@ -264,74 +363,236 @@ components:
     LegStatus:
       additionalProperties: false
       properties:
+        edit_of:
+          description: "Present only on an edit leg: the operation it edits."
+          format: int64
+          type: integer
         id:
           format: int64
           type: integer
         rejection:
           $ref: "#/components/schemas/Rejection"
           description: Machine-readable rejection detail; present only when the group was REJECTED.
+        revision:
+          description: Current revision of a regular leg (1 until its first applied edit); absent on an edit leg.
+          format: int32
+          type: integer
         status:
-          description: "Operation status: PENDING | CONFIRMED | INVALID."
+          description: "Operation status: PENDING | CONFIRMED | INVALID; an edit leg is PENDING | APPLIED | INVALID."
           type: string
       required:
         - id
         - status
       type: object
+    OperationHistoryOutputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - https://example.com/schemas/OperationHistoryOutputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        current_revision:
+          format: int32
+          type: integer
+        operation_id:
+          format: int64
+          type: integer
+        pending_edits:
+          description: Undecided edits targeting this operation, in registration-id order.
+          items:
+            $ref: "#/components/schemas/PendingEdit"
+          type:
+            - array
+            - "null"
+        rejected_edits:
+          description: Rejected (INVALID) edits targeting this operation, in registration-id order.
+          items:
+            $ref: "#/components/schemas/RejectedEdit"
+          type:
+            - array
+            - "null"
+        revisions:
+          description: Ordered by revision; the last entry is the current state.
+          items:
+            $ref: "#/components/schemas/RevisionEntry"
+          type:
+            - array
+            - "null"
+        status:
+          description: "Operation status: PENDING | CONFIRMED | INVALID."
+          type: string
+      required:
+        - operation_id
+        - status
+        - current_revision
+        - revisions
+        - pending_edits
+        - rejected_edits
+      type: object
     OperationInput:
       additionalProperties: false
       properties:
         account:
-          description: Client-defined account external id (unique per owner). Upserted on demand with unbounded limits if it does not exist.
+          description: Client-defined account external id (unique per owner). Upserted on demand with unbounded limits if it does not exist. Required on a new operation; on an edit item, omitted means unchanged.
           minLength: 1
           type: string
         amount:
           description: Signed amount in minor units (e.g. cents); positive is a credit, negative a debit. Integer only — fractional or exponent values are rejected. Values are int64 and may exceed JavaScript's safe-integer range (2^53); clients that use JS numbers can lose precision and should treat the field as a string or bigint.
           format: int64
           type: integer
-        effective_at:
-          description: Timeline timestamp (RFC 3339). May be in the past (backdated) or future; it never affects validation, only where the operation lands on the timeline (§5.4).
-          format: date-time
-          type: string
-        reversal_of:
-          description: Registration id of the operation this reverses. Immutable metadata, unused by the engine (§5.4).
+        edit_of:
+          description: "Makes this item an edit of the named operation (ADR-0010): the group applies it atomically with its other items, netting all changes per account. The target must be a regular operation of this owner; two items may not edit the same operation."
           format: int64
           type: integer
-      required:
-        - account
-        - amount
-        - effective_at
+        effective_at:
+          description: Timeline timestamp (RFC 3339). May be in the past (backdated) or future; it never affects validation, only where the operation lands on the timeline (§5.4). Required on a new operation; on an edit item, omitted means unchanged.
+          format: date-time
+          type: string
+        expected_revision:
+          description: "Edit items only. Optional optimistic guard (>= 1): the group is rejected with STALE_REVISION unless the target is at exactly this revision when decided."
+          format: int32
+          type: integer
+        reversal_of:
+          description: Registration id of the operation this reverses. Immutable metadata, unused by the engine (§5.4). Not allowed on an edit item.
+          format: int64
+          type: integer
       type: object
     OperationOutcome:
       additionalProperties: false
       properties:
+        edit_of:
+          description: "Present only on an edit item: the operation it edits."
+          format: int64
+          type: integer
         id:
           description: Registration id — the global insertion order and the timeline tiebreaker.
           format: int64
           type: integer
         status:
-          description: "Operation status: PENDING | CONFIRMED | INVALID."
+          description: "Operation status: PENDING | CONFIRMED | INVALID; an edit item is PENDING | APPLIED | INVALID."
           type: string
       required:
         - id
         - status
+      type: object
+    PendingEdit:
+      additionalProperties: false
+      properties:
+        account:
+          type: string
+        amount:
+          description: Signed amount in minor units (e.g. cents); positive is a credit, negative a debit. Integer only — fractional or exponent values are rejected. Values are int64 and may exceed JavaScript's safe-integer range (2^53); clients that use JS numbers can lose precision and should treat the field as a string or bigint.
+          format: int64
+          type: integer
+        effective_at:
+          format: date-time
+          type: string
+        expected_revision:
+          format: int32
+          type: integer
+        id:
+          description: Registration id of the edit.
+          format: int64
+          type: integer
+      required:
+        - id
+        - account
+        - amount
+        - effective_at
+      type: object
+    RejectedEdit:
+      additionalProperties: false
+      properties:
+        account:
+          type: string
+        amount:
+          description: Signed amount in minor units (e.g. cents); positive is a credit, negative a debit. Integer only — fractional or exponent values are rejected. Values are int64 and may exceed JavaScript's safe-integer range (2^53); clients that use JS numbers can lose precision and should treat the field as a string or bigint.
+          format: int64
+          type: integer
+        decided_at:
+          format: date-time
+          type: string
+        effective_at:
+          format: date-time
+          type: string
+        expected_revision:
+          format: int32
+          type: integer
+        id:
+          description: Registration id of the edit.
+          format: int64
+          type: integer
+        rejection:
+          $ref: "#/components/schemas/Rejection"
+      required:
+        - id
+        - account
+        - amount
+        - effective_at
+        - decided_at
+        - rejection
       type: object
     Rejection:
       additionalProperties: false
       properties:
         account:
           type: string
+        actual_revision:
+          format: int32
+          type: integer
         code:
           type: string
+        expected_revision:
+          format: int32
+          type: integer
         limit_side:
           type: string
+        operation_id:
+          format: int64
+          type: integer
         shortfall:
           format: int64
           type: integer
       required:
         - code
+      type: object
+    RevisionEntry:
+      additionalProperties: false
+      properties:
+        account:
+          description: Account external id at this revision.
+          type: string
+        amount:
+          description: Signed amount in minor units (e.g. cents); positive is a credit, negative a debit. Integer only — fractional or exponent values are rejected. Values are int64 and may exceed JavaScript's safe-integer range (2^53); clients that use JS numbers can lose precision and should treat the field as a string or bigint.
+          format: int64
+          type: integer
+        effective_at:
+          format: date-time
+          type: string
+        recorded_at:
+          description: "When this revision became current: registration for revision 1, the applying edit's decision instant afterwards."
+          format: date-time
+          type: string
+        revision:
+          format: int32
+          type: integer
+        superseded_at:
+          description: When this revision stopped being current; absent on the current revision.
+          format: date-time
+          type: string
+        superseded_by:
+          description: Registration id of the APPLIED edit that superseded this revision; absent on the current revision.
+          format: int64
+          type: integer
+      required:
+        - revision
         - account
-        - limit_side
-        - shortfall
+        - amount
+        - effective_at
+        - recorded_at
       type: object
     StatementEntry:
       additionalProperties: false
@@ -349,6 +610,10 @@ components:
         reversal_of:
           format: int64
           type: integer
+        revision:
+          description: "Current revision of the operation: 1 for a never-edited operation."
+          format: int32
+          type: integer
         running_balance:
           description: Cumulative confirmed balance up to and including this operation, in timeline order.
           format: int64
@@ -361,6 +626,7 @@ components:
         - amount
         - effective_at
         - running_balance
+        - revision
       type: object
     StatementOutputBody:
       additionalProperties: false
@@ -409,7 +675,7 @@ components:
 info:
   description: "BalanceDB — a Postgres-backed balance-maintenance engine (ledger). Clients insert money operations (singles or atomic groups); a single elected processor selects visible committed work in ID order and validates it so an account's final balance never breaks its configured limits. Insertion is asynchronous: POST /transactions returns 202 and outcomes are queried later."
   title: BalanceDB API
-  version: 1.0.0
+  version: 1.1.0
 openapi: 3.1.0
 paths:
   /accounts:
@@ -615,9 +881,93 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
-      summary: Get an operation's status and, if INVALID, its rejection detail
+      summary: Get an operation's status, current values and revision (or an edit registration's proposed state) and, if INVALID, its rejection detail
       tags:
         - Queries
+    patch:
+      description: "Registers one edit against the operation: a registration in the same id sequence as operations, decided by the processor in registration order like any insert. When applied, the operation's current values change under a new revision and the superseded state is kept in its append-only history (GET /operations/{id}/history); the operation id never changes. Omitted fields are unchanged; at least one of amount, effective_at, account is required. expected_revision (>= 1) makes the edit STALE_REVISION unless the operation is at that revision when decided. By default returns 202 immediately; wait_ms > 0 waits like POST /transactions and returns 200 with the decided status (APPLIED or INVALID with the rejection) if it lands in time. 403 when config.allow_edits is false for the cell; 404 for an unknown or another owner's operation."
+      operationId: editOperation
+      parameters:
+        - description: Owner scope for the request (§2). The target must belong to this owner.
+          in: header
+          name: X-Owner-Id
+          required: true
+          schema:
+            description: Owner scope for the request (§2). The target must belong to this owner.
+            type: string
+        - description: Client-generated UUID. Retrying with the same key never registers a second edit (G6); reusing it with a different payload is rejected with 422.
+          in: header
+          name: Idempotency-Key
+          required: true
+          schema:
+            description: Client-generated UUID. Retrying with the same key never registers a second edit (G6); reusing it with a different payload is rejected with 422.
+            type: string
+        - description: Registration id of the operation to edit.
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Registration id of the operation to edit.
+            format: int64
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EditOperationInputBody"
+        required: true
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EditOutputBody"
+          description: Accepted
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Edit an operation in place (amount, effective_at and/or account)
+      tags:
+        - Editing
+  /operations/{id}/history:
+    get:
+      description: Every state the operation has held, in revision order (the last entry is current); superseded entries name the APPLIED edit that replaced them. pending_edits and rejected_edits list undecided and INVALID edit registrations against the operation in registration-id order. 404 for an unknown id, another owner's id, or an edit registration id.
+      operationId: getOperationHistory
+      parameters:
+        - description: Owner scope (§2).
+          in: header
+          name: X-Owner-Id
+          required: true
+          schema:
+            description: Owner scope (§2).
+            type: string
+        - description: Operation (registration) id. Edit registration ids are not operations and yield 404.
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Operation (registration) id. Edit registration ids are not operations and yield 404.
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationHistoryOutputBody"
+          description: OK
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Get an operation's append-only revision history with its pending and rejected edits
+      tags:
+        - Editing
   /transactions:
     post:
       description: "Registers one atomic unit: a single operation (no transaction row) or a group of 2..max_group_size legs, all belonging to one owner (§2). By default returns 202 immediately (fire-and-forget); the outcome is decided asynchronously and read back via GET /transactions/{id} or GET /operations/{id}. With wait_ms > 0 the call waits up to that budget (capped by api_max_wait_ms) for the decision via LISTEN/NOTIFY with a status-poll fallback: if the outcome is decided in time it returns 200 with the decided status, otherwise 202 with the current (still PENDING) state. Waiting is strictly optional and never guaranteed to return a final outcome."

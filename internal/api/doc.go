@@ -26,4 +26,16 @@
 // current state. wait_ms <= 0 stays fire-and-forget (202) and never touches the
 // notify machinery. The 200/202 split is a runtime status override; the OpenAPI
 // contract advertises 202 as the declared response.
+//
+// Operation editing (ADR-0010) adds PATCH /operations/{id} — one edit item through
+// the same ledger core, mapped to the contract's statuses (404 for an unknown or
+// foreign target, 403 when config.allow_edits is off) and sharing the wait loop
+// (awaitDecision) on 'op:<edit id>' — plus GET /operations/{id}/history over the
+// append-only operation_revisions table. GET /operations/{id} and the statement
+// gain the current values and revision. POST /transactions accepts edit items
+// (edit_of, expected_revision) alongside new operations — one atomic group
+// through the same core, the handler re-imposing account/amount/effective_at on
+// non-edit items before any DB access — and its outcomes and GET
+// /transactions/{id} legs carry edit_of (edit items) / revision (regular legs).
+// Nothing here writes operation_revisions.
 package api
