@@ -35,7 +35,7 @@ type WaitObserver interface {
 // automatically would make the committed spec churn on every build (ADR-0003).
 const (
 	apiTitle   = "BalanceDB API"
-	apiVersion = "1.1.0"
+	apiVersion = "1.2.0"
 )
 
 // Server is the HTTP surface of a cell (spec §10), built on Huma v2 over a chi mux
@@ -136,7 +136,7 @@ func (s *Server) register() {
 		OperationID: "getOperation",
 		Method:      http.MethodGet,
 		Path:        "/operations/{id}",
-		Summary:     "Get an operation's status, current values and revision (or an edit registration's proposed state) and, if INVALID, its rejection detail",
+		Summary:     "Get an operation's status, current values and revision (its last values plus deleted_at/deleted_by once DELETED; an edit or delete registration's state as submitted) and, if INVALID, its rejection detail",
 		Tags:        []string{"Queries"},
 	}, s.getOperation)
 
@@ -151,11 +151,21 @@ func (s *Server) register() {
 	}, s.editOperation)
 
 	huma.Register(s.api, huma.Operation{
+		OperationID:   "deleteOperation",
+		Method:        http.MethodDelete,
+		Path:          "/operations/{id}",
+		Summary:       "Delete an operation in place, keeping its trail",
+		Description:   "Registers one delete against the operation: a registration in the same id sequence as operations and edits, decided by the processor in registration order like any insert. When applied, the operation reads DELETED with its last values, deleted_at and deleted_by, leaves every balance, statement and point-in-time projection, and can no longer be edited or deleted; the operation id never changes and nothing is physically removed. There is no request body (one is ignored). expected_revision (>= 1) makes the delete STALE_REVISION unless the operation is at that revision when decided. By default returns 202 immediately; wait_ms > 0 waits like POST /transactions and returns 200 with the decided status (APPLIED or INVALID with the rejection) if it lands in time. 403 when config.allow_deletes is false for the cell; 404 for an unknown or another owner's operation; 422 when the id is an edit or delete registration.",
+		Tags:          []string{"Deleting"},
+		DefaultStatus: http.StatusAccepted,
+	}, s.deleteOperation)
+
+	huma.Register(s.api, huma.Operation{
 		OperationID: "getOperationHistory",
 		Method:      http.MethodGet,
 		Path:        "/operations/{id}/history",
-		Summary:     "Get an operation's append-only revision history with its pending and rejected edits",
-		Description: "Every state the operation has held, in revision order (the last entry is current); superseded entries name the APPLIED edit that replaced them. pending_edits and rejected_edits list undecided and INVALID edit registrations against the operation in registration-id order. 404 for an unknown id, another owner's id, or an edit registration id.",
+		Summary:     "Get an operation's append-only revision history with its pending and rejected edits and deletes",
+		Description: "Every state the operation has held, in revision order (the last entry is current — the last values once DELETED, when deleted_at/deleted_by name the applied delete); superseded entries name the APPLIED edit that replaced them. pending_edits and rejected_edits list undecided and INVALID edit and delete registrations against the operation in registration-id order, each tagged with its kind. 404 for an unknown id, another owner's id, or an edit or delete registration id.",
 		Tags:        []string{"Editing"},
 	}, s.getOperationHistory)
 

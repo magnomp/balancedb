@@ -25,6 +25,21 @@ func TestLoadMigrations(t *testing.T) {
 	if migs[0].sql == "" {
 		t.Fatal("first migration has empty SQL body")
 	}
+
+	// The embedded set is exactly 0001..0003, each with a non-empty body: a
+	// new migration file updates this list (forward-only, never renumbered).
+	want := []string{"0001_init.sql", "0002_operation_edits.sql", "0003_operation_deletes.sql"}
+	if len(migs) != len(want) {
+		t.Fatalf("embedded migrations = %d, want %d", len(migs), len(want))
+	}
+	for i, name := range want {
+		if migs[i].name != name || migs[i].version != i+1 {
+			t.Errorf("migration %d = %q (version %d), want %q (version %d)", i, migs[i].name, migs[i].version, name, i+1)
+		}
+		if migs[i].sql == "" {
+			t.Errorf("migration %q has empty SQL body", name)
+		}
+	}
 }
 
 func TestParseVersion(t *testing.T) {

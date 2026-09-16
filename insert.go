@@ -35,13 +35,33 @@ var (
 	ErrInvalidExpectedRevision = ledger.ErrInvalidExpectedRevision
 	ErrEditsDisabled           = ledger.ErrEditsDisabled
 	ErrEditWithReversal        = ledger.ErrEditWithReversal
+
+	// Delete registrations (InsertOp.DeleteOf, ADR-0011). The target sentinels
+	// above are shared: a delete names an operation exactly as an edit does.
+	ErrDeleteWithFields = ledger.ErrDeleteWithFields
+	ErrDeletesDisabled  = ledger.ErrDeletesDisabled
+)
+
+// TargetError is the wrapper the ledger puts around a shared target sentinel
+// (ErrEditTargetNotFound, ErrEditTargetNotOperation, ErrDuplicateEditTarget);
+// errors.As yields the offending item's Kind (TargetEdit or TargetDelete) and
+// Target id while errors.Is still matches the sentinel.
+type (
+	TargetError = ledger.TargetError
+	TargetKind  = ledger.TargetKind
+)
+
+const (
+	TargetEdit   = ledger.TargetEdit
+	TargetDelete = ledger.TargetDelete
 )
 
 // Insert registers one single operation or an atomic group in a caller-owned
 // READ COMMITTED pgx transaction in this cell's database. Accounts are created on
 // demand with unbounded limits. No REST call or pool checkout occurs. An item
 // with EditOf set registers an edit of that operation (zero-valued fields mean
-// "unchanged"); the leader decides it like any other registration.
+// "unchanged"); one with DeleteOf set registers its deletion (no other field
+// allowed); the leader decides both like any other registration.
 //
 // A savepoint contains all ledger writes and schema changes; an error rolls it
 // back, allowing the host to handle the error without accidentally committing a

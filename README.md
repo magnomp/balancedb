@@ -98,7 +98,7 @@ the leader (validated against the final-balance limits as `−old` + `+new`, net
 account), and is idempotent under the same `Idempotency-Key` rules. `revision`
 starts at 1 and increments with every applied edit; registration id, owner,
 `transaction_id`, `reversal_of` and `registered_at` are never editable
-(`docs/decisions/0009-operation-editing.md`, spec §10.3).
+(`docs/decisions/0010-operation-editing.md`, spec §10.3).
 
 ```sh
 # One edit: fix -15.00 to -12.00 and wait for the decision (200 = decided).
@@ -127,7 +127,7 @@ curl -s localhost:8080/operations/41/history -H 'X-Owner-Id: 1'
 - **Statuses.** An edit registration goes `PENDING → APPLIED | INVALID` (terminal);
   the target stays `CONFIRMED` and only its current columns, `revision` and
   `revised_at` change. Rejections are `LIMIT_VIOLATED` (as for inserts),
-  `TARGET_NOT_EDITABLE` (the target ended INVALID) or `STALE_REVISION`
+  `TARGET_NOT_EDITABLE` (the target ended INVALID or is DELETED) or `STALE_REVISION`
   (`expected_revision` did not match at decision time). A group with any failing
   item is `REJECTED` as a whole; `COMMITTED` means every new item CONFIRMED and every
   edit item APPLIED.
@@ -142,11 +142,75 @@ curl -s localhost:8080/operations/41/history -H 'X-Owner-Id: 1'
   edits already registered are still decided.
 - **Non-guarantee N7.** Edits and reversals do not track each other: editing an
   operation never adjusts a reversal that points at it, and editing a reversal never
-  adjusts its original — the client owns the follow-up. There is no delete: reverse
-  to cancel, edit to correct.
+  adjusts its original — the client owns the follow-up. Reverse to cancel, edit to
+  correct, delete to remove (next section).
 - **Embedded hosts** register edits through the same `InsertOp.EditOf` /
   `ExpectedRevision` fields inside their own transaction
   ([embedding guide](docs/embedding.md#edit-an-operation-in-a-business-transaction)).
+
+### Deleting operations (ADR-0011)
+
+A confirmed operation can be **deleted**: same id, terminal status `DELETED`, last
+values kept on the row with `deleted_at` and `deleted_by` stamped — nothing is ever
+physically removed, so the audit trail stays complete. A delete is a *registration*
+exactly like an edit: it enters the PENDING queue, is decided by the leader as one
+virtual leg (`−current` on the target's account, validated against the final-balance
+limits — removing a spent credit is a debit without funds), and is idempotent under
+the same `Idempotency-Key` rules. `revision` is not bumped and no history row is
+appended; the row's last values *are* its final state
+(`docs/decisions/0011-operation-deletion.md`, spec §10.4).
+
+```sh
+# One delete, guarded by the revision the client last read, waiting for the decision.
+curl -s -X DELETE 'localhost:8080/operations/41?expected_revision=2&wait_ms=10000' \
+  -H 'X-Owner-Id: 1' -H "Idempotency-Key: $(cat /proc/sys/kernel/random/uuid)"
+# {"deletion":{"id":63,"status":"APPLIED","operation_id":41},"replayed":false}
+
+# Grouped / mixed: deletes are POST /transactions items with delete_of (nothing
+# else on the item) — they mix freely with edits and new operations in one unit.
+curl -s localhost:8080/transactions \
+  -H 'X-Owner-Id: 1' -H "Idempotency-Key: $(cat /proc/sys/kernel/random/uuid)" \
+  -H 'Content-Type: application/json' -d '{
+    "operations": [
+      {"delete_of": 42},
+      {"delete_of": 43, "expected_revision": 1},
+      {"edit_of": 44, "amount": -500},
+      {"account":"cash","amount":300,"effective_at":"2026-03-01T10:00:00Z"}
+    ], "wait_ms": 10000 }'
+
+# The operation now reads DELETED with its last values; its history lists the
+# revisions plus every edit *and* delete registration, each with a kind.
+curl -s localhost:8080/operations/41 -H 'X-Owner-Id: 1'
+curl -s localhost:8080/operations/41/history -H 'X-Owner-Id: 1'
+```
+
+- **Statuses.** A delete registration goes `PENDING → APPLIED | INVALID` (terminal);
+  on APPLIED the target flips `CONFIRMED → DELETED` (terminal — there is no restore,
+  re-insert instead). Rejections are `LIMIT_VIOLATED`, `TARGET_NOT_EDITABLE` (the
+  target ended INVALID or is already DELETED — decided by the leader, never refused
+  at submission, so a client handles it in one place) or `STALE_REVISION`. A group is
+  all-or-nothing: `COMMITTED` means delete and edit items APPLIED and new items
+  CONFIRMED; `REJECTED` touches no target.
+- **Groups are not deletion units.** A leg of a COMMITTED group can be deleted alone;
+  the transaction stays `COMMITTED` and that leg reads `DELETED` among its siblings.
+  Deleting a whole group is just a group of `delete_of` items.
+- **Reads.** A DELETED operation leaves every balance, statement and point-in-time
+  sum (its `−current` leg was applied) but stays readable by id: `GET /operations/{id}`
+  returns `DELETED`, its last values, `deleted_at` and `deleted_by`; a delete
+  registration id returns `delete_of`; `GET /transactions/{id}` legs carry
+  `delete_of` (delete legs), `edit_of` (edit legs) or `revision` (regular legs).
+- **`expected_revision`** is a query parameter (`>= 1`); `0` or a non-integer is the
+  schema's `422`, unlike the body-path `400` of `PATCH` — deliberate, both are
+  client errors before any DB access.
+- **Turning it off.** `UPDATE config SET allow_deletes = false;` — hot-reloaded and
+  independent of `allow_edits`; the next delete registration is refused with `403`
+  (embedded: `ErrDeletesDisabled`); deletes already registered are still decided.
+- **Non-guarantee N7** extends to deletes: deleting an operation never adjusts a
+  reversal that points at it, deleting a reversal never restores its original, and a
+  reversal of a DELETED operation is an ordinary operation.
+- **Embedded hosts** register deletes with `InsertOp.DeleteOf` (plus optional
+  `ExpectedRevision`) and read `OperationOutcome.DeleteOf` / `DeletedAt` / `DeletedBy`
+  ([embedding guide](docs/embedding.md#delete-an-operation-in-a-business-transaction)).
 
 ### Configuration contract
 
@@ -175,9 +239,10 @@ SET …;`) and picked up on the next cycle/request without a restart:
 | `lease_ttl_ms` | `15000` | Leader lease TTL; failover bound (spec §7.1). |
 | `loop_interval_ms` | `1000` | Processor polling interval (the doorbell wakes it earlier, ADR-0002). |
 | `batch_size` | `200` | Decisions per DB commit (spec §8.5). |
-| `max_group_size` | `10` | Maximum items per `POST /transactions` unit — new operations and edits together. |
+| `max_group_size` | `10` | Maximum items per `POST /transactions` unit — new operations, edits and deletes together. |
 | `api_max_wait_ms` | `30000` | Cap on `wait_ms` for synchronous waits (spec §10.1). |
 | `allow_edits` | `true` | `false` refuses **new** edit registrations (`403` / `ErrEditsDisabled`) and keeps the cell on the reversal-only contract; already registered edits are still decided (ADR-0010). Read per request by the insertion core; the processor never checks it. |
+| `allow_deletes` | `true` | `false` refuses **new** delete registrations (`403` / `ErrDeletesDisabled`), independently of `allow_edits`; already registered deletes are still decided (ADR-0011). Same read pattern as `allow_edits`. |
 
 ### Roles
 
@@ -251,8 +316,8 @@ authority.
 | `snapshot_rows_touched` | histogram | Balance-snapshot rows written per confirmed operation (1 = newest day; more = a backdating cascade). | §13 — measures the backdating workload in production (spec §8.4 makes backdating O(days spanned)). |
 | `leadership_changes_total` | counter | Lease ownership transitions (gained or lost) this instance observed. | §13 — `rate()*3600` = changes/hour; a high rate is lease flapping (tuning or infrastructure). |
 | `leader` | gauge | `1` if this instance currently holds the lease, else `0`. | Companion to leadership changes: which instance is the leader right now. |
-| `decisions_total{kind,outcome}` | counter | Committed terminal decisions: `kind` ∈ single\|group\|edit, `outcome` ∈ confirmed\|invalid\|committed\|rejected\|applied (`edit` × applied\|invalid). | §13 decision counters by outcome; the `edit` kind is the edit adoption/rejection mix (ADR-0010). Counted **only on a committed batch**, so a guard-miss rollback never inflates them. |
-| `edit_deferrals_total` | counter | Units (a single edit or a whole group) skipped because an edit target was still PENDING; decided on a later cycle once the target is. | §13 / ADR-0010 — zero is the norm; a sustained rate means overlapping insertion transactions (ADR-0008). Never blocks the work behind it. |
+| `decisions_total{kind,outcome}` | counter | Committed terminal decisions: `kind` ∈ single\|group\|edit\|delete, `outcome` ∈ confirmed\|invalid\|committed\|rejected\|applied (`edit` and `delete` × applied\|invalid). | §13 decision counters by outcome; the `edit` and `delete` kinds are the adoption/rejection mix of each (ADR-0010, ADR-0011). Counted **only on a committed batch**, so a guard-miss rollback never inflates them. |
+| `edit_deferrals_total` | counter | Units (a single edit or delete, or a whole group) skipped because an edit or delete target was still PENDING; decided on a later cycle once the target is. | §13 / ADR-0010 / ADR-0011 — one shared counter; zero is the norm; a sustained rate means overlapping insertion transactions (ADR-0008). Never blocks the work behind it. |
 | `doorbell_wakeup_lag_seconds` | histogram | Insert-commit → leader-pickup lag per operation, on the **DB clock** (`now() - registered_at` at fetch). | **ADR-0002** — the measured doorbell latency win: tens of ms on an idle system, degrading gracefully into queue latency under load. |
 | `api_wait_seconds{source,result}` | histogram | Synchronous-insert wait latency (register → return). `source` ∈ immediate\|notify\|poll\|timeout, `result` ∈ decided\|pending. | **ADR-0002** / §13 NOTIFY→outcome lag — API wait health. The `notify` source is the low-latency fast path; `poll` is the durability fallback firing. |
 | `slow_queries_total` | counter | SQL queries over the slow-query threshold (also logged). | §13 DB-write health — surfaces queries approaching the cell's DB ceiling. |
@@ -317,13 +382,18 @@ two tiers (ADR-0006):
   reversal-after-reject retries), state-aware limit changes, idempotent
   replays/conflicts, and edits (ADR-0010: single `PATCH`-shaped edits, grouped edits
   and mixed groups, with `expected_revision` guards, account moves and
-  `effective_at` moves across days) — through the sequential reference model across
+  `effective_at` moves across days) and deletes (ADR-0011: single deletes, delete
+  groups and mixed groups, with `expected_revision` guards and targets that are
+  fresh, edited, INVALID or already DELETED) — through the sequential reference model across
   **1,000+ seeds** (default 1,200), asserting G1 (final balance within limits), G2 (no
   partially applied group), G4 (timeline order total and unique), G6 (no duplicate
   rows), G3 reproducibility (the same seed replays to an identical decision
-  sequence), and dense append-only revision histories. Every tier prints its action
-  mix (`insert/replay/conflict/reversal/set_limits/edit/edit_group/edit_group_mixed`)
-  and fails if any edit class is absent from the run.
+  sequence), dense append-only revision histories, and the deletion invariants (a
+  DELETED row has exactly one APPLIED delete and never reads CONFIRMED again). Every
+  tier prints its action mix (`insert/replay/conflict/reversal/set_limits/edit/
+  edit_group/edit_group_mixed/delete/delete_group/delete_group_mixed`, plus the
+  fine-grained `del_*` guard/target/replay classes) and fails if any edit or delete
+  class is absent from the run.
 - **Fidelity (DB-backed, `make simtest`, build tag `simtest`).** The real processor
   runs over throwaway schemas and the database is asserted equal to the reference
   model — interleaved with fault injection: batch-boundary crashes, competing-leader
@@ -331,9 +401,10 @@ two tiers (ADR-0006):
   running processors; the guards must catch every stale write), and a Guard-3
   version-race stressor. Identity ids do not line up between the two (idempotent
   replays consume Postgres IDENTITY values the reference does not), so the harness
-  compares through an explicit reference→database id map — statuses (APPLIED
-  included), balances, latest snapshots, each operation's current columns and `revision`,
-  `edit_of`, and every `operation_revisions` row.
+  compares through an explicit reference→database id map — statuses (APPLIED and
+  DELETED included), balances, latest snapshots, each operation's current columns and
+  `revision`, `edit_of`/`is_delete`, `deleted_by`/`deleted_at`, and every
+  `operation_revisions` row.
 
 Additional transaction-visibility schedules hold an embedded credit open while a
 later HTTP-core debit commits, then vary processing time and credit commit/rollback.

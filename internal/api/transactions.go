@@ -16,21 +16,24 @@ import (
 
 // --- POST /transactions -----------------------------------------------------
 
-// OperationInput is one item of an insertion request. Without edit_of it is a new
-// operation and account, amount and effective_at are all required (the handler
-// refuses an item missing one with 400 — the schema leaves them optional only so
-// edit items can omit them). With edit_of it is an edit registration of that
-// operation (ADR-0010): every omitted field means "unchanged", at least one of
-// amount, effective_at and account must be present, and reversal_of is not
-// allowed. Amount is int64 minor units (see the Amount type); the account is
-// referenced by its owner-scoped external id and upserted on demand.
+// OperationInput is one item of an insertion request. Without edit_of or
+// delete_of it is a new operation and account, amount and effective_at are all
+// required (the handler refuses an item missing one with 400 — the schema leaves
+// them optional only so edit and delete items can omit them). With edit_of it is
+// an edit registration of that operation (ADR-0010): every omitted field means
+// "unchanged", at least one of amount, effective_at and account must be present,
+// and reversal_of is not allowed. With delete_of it is a delete registration of
+// that operation (ADR-0011): only expected_revision may accompany it. Amount is
+// int64 minor units (see the Amount type); the account is referenced by its
+// owner-scoped external id and upserted on demand.
 type OperationInput struct {
 	Account          string     `json:"account,omitempty" minLength:"1" doc:"Client-defined account external id (unique per owner). Upserted on demand with unbounded limits if it does not exist. Required on a new operation; on an edit item, omitted means unchanged."`
 	Amount           *Amount    `json:"amount,omitempty"`
 	EffectiveAt      *time.Time `json:"effective_at,omitempty" doc:"Timeline timestamp (RFC 3339). May be in the past (backdated) or future; it never affects validation, only where the operation lands on the timeline (§5.4). Required on a new operation; on an edit item, omitted means unchanged."`
 	ReversalOf       *int64     `json:"reversal_of,omitempty" doc:"Registration id of the operation this reverses. Immutable metadata, unused by the engine (§5.4). Not allowed on an edit item."`
-	EditOf           *int64     `json:"edit_of,omitempty" doc:"Makes this item an edit of the named operation (ADR-0010): the group applies it atomically with its other items, netting all changes per account. The target must be a regular operation of this owner; two items may not edit the same operation."`
-	ExpectedRevision *int32     `json:"expected_revision,omitempty" doc:"Edit items only. Optional optimistic guard (>= 1): the group is rejected with STALE_REVISION unless the target is at exactly this revision when decided."`
+	EditOf           *int64     `json:"edit_of,omitempty" doc:"Makes this item an edit of the named operation (ADR-0010): the group applies it atomically with its other items, netting all changes per account. The target must be a regular operation of this owner; two items may not edit or delete the same operation."`
+	DeleteOf         *int64     `json:"delete_of,omitempty" doc:"Makes this item a delete of the named operation (ADR-0011): the group applies it atomically with its other items, netting the removal per account. The target must be a regular operation of this owner; no field other than expected_revision may accompany it; two items may not edit or delete the same operation."`
+	ExpectedRevision *int32     `json:"expected_revision,omitempty" doc:"Edit and delete items only. Optional optimistic guard (>= 1): the group is rejected with STALE_REVISION unless the target is at exactly this revision when decided."`
 }
 
 // CreateTransactionInput is the POST /transactions request. The idempotency key is
@@ -45,12 +48,13 @@ type CreateTransactionInput struct {
 }
 
 // OperationOutcome is a per-operation result: its registration id and current
-// status (PENDING on a fresh insert; the current status on a replay). An edit
-// item's outcome names the operation it edits.
+// status (PENDING on a fresh insert; the current status on a replay). An edit or
+// delete item's outcome names the operation it targets.
 type OperationOutcome struct {
-	ID     int64  `json:"id" doc:"Registration id — the global insertion order and the timeline tiebreaker."`
-	Status string `json:"status" doc:"Operation status: PENDING | CONFIRMED | INVALID; an edit item is PENDING | APPLIED | INVALID."`
-	EditOf *int64 `json:"edit_of,omitempty" doc:"Present only on an edit item: the operation it edits."`
+	ID       int64  `json:"id" doc:"Registration id — the global insertion order and the timeline tiebreaker."`
+	Status   string `json:"status" doc:"Operation status: PENDING | CONFIRMED | INVALID | DELETED; an edit or delete item is PENDING | APPLIED | INVALID."`
+	EditOf   *int64 `json:"edit_of,omitempty" doc:"Present only on an edit item: the operation it edits."`
+	DeleteOf *int64 `json:"delete_of,omitempty" doc:"Present only on a delete item: the operation it deletes."`
 }
 
 // CreateTransactionOutput is the insertion response. TransactionID/TransactionStatus
@@ -110,45 +114,60 @@ func (s *Server) createTransaction(ctx context.Context, in *CreateTransactionInp
 }
 
 // insertOps shapes the request items into ledger items after the contract's
-// structural checks, all before any database access (the _dx.md error table):
-// a new operation must carry account, amount and effective_at (400); a zero
-// amount is the insertion path's zero-amount error (422); an edit item's
-// expected_revision must be >= 1, it may not carry reversal_of, it must change
-// something (400 each), and two items may not edit one target (422). The ledger
+// structural checks, all before any database access (the _dx.md error tables):
+// a new operation must carry account, amount and effective_at (400); a delete
+// item may carry nothing but delete_of and expected_revision (400); a zero
+// amount is the insertion path's zero-amount error (422); an edit or delete
+// item's expected_revision must be >= 1, an edit may not carry reversal_of and
+// must change something (400 each), and two items may not target one operation
+// in any mix of kinds (422, wrapped as the ledger's TargetError). The ledger
 // enforces the same rules again as its own invariant; checking them here keeps
 // the messages exact and the DB untouched for a malformed request.
 func insertOps(ownerID int64, items []OperationInput) ([]InsertOp, error) {
 	ops := make([]InsertOp, len(items))
 	seen := make(map[int64]struct{}, len(items))
 	for i, o := range items {
-		if o.EditOf == nil && (o.Account == "" || o.Amount == nil || o.EffectiveAt == nil) {
+		if o.DeleteOf != nil && (o.EditOf != nil || o.ReversalOf != nil || o.Account != "" || o.Amount != nil || o.EffectiveAt != nil) {
+			return nil, mapInsertErr(fmt.Errorf("%w: target %d", ErrDeleteWithFields, *o.DeleteOf))
+		}
+		if o.EditOf == nil && o.DeleteOf == nil && (o.Account == "" || o.Amount == nil || o.EffectiveAt == nil) {
 			return nil, huma.Error400BadRequest(fmt.Sprintf("operations[%d]: account, amount and effective_at are required on a new operation", i))
 		}
 		if o.Amount != nil && *o.Amount == 0 {
 			return nil, mapInsertErr(ErrZeroAmount)
 		}
-		op := InsertOp{OwnerID: ownerID, ExternalID: o.Account, ReversalOf: o.ReversalOf, EditOf: o.EditOf, ExpectedRevision: o.ExpectedRevision}
+		op := InsertOp{OwnerID: ownerID, ExternalID: o.Account, ReversalOf: o.ReversalOf, EditOf: o.EditOf, DeleteOf: o.DeleteOf, ExpectedRevision: o.ExpectedRevision}
 		if o.Amount != nil {
 			op.Amount = int64(*o.Amount)
 		}
 		if o.EffectiveAt != nil {
 			op.EffectiveAt = *o.EffectiveAt
 		}
-		if o.EditOf != nil {
-			target := *o.EditOf
-			switch {
-			case o.ReversalOf != nil:
-				return nil, mapInsertErr(fmt.Errorf("%w: target %d", ErrEditWithReversal, target))
-			case o.ExpectedRevision != nil && *o.ExpectedRevision < 1:
-				return nil, mapInsertErr(fmt.Errorf("%w: got %d", ErrInvalidExpectedRevision, *o.ExpectedRevision))
-			case o.Account == "" && o.Amount == nil && o.EffectiveAt == nil:
-				return nil, mapInsertErr(fmt.Errorf("%w: target %d", ErrEditChangesNothing, target))
-			}
-			if _, dup := seen[target]; dup {
-				return nil, mapInsertErr(fmt.Errorf("%w: %d", ErrDuplicateEditTarget, target))
-			}
-			seen[target] = struct{}{}
+		if o.EditOf == nil && o.DeleteOf == nil {
+			ops[i] = op
+			continue
 		}
+		// Edit-class item, checked in the ledger's order: the kind's own shape,
+		// the shared guard rule, then the shared target set.
+		kind, target := TargetDelete, int64(0)
+		if o.DeleteOf != nil {
+			target = *o.DeleteOf
+		} else {
+			kind, target = TargetEdit, *o.EditOf
+			if o.ReversalOf != nil {
+				return nil, mapInsertErr(fmt.Errorf("%w: target %d", ErrEditWithReversal, target))
+			}
+		}
+		if o.ExpectedRevision != nil && *o.ExpectedRevision < 1 {
+			return nil, mapInsertErr(fmt.Errorf("%w: got %d", ErrInvalidExpectedRevision, *o.ExpectedRevision))
+		}
+		if kind == TargetEdit && o.Account == "" && o.Amount == nil && o.EffectiveAt == nil {
+			return nil, mapInsertErr(fmt.Errorf("%w: target %d", ErrEditChangesNothing, target))
+		}
+		if _, dup := seen[target]; dup {
+			return nil, mapInsertErr(&TargetError{Kind: kind, Target: target, Err: ErrDuplicateEditTarget})
+		}
+		seen[target] = struct{}{}
 		ops[i] = op
 	}
 	return ops, nil
@@ -163,7 +182,7 @@ func insertOutput(res *InsertResult) *CreateTransactionOutput {
 	out.Body.Replayed = res.Replayed
 	out.Body.Operations = make([]OperationOutcome, len(res.Operations))
 	for i, o := range res.Operations {
-		out.Body.Operations[i] = OperationOutcome{ID: o.ID, Status: o.Status, EditOf: o.EditOf}
+		out.Body.Operations[i] = OperationOutcome{ID: o.ID, Status: o.Status, EditOf: o.EditOf, DeleteOf: o.DeleteOf}
 	}
 	return out
 }
@@ -178,13 +197,16 @@ type GetTransactionInput struct {
 }
 
 // LegStatus is one leg of a group with its status and, if INVALID, its rejection.
-// An edit leg (ADR-0010) names the operation it edits and omits revision; a
-// regular leg carries its current revision and omits edit_of.
+// An edit leg (ADR-0010) names the operation it edits, a delete leg (ADR-0011)
+// the operation it deletes, and both omit revision; a regular leg carries its
+// current revision and omits edit_of/delete_of. A regular leg deleted after its
+// group committed reads DELETED while the group stays COMMITTED.
 type LegStatus struct {
 	ID        int64            `json:"id"`
-	Status    string           `json:"status" doc:"Operation status: PENDING | CONFIRMED | INVALID; an edit leg is PENDING | APPLIED | INVALID."`
+	Status    string           `json:"status" doc:"Operation status: PENDING | CONFIRMED | INVALID | DELETED; an edit or delete leg is PENDING | APPLIED | INVALID."`
 	EditOf    *int64           `json:"edit_of,omitempty" doc:"Present only on an edit leg: the operation it edits."`
-	Revision  int32            `json:"revision,omitempty" doc:"Current revision of a regular leg (1 until its first applied edit); absent on an edit leg."`
+	DeleteOf  *int64           `json:"delete_of,omitempty" doc:"Present only on a delete leg: the operation it deletes."`
+	Revision  int32            `json:"revision,omitempty" doc:"Current revision of a regular leg (1 until its first applied edit); absent on an edit or delete leg."`
 	Rejection *model.Rejection `json:"rejection,omitempty" doc:"Machine-readable rejection detail; present only when the group was REJECTED."`
 }
 
@@ -209,20 +231,27 @@ type GetOperationInput struct {
 }
 
 // GetOperationOutput is an operation's current state: status, timeline values and
-// revision for a regular operation; for an edit registration (edit_of present,
-// ADR-0010) the proposed state as resolved at submission and its optional guard.
-// Regular rows omit edit_of/expected_revision; edit rows omit revision.
+// revision for a regular operation (its last values once DELETED, when
+// deleted_at/deleted_by name the instant and the APPLIED delete, ADR-0011); for
+// an edit registration (edit_of present, ADR-0010) the proposed state as
+// resolved at submission and its optional guard; for a delete registration
+// (delete_of present) the target's values as they stood at submission,
+// informational only, and the guard. Regular rows omit edit_of/delete_of/
+// expected_revision; edit and delete rows omit revision.
 type GetOperationOutput struct {
 	Body struct {
 		ID               int64            `json:"id"`
-		Status           string           `json:"status" doc:"Operation status: PENDING | CONFIRMED | INVALID; an edit registration is PENDING | APPLIED | INVALID."`
+		Status           string           `json:"status" doc:"Operation status: PENDING | CONFIRMED | INVALID | DELETED; an edit or delete registration is PENDING | APPLIED | INVALID."`
 		TransactionID    *int64           `json:"transaction_id,omitempty" doc:"Group transaction id if this operation is a group leg; absent for a single."`
 		EditOf           *int64           `json:"edit_of,omitempty" doc:"Present only on an edit registration: the operation it edits."`
-		Account          string           `json:"account" doc:"Account external id (current value; for an edit, the proposed one)."`
+		DeleteOf         *int64           `json:"delete_of,omitempty" doc:"Present only on a delete registration: the operation it deletes."`
+		Account          string           `json:"account" doc:"Account external id (current value — the last one once DELETED; for an edit, the proposed one; for a delete, the target's at submission)."`
 		Amount           Amount           `json:"amount"`
-		EffectiveAt      time.Time        `json:"effective_at" doc:"Timeline instant (current value; for an edit, the proposed one)."`
-		Revision         int32            `json:"revision,omitempty" doc:"Current revision of a regular operation (1 until its first applied edit); absent on an edit registration."`
-		ExpectedRevision *int32           `json:"expected_revision,omitempty" doc:"Present only on an edit registration that carries an optimistic guard."`
+		EffectiveAt      time.Time        `json:"effective_at" doc:"Timeline instant (current value; for an edit, the proposed one; for a delete, the target's at submission)."`
+		Revision         int32            `json:"revision,omitempty" doc:"Current revision of a regular operation (1 until its first applied edit; frozen once DELETED); absent on an edit or delete registration."`
+		ExpectedRevision *int32           `json:"expected_revision,omitempty" doc:"Present only on an edit or delete registration that carries an optimistic guard."`
+		DeletedAt        *time.Time       `json:"deleted_at,omitempty" doc:"Present only on a DELETED operation: the instant the delete was applied."`
+		DeletedBy        *int64           `json:"deleted_by,omitempty" doc:"Present only on a DELETED operation: the registration id of the APPLIED delete."`
 		Rejection        *model.Rejection `json:"rejection,omitempty" doc:"Machine-readable rejection detail; present only when the row is INVALID."`
 	}
 }
@@ -243,11 +272,15 @@ func (s *Server) getTransaction(ctx context.Context, in *GetTransactionInput) (*
 	out.Body.Operations = make([]LegStatus, len(value.Operations))
 	for i, op := range value.Operations {
 		leg := LegStatus{ID: op.ID, Status: string(op.Status), Rejection: op.Rejection}
-		// Edit legs name their target and hide the meaningless default revision;
-		// regular legs carry their revision (the same split as GET /operations/{id}).
-		if op.EditOf != nil {
+		// Edit and delete legs name their target and hide the meaningless default
+		// revision; regular legs carry their revision (the same split as
+		// GET /operations/{id}).
+		switch {
+		case op.EditOf != nil:
 			leg.EditOf = op.EditOf
-		} else {
+		case op.DeleteOf != nil:
+			leg.DeleteOf = op.DeleteOf
+		default:
 			leg.Revision = op.Revision
 		}
 		out.Body.Operations[i] = leg
@@ -269,13 +302,22 @@ func (s *Server) getOperation(ctx context.Context, in *GetOperationInput) (*GetO
 	out.Body.Account = value.Account
 	out.Body.Amount = Amount(value.Amount)
 	out.Body.EffectiveAt = value.EffectiveAt.UTC()
-	if value.EditOf != nil {
-		// Edit registration: the guard travels with it; revision is meaningless
-		// (the column is the default 1) and stays hidden.
+	switch {
+	case value.EditOf != nil || value.DeleteOf != nil:
+		// Edit or delete registration: the guard travels with it; revision is
+		// meaningless (the column is the default 1) and stays hidden.
 		out.Body.EditOf = value.EditOf
+		out.Body.DeleteOf = value.DeleteOf
 		out.Body.ExpectedRevision = value.ExpectedRevision
-	} else {
+	default:
 		out.Body.Revision = value.Revision
+		// Deletion markers are set together by the leader (ADR-0011); a live row
+		// carries neither.
+		if value.DeletedAt != nil {
+			at := value.DeletedAt.UTC()
+			out.Body.DeletedAt = &at
+		}
+		out.Body.DeletedBy = value.DeletedBy
 	}
 	return out, nil
 }

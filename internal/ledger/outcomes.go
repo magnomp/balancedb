@@ -12,10 +12,14 @@ import (
 
 // OperationOutcome is one operation's current state as both HTTP and embedded
 // callers read it. For a regular operation Account/Amount/EffectiveAt are the
-// current (possibly edited) values and Revision counts applied edits from 1. For
-// an edit registration (EditOf set, ADR-0010) they are the proposed state as
-// resolved at submission, ExpectedRevision is its optional guard, and Revision
-// is the meaningless column default.
+// current (possibly edited) values — its last values once DELETED, when
+// DeletedAt/DeletedBy name the instant and the APPLIED delete registration
+// (ADR-0011) — and Revision counts applied edits from 1. For an edit
+// registration (EditOf set, ADR-0010) they are the proposed state as resolved at
+// submission; for a delete registration (DeleteOf set) the target's values as
+// they stood at submission, informational only. On either, ExpectedRevision is
+// the optional guard and Revision is the meaningless column default. EditOf and
+// DeleteOf are exclusive.
 type OperationOutcome struct {
 	ID               int64
 	Status           model.OpStatus
@@ -26,7 +30,21 @@ type OperationOutcome struct {
 	EffectiveAt      time.Time
 	Revision         int32
 	EditOf           *int64
+	DeleteOf         *int64
 	ExpectedRevision *int32
+	DeletedAt        *time.Time
+	DeletedBy        *int64
+}
+
+// setTarget fills EditOf / DeleteOf exclusively from the row's edit_of and
+// is_delete, exactly as OpOutcome does for insert results.
+func (o *OperationOutcome) setTarget(editOf *int64, isDelete bool) {
+	o.EditOf, o.DeleteOf = nil, nil
+	if isDelete {
+		o.DeleteOf = editOf
+		return
+	}
+	o.EditOf = editOf
 }
 
 type TransactionOutcome struct {
@@ -42,12 +60,18 @@ func GetOperation(ctx context.Context, q Queryer, owner, id int64) (*OperationOu
 		return nil, fmt.Errorf("%w: positive owner and operation ID required", ErrInvalidArgument)
 	}
 	const stmt = `SELECT o.id, o.status, o.transaction_id, o.invalidation_reason,
-       a.external_id, o.amount, o.effective_at, o.revision, o.edit_of, o.expected_revision
+       a.external_id, o.amount, o.effective_at, o.revision, o.edit_of, o.is_delete, o.expected_revision,
+       o.deleted_by, o.deleted_at
 FROM operations o JOIN accounts a ON a.id=o.account_id WHERE o.id=$1 AND a.owner_id=$2`
-	var result OperationOutcome
-	var reason *string
+	var (
+		result   OperationOutcome
+		reason   *string
+		editOf   *int64
+		isDelete bool
+	)
 	err := q.QueryRow(ctx, stmt, id, owner).Scan(&result.ID, &result.Status, &result.TransactionID, &reason,
-		&result.Account, &result.Amount, &result.EffectiveAt, &result.Revision, &result.EditOf, &result.ExpectedRevision)
+		&result.Account, &result.Amount, &result.EffectiveAt, &result.Revision, &editOf, &isDelete, &result.ExpectedRevision,
+		&result.DeletedBy, &result.DeletedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -55,6 +79,7 @@ FROM operations o JOIN accounts a ON a.id=o.account_id WHERE o.id=$1 AND a.owner
 		return nil, fmt.Errorf("read operation: %w", err)
 	}
 	result.Rejection = parseRejection(reason)
+	result.setTarget(editOf, isDelete)
 	return &result, nil
 }
 
@@ -78,7 +103,8 @@ WHERE o.transaction_id=t.id AND a.owner_id=$2)`
 	}
 	result.Rejection = parseRejection(reason)
 	const legs = `SELECT o.id, o.status, o.transaction_id, o.invalidation_reason,
-       a.external_id, o.amount, o.effective_at, o.revision, o.edit_of, o.expected_revision
+       a.external_id, o.amount, o.effective_at, o.revision, o.edit_of, o.is_delete, o.expected_revision,
+       o.deleted_by, o.deleted_at
 FROM operations o JOIN accounts a ON a.id=o.account_id
 WHERE o.transaction_id=$1 AND a.owner_id=$2 ORDER BY o.id`
 	rows, err := q.Query(ctx, legs, id, owner)
@@ -88,13 +114,19 @@ WHERE o.transaction_id=$1 AND a.owner_id=$2 ORDER BY o.id`
 	defer rows.Close()
 	result.Operations = []OperationOutcome{}
 	for rows.Next() {
-		var op OperationOutcome
-		var reason *string
+		var (
+			op       OperationOutcome
+			reason   *string
+			editOf   *int64
+			isDelete bool
+		)
 		if err := rows.Scan(&op.ID, &op.Status, &op.TransactionID, &reason,
-			&op.Account, &op.Amount, &op.EffectiveAt, &op.Revision, &op.EditOf, &op.ExpectedRevision); err != nil {
+			&op.Account, &op.Amount, &op.EffectiveAt, &op.Revision, &editOf, &isDelete, &op.ExpectedRevision,
+			&op.DeletedBy, &op.DeletedAt); err != nil {
 			return nil, fmt.Errorf("scan transaction leg: %w", err)
 		}
 		op.Rejection = parseRejection(reason)
+		op.setTarget(editOf, isDelete)
 		result.Operations = append(result.Operations, op)
 	}
 	if err := rows.Err(); err != nil {

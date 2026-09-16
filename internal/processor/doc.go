@@ -41,4 +41,17 @@
 // that ended INVALID or is not at the expected revision rejects the whole group.
 // A unit whose edit target is still PENDING is deferred — skipped, left PENDING,
 // counted — and the batch continues.
+//
+// A delete registration (edit_of set with is_delete, ADR-0011) is an edit whose
+// proposed state is "none": one virtual leg (−current, read in the deciding
+// transaction), the same three guards plus the delete CAS on the target, which
+// flips CONFIRMED→DELETED with deleted_by/deleted_at — DELETED is terminal, no
+// revision row is appended and revision is untouched, so the row's last values
+// stay readable as its final state. A DELETED target rejects any later edit or
+// delete with TARGET_NOT_EDITABLE; a PENDING one defers the unit like an edit.
+// Delete legs mix into groups exactly as edit legs do — one virtual leg each,
+// APPLIED by the same edit_of split of Guard 2, the delete CAS per leg in leg
+// order — so a group of deletes, or deletes with edits and new operations, is
+// one atomic unit; deleting one leg of a COMMITTED group leaves the group
+// COMMITTED (group membership is not a deletion unit).
 package processor

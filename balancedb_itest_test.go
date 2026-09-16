@@ -531,6 +531,346 @@ func TestEmbeddedEditSentinelsThroughSavepoint(t *testing.T) {
 	countRows(t, pool, `SELECT count(*) FROM operations`, 3) // theirs, own, one edit
 }
 
+// deleteRequest builds a single-delete request (owner 1) against target.
+func deleteRequest(n int, target int64, guard *int32) balancedb.InsertRequest {
+	return balancedb.InsertRequest{
+		IdempotencyKey: fmt.Sprintf("00000000-0000-4000-8000-%012x", n),
+		Operations:     []balancedb.InsertOp{{OwnerID: 1, DeleteOf: &target, ExpectedRevision: guard}},
+	}
+}
+
+// IT-050: DB.Insert with DeleteOf inside a host transaction commits the PENDING
+// delete together with the host's own row (or neither), leaves the host
+// search_path untouched, returns DeleteOf (never EditOf) in the outcome, replays
+// under the same key, and — after the embedded leader's next cycle — the
+// registration reads back APPLIED and the target reads back through
+// DB.GetOperation as OpDeleted with DeletedAt/DeletedBy and its last values
+// intact (ADR-0011). A grouped delete mixed with an edit and a new operation
+// registers the same way and is decided as one unit by the group path: here the
+// edit names the already-DELETED target, so the whole group is REJECTED with
+// TARGET_NOT_EDITABLE and the delete leg's target stays CONFIRMED; a second
+// group without it commits, deleting that target through DB.GetTransaction's
+// delete-leg view.
+func TestEmbeddedDeleteInHostTransaction(t *testing.T) {
+	ctx := context.Background()
+	cell := dbtest.NewSchema(t)
+	host := dbtest.NewSchema(t)
+	d, _ := openCell(t, cell)
+	setup := begin(t, host, pgx.TxOptions{})
+	execSQL(t, setup, `CREATE TABLE corrections (id int PRIMARY KEY)`)
+	if err := setup.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The embedded leader runs on a second handle.
+	runner, _ := openCell(t, cell)
+	runCtx, stopRunner := context.WithCancel(ctx)
+	runDone := make(chan error, 1)
+	go func() { runDone <- runner.Run(runCtx) }()
+	defer func() {
+		stopRunner()
+		if err := <-runDone; err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	// Two targets, registered as usual and decided by the leader.
+	tx := begin(t, host, pgx.TxOptions{})
+	seeds, err := d.Insert(ctx, tx, balancedb.InsertRequest{
+		IdempotencyKey: "00000000-0000-4000-8000-000000000001",
+		Operations: []balancedb.InsertOp{
+			{OwnerID: 1, ExternalID: "wallet", Amount: 100, EffectiveAt: time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)},
+			{OwnerID: 1, ExternalID: "wallet", Amount: -40, EffectiveAt: time.Date(2026, 9, 13, 13, 0, 0, 0, time.UTC)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	target, other := seeds.Operations[0].ID, seeds.Operations[1].ID
+	eventually(t, func() bool { return txStatus(t, cell, *seeds.TransactionID) == "COMMITTED" })
+
+	rev := int32(1)
+	var registered int64
+	for _, commit := range []bool{false, true} {
+		tx := begin(t, host, pgx.TxOptions{})
+		var before, after string
+		if err := tx.QueryRow(ctx, `SHOW search_path`).Scan(&before); err != nil {
+			t.Fatal(err)
+		}
+		execSQL(t, tx, `INSERT INTO corrections VALUES (1)`)
+		del, err := d.Insert(ctx, tx, deleteRequest(2, target, &rev))
+		if err != nil {
+			t.Fatalf("delete insert: %v", err)
+		}
+		out := del.Operations[0]
+		if out.Status != "PENDING" || out.DeleteOf == nil || *out.DeleteOf != target || out.EditOf != nil || del.Replayed {
+			t.Fatalf("delete outcome = %+v, want PENDING with DeleteOf %d", out, target)
+		}
+		if err := tx.QueryRow(ctx, `SHOW search_path`).Scan(&after); err != nil {
+			t.Fatal(err)
+		}
+		if after != before {
+			t.Fatalf("host path changed: %q -> %q", before, after)
+		}
+		countRows(t, cell, `SELECT count(*) FROM operations WHERE is_delete`, 0)
+		if !commit {
+			if err := tx.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+			countRows(t, cell, `SELECT count(*) FROM operations WHERE is_delete`, 0)
+			countRows(t, host, `SELECT count(*) FROM corrections`, 0)
+			continue
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		registered = out.ID
+		countRows(t, cell, `SELECT count(*) FROM operations WHERE is_delete AND edit_of = `+fmt.Sprint(target)+` AND expected_revision = 1`, 1)
+		countRows(t, host, `SELECT count(*) FROM corrections`, 1)
+	}
+
+	// Replay under the same key returns the original registration.
+	tx = begin(t, host, pgx.TxOptions{})
+	replay, err := d.Insert(ctx, tx, deleteRequest(2, target, &rev))
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if !replay.Replayed || replay.Operations[0].ID != registered || replay.Operations[0].DeleteOf == nil || *replay.Operations[0].DeleteOf != target || replay.Operations[0].EditOf != nil {
+		t.Fatalf("replay outcome = %+v", replay)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// One leader cycle later the registration reads back APPLIED as a delete
+	// (DeleteOf, the target's values as the informational copy, no EditOf) and the
+	// target reads back DELETED with its last values, revision untouched, and the
+	// deletion stamps pointing at the registration; the balance dropped by 100.
+	eventually(t, func() bool { return opStatus(t, cell, registered) == "APPLIED" })
+	reg, err := d.GetOperation(ctx, 1, registered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reg.Status != balancedb.OpApplied || reg.DeleteOf == nil || *reg.DeleteOf != target || reg.EditOf != nil ||
+		reg.Account != "wallet" || reg.Amount != 100 || reg.ExpectedRevision == nil || *reg.ExpectedRevision != 1 ||
+		reg.DeletedAt != nil || reg.DeletedBy != nil {
+		t.Fatalf("delete registration = %+v", reg)
+	}
+	op, err := d.GetOperation(ctx, 1, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.Status != balancedb.OpDeleted || op.Amount != 100 || op.Account != "wallet" || op.Revision != 1 ||
+		op.DeletedAt == nil || op.DeletedBy == nil || *op.DeletedBy != registered || op.DeleteOf != nil || op.EditOf != nil {
+		t.Fatalf("target after the applied delete = %+v, want DELETED by %d with its last values", op, registered)
+	}
+	var balance int64
+	if err := cell.QueryRow(ctx, `SELECT confirmed_balance FROM accounts WHERE owner_id = 1 AND external_id = 'wallet'`).Scan(&balance); err != nil {
+		t.Fatal(err)
+	}
+	if balance != -40 { // 100 − 40, then the 100 removed
+		t.Fatalf("wallet balance = %d, want -40", balance)
+	}
+	countRows(t, cell, `SELECT count(*) FROM operation_revisions`, 0)
+
+	// Grouped: a delete, an edit and a new operation, one atomic unit through the
+	// host tx. The edit names the DELETED target, so the leader rejects the whole
+	// group with TARGET_NOT_EDITABLE{target}: every leg INVALID, `other` still
+	// CONFIRMED, the balance untouched.
+	tx = begin(t, host, pgx.TxOptions{})
+	group, err := d.Insert(ctx, tx, balancedb.InsertRequest{
+		IdempotencyKey: "00000000-0000-4000-8000-000000000003",
+		Operations: []balancedb.InsertOp{
+			{OwnerID: 1, DeleteOf: &other},
+			{OwnerID: 1, EditOf: &target, Amount: 300},
+			{OwnerID: 1, ExternalID: "wallet", Amount: -20, EffectiveAt: time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("grouped delete insert: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	ops := group.Operations
+	if group.TransactionID == nil || ops[0].DeleteOf == nil || *ops[0].DeleteOf != other || ops[0].EditOf != nil ||
+		ops[1].EditOf == nil || *ops[1].EditOf != target || ops[1].DeleteOf != nil || ops[2].EditOf != nil || ops[2].DeleteOf != nil {
+		t.Fatalf("grouped outcome = %+v", group)
+	}
+	eventually(t, func() bool { return txStatus(t, cell, *group.TransactionID) == "REJECTED" })
+	legs, err := d.GetTransaction(ctx, 1, *group.TransactionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legs.Status != balancedb.TxRejected || len(legs.Operations) != 3 || legs.Rejection == nil ||
+		legs.Rejection.Code != balancedb.ReasonCode("TARGET_NOT_EDITABLE") || legs.Rejection.OperationID == nil || *legs.Rejection.OperationID != target ||
+		legs.Operations[0].Status != balancedb.OpInvalid || legs.Operations[0].DeleteOf == nil || *legs.Operations[0].DeleteOf != other || legs.Operations[0].EditOf != nil || legs.Operations[0].Amount != -40 ||
+		legs.Operations[1].Status != balancedb.OpInvalid || legs.Operations[1].EditOf == nil || legs.Operations[1].DeleteOf != nil ||
+		legs.Operations[2].Status != balancedb.OpInvalid {
+		t.Fatalf("rejected grouped legs = %+v (%+v)", legs.Operations, legs.Rejection)
+	}
+	if op, err := d.GetOperation(ctx, 1, other); err != nil || op.Status != balancedb.OpConfirmed || op.DeletedBy != nil {
+		t.Fatalf("delete target of a rejected group = %+v (%v), want untouched CONFIRMED", op, err)
+	}
+	countRows(t, cell, `SELECT count(*) FROM operations WHERE is_delete`, 2)
+	countRows(t, cell, `SELECT count(*) FROM operation_revisions`, 0)
+
+	// The same delete with a new operation alone commits: the delete leg APPLIED,
+	// `other` DELETED by it, the new leg CONFIRMED; the balance is −40 + 40 − 20.
+	tx = begin(t, host, pgx.TxOptions{})
+	group, err = d.Insert(ctx, tx, balancedb.InsertRequest{
+		IdempotencyKey: "00000000-0000-4000-8000-000000000004",
+		Operations: []balancedb.InsertOp{
+			{OwnerID: 1, DeleteOf: &other},
+			{OwnerID: 1, ExternalID: "wallet", Amount: -20, EffectiveAt: time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("grouped delete insert: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, func() bool { return txStatus(t, cell, *group.TransactionID) == "COMMITTED" })
+	legs, err = d.GetTransaction(ctx, 1, *group.TransactionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legs.Status != balancedb.TxCommitted || len(legs.Operations) != 2 ||
+		legs.Operations[0].Status != balancedb.OpApplied || legs.Operations[0].DeleteOf == nil || *legs.Operations[0].DeleteOf != other ||
+		legs.Operations[1].Status != balancedb.OpConfirmed {
+		t.Fatalf("committed grouped legs = %+v", legs.Operations)
+	}
+	op, err = d.GetOperation(ctx, 1, other)
+	if err != nil || op.Status != balancedb.OpDeleted || op.DeletedBy == nil || *op.DeletedBy != legs.Operations[0].ID || op.Amount != -40 || op.Revision != 1 {
+		t.Fatalf("grouped delete target = %+v (%v), want DELETED by %d with its last values", op, err, legs.Operations[0].ID)
+	}
+	if err := cell.QueryRow(ctx, `SELECT confirmed_balance FROM accounts WHERE owner_id = 1 AND external_id = 'wallet'`).Scan(&balance); err != nil {
+		t.Fatal(err)
+	}
+	if balance != -20 { // −40, the −40 removed, then −20
+		t.Fatalf("wallet balance = %d, want -20", balance)
+	}
+	countRows(t, cell, `SELECT count(*) FROM operations WHERE is_delete`, 3)
+	countRows(t, cell, `SELECT count(*) FROM operation_revisions`, 0)
+}
+
+// IT-051: every delete sentinel of the contract's error table is errors.Is-able
+// from DB.Insert through the savepoint — the shared target sentinels carrying
+// the delete kind through errors.As — and the host transaction stays usable
+// after each refusal with no ledger row left behind.
+func TestEmbeddedDeleteSentinelsThroughSavepoint(t *testing.T) {
+	ctx := context.Background()
+	pool := dbtest.NewSchema(t)
+	d, _ := openCell(t, pool)
+	setup := begin(t, pool, pgx.TxOptions{})
+	execSQL(t, setup, `CREATE TABLE host_rows (id int PRIMARY KEY)`)
+	if err := setup.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Owner 2's operation is not a valid target for owner 1.
+	tx := begin(t, pool, pgx.TxOptions{})
+	foreign, err := d.Insert(ctx, tx, balancedb.InsertRequest{
+		IdempotencyKey: "00000000-0000-4000-8000-0000000000f1",
+		Operations:     []balancedb.InsertOp{{OwnerID: 2, ExternalID: "theirs", Amount: 5, EffectiveAt: time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	foreignID := foreign.Operations[0].ID
+
+	wantTarget := func(err, sentinel error, kind balancedb.TargetKind, target int64) {
+		t.Helper()
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("err = %v, want %v", err, sentinel)
+		}
+		var te *balancedb.TargetError
+		if !errors.As(err, &te) || te.Kind != kind || te.Target != target {
+			t.Fatalf("err = %v, want TargetError{%s, %d}", err, kind, target)
+		}
+	}
+
+	tx = begin(t, pool, pgx.TxOptions{})
+	execSQL(t, tx, `INSERT INTO host_rows VALUES (1)`)
+	_, err = d.Insert(ctx, tx, deleteRequest(1, foreignID, nil))
+	wantTarget(err, balancedb.ErrEditTargetNotFound, balancedb.TargetDelete, foreignID)
+	_, err = d.Insert(ctx, tx, deleteRequest(2, foreignID+1000, nil))
+	wantTarget(err, balancedb.ErrEditTargetNotFound, balancedb.TargetDelete, foreignID+1000)
+
+	own, err := d.Insert(ctx, tx, request(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownID := own.Operations[0].ID
+	if _, err := d.Insert(ctx, tx, balancedb.InsertRequest{
+		IdempotencyKey: "00000000-0000-4000-8000-000000000004",
+		Operations:     []balancedb.InsertOp{{OwnerID: 1, DeleteOf: &ownID, Amount: 1}},
+	}); !errors.Is(err, balancedb.ErrDeleteWithFields) {
+		t.Fatalf("delete with fields: %v", err)
+	}
+	if _, err := d.Insert(ctx, tx, balancedb.InsertRequest{
+		IdempotencyKey: "00000000-0000-4000-8000-000000000005",
+		Operations:     []balancedb.InsertOp{{OwnerID: 1, DeleteOf: &ownID, EditOf: &ownID}},
+	}); !errors.Is(err, balancedb.ErrDeleteWithFields) {
+		t.Fatalf("delete with edit_of: %v", err)
+	}
+	zero := int32(0)
+	if _, err := d.Insert(ctx, tx, deleteRequest(6, ownID, &zero)); !errors.Is(err, balancedb.ErrInvalidExpectedRevision) {
+		t.Fatalf("expected_revision 0: %v", err)
+	}
+	_, err = d.Insert(ctx, tx, balancedb.InsertRequest{
+		IdempotencyKey: "00000000-0000-4000-8000-000000000007",
+		Operations:     []balancedb.InsertOp{{OwnerID: 1, EditOf: &ownID, Amount: 1}, {OwnerID: 1, DeleteOf: &ownID}},
+	})
+	wantTarget(err, balancedb.ErrDuplicateEditTarget, balancedb.TargetDelete, ownID)
+	// A delete of an edit or delete registration is refused as well.
+	edit, err := d.Insert(ctx, tx, editRequest(8, ownID, 9))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = d.Insert(ctx, tx, deleteRequest(9, edit.Operations[0].ID, nil))
+	wantTarget(err, balancedb.ErrEditTargetNotOperation, balancedb.TargetDelete, edit.Operations[0].ID)
+	del, err := d.Insert(ctx, tx, deleteRequest(10, ownID, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = d.Insert(ctx, tx, deleteRequest(11, del.Operations[0].ID, nil))
+	wantTarget(err, balancedb.ErrEditTargetNotOperation, balancedb.TargetDelete, del.Operations[0].ID)
+	// Same key, different payload.
+	guard := int32(1)
+	if _, err := d.Insert(ctx, tx, deleteRequest(10, ownID, &guard)); !errors.Is(err, balancedb.ErrPayloadConflict) {
+		t.Fatalf("payload conflict: %v", err)
+	}
+	// Policy, independent of allow_edits.
+	execSQL(t, tx, `UPDATE config SET allow_deletes = false`)
+	if _, err := d.Insert(ctx, tx, deleteRequest(12, ownID, nil)); !errors.Is(err, balancedb.ErrDeletesDisabled) {
+		t.Fatalf("deletes disabled: %v", err)
+	}
+	// A second delete of the same target under a fresh key is structurally fine
+	// (duplicates are per request); deletes stay allowed with edits off.
+	execSQL(t, tx, `UPDATE config SET allow_deletes = true, allow_edits = false`)
+	if _, err := d.Insert(ctx, tx, deleteRequest(13, ownID, nil)); err != nil {
+		t.Fatalf("delete with edits disabled: %v", err)
+	}
+	execSQL(t, tx, `UPDATE config SET allow_edits = true`)
+	// The host transaction is still usable after every refusal.
+	execSQL(t, tx, `INSERT INTO host_rows VALUES (2)`)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	countRows(t, pool, `SELECT count(*) FROM host_rows`, 2)
+	countRows(t, pool, `SELECT count(*) FROM operations WHERE is_delete`, 2)
+	countRows(t, pool, `SELECT count(*) FROM operations WHERE edit_of IS NOT NULL AND NOT is_delete`, 1)
+	countRows(t, pool, `SELECT count(*) FROM operations`, 5) // theirs, own, one edit, two deletes
+}
+
 func opStatus(t *testing.T, pool *pgxpool.Pool, id int64) string {
 	t.Helper()
 	var status string

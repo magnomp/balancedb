@@ -9,18 +9,20 @@ import (
 const namespace = "balancedb"
 
 // Decision label values (spec §13 "decision counters by outcome"). kind
-// distinguishes a single operation, a group transaction and a single edit
-// registration (ADR-0010); outcome is the terminal fact the processor wrote.
+// distinguishes a single operation, a group transaction, a single edit
+// registration (ADR-0010) and a single delete registration (ADR-0011); outcome
+// is the terminal fact the processor wrote.
 const (
 	KindSingle = "single"
 	KindGroup  = "group"
 	KindEdit   = "edit"
+	KindDelete = "delete"
 
 	OutcomeConfirmed = "confirmed" // single accepted
 	OutcomeInvalid   = "invalid"   // single or edit rejected
 	OutcomeCommitted = "committed" // group accepted
 	OutcomeRejected  = "rejected"  // group rejected
-	OutcomeApplied   = "applied"   // edit accepted: target overwritten, history appended
+	OutcomeApplied   = "applied"   // edit accepted (target overwritten, history appended) or delete accepted (target DELETED)
 )
 
 // Wait-path label values (spec §13 "NOTIFY→outcome lag", API wait health). source
@@ -210,8 +212,9 @@ func (m *Metrics) RecordDecision(kind, outcome string) {
 	m.decisions.WithLabelValues(kind, outcome).Inc()
 }
 
-// IncEditDeferral counts one edit unit deferred because its target was still
-// PENDING (ADR-0010). Deferral is normal control flow, never an error.
+// IncEditDeferral counts one edit-class unit — an edit or a delete — deferred
+// because its target was still PENDING (ADR-0010/0011; one shared counter).
+// Deferral is normal control flow, never an error.
 func (m *Metrics) IncEditDeferral() {
 	if m == nil {
 		return

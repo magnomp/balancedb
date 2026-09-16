@@ -20,8 +20,9 @@ import (
 
 // This file is the M10 fault-injection tier: competing-leader failover and
 // zombie-leader stale-lease writes, both across the full scenario space — edits
-// (single, grouped, mixed; ADR-0010) included, so the revision CAS and the
-// append-only history are under the same churn (SIM-004). In each,
+// (single, grouped, mixed; ADR-0010) and deletes (single, grouped, mixed;
+// ADR-0011) included, so the revision CAS, the delete CAS and the append-only
+// history are under the same churn (SIM-004). In each,
 // several processors and/or direct lease tampering create windows where a node acts
 // on a lease view that has moved under it; the three guards (spec §7.2) must catch
 // every such stale attempt. The proof is correctness: after all the churn the
@@ -317,12 +318,13 @@ func TestSimReversalConstraints(t *testing.T) {
 }
 
 // reportMix prints a fault tier's action mix and fails the test if the churned
-// schedules never carried single, grouped and mixed edits (SIM-004 runs with
-// edits enabled by construction, not by accident).
+// schedules never carried single, grouped and mixed edits or single, grouped
+// and mixed deletes (SIM-004 runs with edits and deletes enabled by
+// construction, not by accident).
 func reportMix(t *testing.T, seeds int, mix actionMix) {
 	t.Helper()
 	t.Logf("action mix over %d seeds: %s", seeds, mix)
-	if missing := mix.missingEdits(); missing != nil && !t.Failed() {
+	if missing := mix.missingClasses(); missing != nil && !t.Failed() {
 		t.Errorf("the schedule never emitted %v (mix %s)", missing, mix)
 	}
 }

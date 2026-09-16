@@ -182,6 +182,73 @@ outcome later (`GET /operations/{edit id}`, the group, or the target's
 registered while its target is still PENDING is decided after the target, in id
 order.
 
+## Delete an operation in a business transaction
+
+An item with `DeleteOf` set is a **delete registration** of that operation
+(ADR-0011): the leader applies it in place — same id, status `DELETED`, last
+values kept, `deleted_at` and `deleted_by` stamped — without bumping the
+revision or appending a revision row. A delete item carries nothing but
+`DeleteOf` and an optional `ExpectedRevision`; any of `Amount`, `EffectiveAt`,
+`ExternalID`, `ReversalOf` or `EditOf` on it is `ErrDeleteWithFields`. The
+target must be a regular operation of the same owner, resolved inside the host
+transaction like an edit target; its *status* is never checked at submission — a
+delete of a PENDING, INVALID or already DELETED operation registers and is
+decided later (`TARGET_NOT_EDITABLE` for the last two).
+
+```go
+// Delete one operation inside the host transaction.
+target := int64(41)
+res, err := ledger.Insert(ctx, tx, balancedb.InsertRequest{
+    IdempotencyKey: requestUUID,
+    Operations:     []balancedb.InsertOp{{OwnerID: 7, DeleteOf: &target}},
+})
+// res.Operations[0].ID == 63, Status == "PENDING", DeleteOf == &target
+if err := tx.Commit(ctx); err != nil { return err }
+
+// Grouped: two deletes, one edit and a new operation, one atomic unit.
+rev := int32(2)
+res, err = ledger.Insert(ctx, tx, balancedb.InsertRequest{
+    IdempotencyKey: otherUUID,
+    Operations: []balancedb.InsertOp{
+        {OwnerID: 7, DeleteOf: &target},
+        {OwnerID: 7, DeleteOf: &other, ExpectedRevision: &rev},
+        {OwnerID: 7, EditOf: &third, Amount: -700},
+        {OwnerID: 7, ExternalID: "cash", Amount: 300, EffectiveAt: effectiveAt},
+    },
+})
+
+// Reading a deleted operation.
+op, err := ledger.GetOperation(ctx, 7, 41)
+// op.Status == balancedb.OpDeleted, op.DeletedAt != nil, *op.DeletedBy == 63
+```
+
+A single delete item is a single registration, identical to
+`DELETE /operations/{id}`. In a group a delete counts as −current on the target's
+current account, netted per account with every other item; the group is
+`COMMITTED` (delete and edit items `APPLIED`, new items `CONFIRMED`) or
+`REJECTED` as a whole (no target touched). Two items may not target the same
+operation, whether they edit or delete it. Group membership is not a deletion
+unit: a leg of a `COMMITTED` group may be deleted alone and the transaction stays
+`COMMITTED` with that leg reading `DELETED`. `OpOutcome.DeleteOf` names the target of a delete item
+(`EditOf` stays nil); `OperationOutcome.DeleteOf` does the same on a read, and a
+DELETED regular operation reports `DeletedAt` and `DeletedBy` (the APPLIED
+delete registration) alongside its last values. A delete registration's own
+`Account`/`Amount`/`EffectiveAt` are the target's values as they stood at
+submission, informational only.
+
+New exported sentinels, all `errors.Is`-able through the savepoint rollback:
+`ErrDeleteWithFields` and `ErrDeletesDisabled` (the cell's
+`config.allow_deletes` is false — already registered deletes are still decided;
+independent of `allow_edits`). The target sentinels are shared with edits —
+`ErrEditTargetNotFound`, `ErrEditTargetNotOperation` (the target is itself an
+edit or delete registration), `ErrDuplicateEditTarget`,
+`ErrInvalidExpectedRevision` — and the ledger wraps the first three in a
+`TargetError` whose `Kind` (`TargetEdit` or `TargetDelete`) and `Target` are
+available through `errors.As`, so a host can tell "delete target 41 not found"
+from "edit target 41 not found" without string matching. Replays follow the
+usual idempotency rules: the hash covers owner, `DeleteOf` and
+`ExpectedRevision` exactly as sent.
+
 ## Accounts, balances, statements and outcomes
 
 Account writes use the existing host transaction, just like insertion:
@@ -223,8 +290,10 @@ group, err := ledger.GetTransaction(ctx, ownerID, transactionID)
 
 All methods scope access to the explicit owner ID. Unknown and foreign-owner
 records both return `ErrNotFound`. Amounts, bounds, balances and shortfalls remain
-`int64` minor units. `OperationOutcome.Status` uses `OpPending`, `OpConfirmed`, or
-`OpInvalid`; groups use `TxPending`, `TxCommitted`, or `TxRejected`. Terminal
+`int64` minor units. `OperationOutcome.Status` uses `OpPending`, `OpConfirmed`,
+`OpInvalid` or `OpDeleted` for a regular operation and `OpPending`, `OpApplied`
+or `OpInvalid` for an edit or delete registration; groups use `TxPending`,
+`TxCommitted`, or `TxRejected`. Terminal
 rejections include typed `Rejection` details. A PENDING result is normal; hosts
 can query again later, after committing insertion, using their own request context.
 

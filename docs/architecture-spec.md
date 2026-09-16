@@ -6,12 +6,22 @@
 limits G3 to ID-ordered selection of committed work visible to each work query;
 overlapping insertion transactions may change decision order and acceptance.
 
-**Contract refinement — 2026-09-15:** [ADR-0010](decisions/0009-operation-editing.md)
+**Contract refinement — 2026-09-15:** [ADR-0010](decisions/0010-operation-editing.md)
 adds in-place editing: an edit is a registration row decided by the leader as two
 virtual legs; the target's current columns are overwritten under a revision CAS and
 every superseded state is appended to `operation_revisions`. Principle 5 becomes
 "history append-only", G4 gains the "moved by a confirmed edit" clause, N7 is added,
 and §5.2–§5.4, §7.2 and §8 gain the edit rules.
+
+**Contract refinement — 2026-09-16:** [ADR-0011](decisions/0011-operation-deletion.md)
+adds deletion: a delete is an edit-class registration row (`edit_of` + `is_delete`)
+decided by the leader as one virtual leg (`−current`); the target flips
+`CONFIRMED → DELETED` under the revision CAS with `deleted_by`/`deleted_at`, keeps its
+last values and revision, and no row is ever physically deleted. Principle 5 gains the
+DELETED terminal, N7 extends to deletes, `TARGET_NOT_EDITABLE` covers DELETED targets,
+and §5.2–§5.4, §7.2, §8.2, §8.3, §9, §10, §12 and §13 gain the delete rules (§10.4 is
+the HTTP surface, §8.3 the grouped decision — delete legs in any mix, group
+membership not a deletion unit).
 
 ---
 
@@ -69,7 +79,7 @@ The deployment unit is a **cell**. A cell serves a disjoint set of owners (users
 
 4. **Facts are written once; derivations are computed on read.** No back-pointers, no flags on existing rows, no stored values a query can derive.
 
-5. **Immutability of history (ADR-0010).** An operation's history is append-only: its registration id, `transaction_id`, `reversal_of` and `registered_at` never change, its status flips once, and every superseded state is kept forever in `operation_revisions`. The `operations` row is the *current projection*: a CONFIRMED operation's `account_id`, `amount` and `effective_at` may be overwritten only by the leader applying an edit registration under the revision CAS, in the same transaction that appends the superseded state. Cancellation is still a new opposite operation (reversal); correction is an edit.
+5. **Immutability of history (ADR-0010, ADR-0011).** An operation's history is append-only: its registration id, `transaction_id`, `reversal_of` and `registered_at` never change, its status only moves forward (`PENDING → CONFIRMED → DELETED` or `PENDING → INVALID`, at most two flips), and every superseded state is kept forever in `operation_revisions`. The `operations` row is the *current projection*: a CONFIRMED operation's `account_id`, `amount` and `effective_at` may be overwritten only by the leader applying an edit registration under the revision CAS, in the same transaction that appends the superseded state; its `status`, `deleted_by` and `deleted_at` may be flipped to DELETED only by the leader applying a delete registration under the same CAS, once, with no revision appended — the row's last values are its final state and stay readable. Nothing is ever physically deleted from `operations` or `operation_revisions`. Cancellation is a new opposite operation (reversal), correction is an edit, removal is a delete.
 
 ## 4. Consistency Contract
 
@@ -103,7 +113,7 @@ Publish to client teams verbatim.
 
 - **N6 — No global decision ordering across overlapping insertion transactions (ADR-0008).** Inserting at the end of a short transaction reduces the risk of a later ID being decided first, but cannot eliminate it. A late commit never revisits terminal rejections, including rejected groups. Balance limits, group atomicity, and `(effective_at, id)` timeline ordering remain enforced.
 
-- **N7 — Reversals and edits do not track each other (ADR-0010).** `reversal_of` is inert metadata: editing an operation never adjusts a reversal that points at it, and editing a reversal never adjusts its original. A client that edits a reversed operation owns the follow-up.
+- **N7 — Reversals, edits and deletes do not track each other (ADR-0010, ADR-0011).** `reversal_of` is inert metadata: editing or deleting an operation never adjusts a reversal that points at it, and editing or deleting a reversal never adjusts its original. A reversal of a DELETED operation is an ordinary operation. A client that edits or deletes a reversed operation owns the follow-up.
 
 ## 5. Data Model
 
@@ -207,7 +217,19 @@ CREATE TABLE operations (
 
   CHECK (edit_of IS NULL OR edit_of <> id),
 
-  CHECK (expected_revision IS NULL OR expected_revision >= 1)
+  CHECK (expected_revision IS NULL OR expected_revision >= 1),
+
+  -- Deletion (ADR-0011, migration 0003):
+
+  is_delete           BOOLEAN NOT NULL DEFAULT FALSE,  -- set with edit_of: this row is a delete registration of that operation
+
+  deleted_by          BIGINT NULL REFERENCES operations(id),  -- regular row: the APPLIED delete registration that removed it
+
+  deleted_at          TIMESTAMPTZ NULL,       -- regular row: when it became DELETED (= the delete row's confirmed_at)
+
+  CHECK (NOT is_delete OR edit_of IS NOT NULL),
+
+  CHECK ((deleted_by IS NULL) = (deleted_at IS NULL))
 
 );
 
@@ -287,7 +309,9 @@ CREATE TABLE config (             -- single row; hot-reloaded every cycle
 
   api_max_wait_ms   INT NOT NULL DEFAULT 30000,
 
-  allow_edits       BOOLEAN NOT NULL DEFAULT TRUE  -- FALSE refuses new edit registrations (ADR-0010)
+  allow_edits       BOOLEAN NOT NULL DEFAULT TRUE,  -- FALSE refuses new edit registrations (ADR-0010)
+
+  allow_deletes     BOOLEAN NOT NULL DEFAULT TRUE   -- FALSE refuses new delete registrations (ADR-0011), independent of allow_edits
 
 );
 
@@ -297,11 +321,11 @@ CREATE TABLE config (             -- single row; hot-reloaded every cycle
 
 ```
 
-Operation:    PENDING ──► CONFIRMED            Transaction: PENDING ──► COMMITTED
+Operation:    PENDING ──► CONFIRMED ──► DELETED (terminal, ADR-0011)    Transaction: PENDING ──► COMMITTED
 
-                      └─► INVALID  (terminal)                       └─► REJECTED (terminal)
+                      └─► INVALID  (terminal)                                          └─► REJECTED (terminal)
 
-Edit registration (edit_of set, ADR-0010):
+Edit / delete registration (edit_of set; is_delete marks a delete — ADR-0010, ADR-0011):
 
               PENDING ──► APPLIED  (terminal)
 
@@ -309,7 +333,7 @@ Edit registration (edit_of set, ADR-0010):
 
 ```
 
-`INVALID` / `APPLIED` / `REJECTED` are terminal; recovery is client re-submission. All operations of a group flip together with their transaction row, in one DB transaction (`COMMITTED` means every regular leg CONFIRMED and every edit leg APPLIED). An edit registration is never CONFIRMED, so every read that selects CONFIRMED rows excludes edits without a query change. Applying an edit also bumps the target's `revision` and sets `revised_at`, the only post-decision change a regular row ever sees.
+`INVALID` / `APPLIED` / `DELETED` / `REJECTED` are terminal; recovery is client re-submission (there is no restore of a DELETED operation — re-insert instead). All operations of a group flip together with their transaction row, in one DB transaction (`COMMITTED` means every regular leg was CONFIRMED and every edit or delete leg APPLIED *at decision time*; a regular leg may be DELETED later by its own delete registration — group membership is not a deletion unit). An edit or delete registration is never CONFIRMED and a DELETED row is no longer CONFIRMED, so every read that selects CONFIRMED rows excludes both without a query change. Applying an edit bumps the target's `revision` and sets `revised_at`; applying a delete flips the target to DELETED and stamps `deleted_by`/`deleted_at`, leaving its values and `revision` untouched — the only post-decision changes a regular row ever sees.
 
 ### 5.4 Ordering and reversals
 
@@ -318,6 +342,8 @@ Timeline order is the composite key `(effective_at, id)` — deterministic, uniq
 A reversal is an ordinary operation with the opposite amount, typically the original's `effective_at`, and `reversal_of` set at insertion — immutable metadata, unused by the engine. Nothing is ever written to the reversed operation; "was it reversed?" is derived by querying the index. The partial unique index blocks double reversal while allowing a retry after a *rejected* reversal.
 
 **Edits (ADR-0010).** An edit is a registration row with `edit_of = <target>` carrying the full proposed state (`account_id`, `amount`, `effective_at`; omitted fields are resolved from the target's current row at submission, so the hash covers the request as sent) and an optional `expected_revision`. The target must exist, belong to the same owner, and be a regular operation; one request may edit a given operation at most once; `reversal_of` is never set on an edit. Registration id, owner, `transaction_id`, `reversal_of` and `registered_at` are never editable. Editing and reversing are independent (N7): a client corrects by editing and cancels by reversing. When an applied edit changes `effective_at` the operation moves to its new timeline position with its original id as the tiebreaker (G4). `config.allow_edits = false` refuses new edit registrations; edits already registered are still decided.
+
+**Deletes (ADR-0011).** A delete is an edit-class registration row with `edit_of = <target>` and `is_delete = TRUE`, carrying only its target and an optional `expected_revision` (the row's `account_id`, `amount`, `effective_at` are an informational copy of the target at submission that the leader never reads; the hash covers `owner`, `delete_of`, `expected_revision`). The same target rules as an edit apply at submission — exists, same owner, a regular operation, named at most once per request across edits and deletes — and the target's *status* is deliberately not checked there: a DELETED, INVALID or PENDING target is a decision-time outcome. A DELETED operation keeps its `(effective_at, id)` position on its row for audit views but is excluded from every CONFIRMED read; a reversal of a DELETED operation is an ordinary operation, and `idx_ops_reversal` keeps a DELETED reversal "live" (its predicate is `status <> 'INVALID'`) because deleting a reversal does not restore its original. `config.allow_deletes = false` refuses new delete registrations independently of `allow_edits`; deletes already registered are still decided.
 
 ## 6. Balances & Validation
 
@@ -399,6 +425,18 @@ UPDATE operations SET account_id = :new, amount = :new, effective_at = :new,
 
 ```
 
+Deciding a delete registration (ADR-0011) keeps the same three guards — Guard 2 flips the delete row `PENDING → APPLIED`, Guard 3 runs on the target's account with the net of the one virtual leg — and its fourth rowcount-checked write is the **delete CAS**, the same predicate with a different payload:
+
+```sql
+
+UPDATE operations SET status = 'DELETED', deleted_by = :delete_id, deleted_at = now()
+
+ WHERE id = :target AND revision = :revision_read AND status = 'CONFIRMED';   -- 0 rows? rollback
+
+```
+
+A concurrent edit apply bumped `revision`, a concurrent delete apply left the row non-CONFIRMED: either way the CAS matches 0 rows and the whole batch rolls back. `revision` is not bumped and no revision row is appended by a delete.
+
 ## 8. Processing Algorithm
 
 ### 8.1 Main loop (leader only)
@@ -434,17 +472,21 @@ One DB transaction: read account (balance, version, limits) → binary validatio
 **Edit registration (ADR-0010).** Same transaction shape, with the item expanded into two *virtual legs*. Read the target (`account_id, amount, effective_at, status, revision, registered_at, revised_at`):
 
 - target `PENDING` → the unit is **deferred**: skipped, left PENDING, counted (`balancedb_edit_deferrals_total`), and the batch continues with the next unit; the next select of the same drain starts past it so a deferred head-of-queue never starves later work, and the next cycle decides target and edit in id order. Only reachable when a work query sees an edit whose target it has not decided (overlapping insertion transactions, ADR-0008).
-- target `INVALID` → REJECT with `TARGET_NOT_EDITABLE{operation_id}`.
+- target `INVALID` or `DELETED` (ADR-0011) → REJECT with `TARGET_NOT_EDITABLE{operation_id}`.
 - `expected_revision` set and ≠ `revision` → REJECT with `STALE_REVISION{operation_id, expected_revision, actual_revision}`.
 - otherwise the legs are `(−current_amount, current_account, current_effective_at)` and `(+new_amount, new_account, new_effective_at)`, netted per account; every involved account is read and validated in ascending id order (§6), the first violation rejecting with `LIMIT_VIOLATED`.
 
 ACCEPT: flip the edit row `PENDING → APPLIED` (Guard 2); append the superseded state to `operation_revisions` with `recorded_at = COALESCE(target.revised_at, target.registered_at)` and `superseded_by = <edit id>`; overwrite the target under the revision CAS (§7.2); apply each account's net under Guard 3; update snapshots per virtual leg with same-bucket coalescing (§8.4); NOTIFY `op:<edit id>`. REJECT: flip the edit row to INVALID with the reason — no balance, snapshot or revision write, the target untouched. Two edits of one target in one batch are decided sequentially in the same transaction; the second reads the first's result, so its CAS holds.
+
+**Delete registration (ADR-0011).** The same transaction shape with the item expanded into *one* virtual leg. Read the target exactly as for an edit; the same three target rules apply verbatim (`PENDING` → deferred, counted on the shared `balancedb_edit_deferrals_total`; `INVALID` or `DELETED` → `TARGET_NOT_EDITABLE{operation_id}`; a mismatched `expected_revision` → `STALE_REVISION`); otherwise the leg is `(−current_amount, current_account, current_effective_at)` — the values as they stand when the leader decides, never the delete row's informational copy — and the account is read and validated (§6) against the limits in force at processing time, a violation rejecting with `LIMIT_VIOLATED`. ACCEPT: flip the delete row `PENDING → APPLIED` (Guard 2); flip the target `CONFIRMED → DELETED` under the delete CAS (§7.2) with `deleted_by = <delete id>`, `deleted_at = now()`; apply the account's net under Guard 3; exactly one `snapshot.Apply(−current_amount)` at the target's current instant (§8.4, no coalescing — there is no pair); NOTIFY `op:<delete id>`. No revision row is appended and `revision` is untouched. REJECT: flip the delete row to INVALID with the reason and its decision instant — nothing else written. A delete and an edit of one target in one batch are decided in id order: delete first leaves the edit `TARGET_NOT_EDITABLE`; edit first lets the delete remove the *edited* values.
 
 ### 8.3 Group
 
 One DB transaction for the entire group: load all legs by `transaction_id` (the universe is complete — groups are inserted atomically, §10.1; cross-check `op_count`) → compute net per account → read and validate every involved account → all pass: apply every account's net (each under Guard 3), update snapshots for every leg, flip all legs to CONFIRMED and the transaction to COMMITTED; any fail: flip all legs to INVALID and the transaction to REJECTED with reason. **Group atomicity is simply the DB transaction** — there is no distributed protocol.
 
 **Edit legs (ADR-0010).** A group may mix edit registrations with regular legs. Every edit leg's target is read as in §8.2; any target still PENDING defers the whole group (every leg stays PENDING, one deferral counted, the drain cursor moves past all its legs); then, in leg order, a target that ended INVALID or is not at the leg's `expected_revision` rejects the whole group with `TARGET_NOT_EDITABLE` / `STALE_REVISION` — every leg INVALID with that one reason, no target touched. Otherwise the net per account is taken over all *virtual* legs (one per regular leg, two per edit leg) and validated as above. ACCEPT: Guard 2 flips regular legs `PENDING → CONFIRMED` and edit legs `PENDING → APPLIED` as two conditional updates split by `edit_of IS NULL / IS NOT NULL`, each rowcount-checked against its own class's leg count (so together they cover every leg), then the transaction to COMMITTED; for each edit leg, in leg order, the history row is appended and the target overwritten under the revision CAS (two legs never share a target — refused at registration); Guard 3 runs once per involved account with its net; snapshots update per regular leg and per coalesced edit-leg pair (§8.4); NOTIFY `tx:<id>`. REJECT: the same split flips to INVALID (a rejected edit leg stamps `confirmed_at` as its decision instant, like a rejected single edit) and the transaction to REJECTED. Either every regular leg is CONFIRMED and every edit leg APPLIED, or every leg is INVALID.
+
+**Delete legs (ADR-0011).** A group may also carry delete registrations, in any mix with edit and regular legs (two legs never target one operation — refused at registration). A delete leg is an edit-class leg: its target is read with the edit legs' (`selectGroupLegs` adds `is_delete`), the whole-group deferral and the leg-order `checkTarget` rules above apply verbatim (a DELETED target is `TARGET_NOT_EDITABLE`), and it expands to *one* virtual leg `(−current_amount, current_account, current_effective_at)` — the target as read in the deciding transaction, never the leg's informational copy — so the net per account runs over one leg per regular leg, two per edit leg and one per delete leg. ACCEPT: the Guard 2 split is unchanged — delete legs flip `PENDING → APPLIED` with the edit legs (`edit_of IS NOT NULL`), the rowcount still matching the edit-class count; then, per edit-class leg in leg order, an edit leg appends its history row and runs the revision CAS, a delete leg runs the delete CAS of §7.2 (`status = 'DELETED', deleted_by = <leg id>, deleted_at = now()` at the revision read, rowcount 1 or rollback), appending nothing and leaving `revision` untouched; Guard 3 runs once per involved account with its net; snapshots update per regular leg, per coalesced edit-leg pair and per delete leg as-is (one `snapshot.Apply(−current_amount)` at the target's current instant, no pair to coalesce); NOTIFY `tx:<id>`. REJECT: unchanged — the same split flips every leg to INVALID with the one shared reason (a rejected delete leg stamps `confirmed_at` like a rejected edit leg), the transaction to REJECTED, and no target is touched. Group atomicity now reads: either every regular leg is CONFIRMED, every edit leg APPLIED and every delete leg APPLIED (each target DELETED), or every leg is INVALID and no target is touched (Safety Invariant 6, ADR-0011). **Group membership is not a deletion unit**: deleting any leg of a COMMITTED group — alone or in a later group — leaves the transaction COMMITTED with its `op_count`; the deleted leg keeps its `transaction_id` and reads `DELETED` among its siblings.
 
 ### 8.4 Applying amounts — snapshots
 
@@ -474,6 +516,8 @@ Commit fsync (~2–5 ms) dominates service time. The leader packs up to `batch_s
 
 - **Statement with running balance**: page over `idx_ops_timeline` (CONFIRMED only), seeded by the snapshot preceding the page, prefix-summed within the page.
 
+- **Deleted operations (ADR-0011)**: every read above selects `status = 'CONFIRMED'`, so a DELETED operation leaves the final balance (its `−current` leg was applied), the point-in-time sums and the statement without any query change; snapshots were moved by the same leg. The row itself stays readable by id (operation and transaction views, history) as `DELETED` with its last values, `deleted_by` and `deleted_at`.
+
 - **Retention**: full history kept in the database indefinitely — no archival tier. If volume ever demands it, native time-based table partitioning applies without design changes.
 
 ## 10. HTTP API
@@ -495,6 +539,7 @@ Idempotency-Key: <client-generated UUID>          (required)
   "wait_ms": 0 }
 
 -- an item may instead be an edit: { "edit_of": <op_id>, "expected_revision"?, "account"?, "amount"?, "effective_at"? }  (§10.3)
+-- or a delete:                    { "delete_of": <op_id>, "expected_revision"? }  (§10.4)
 
 ```
 
@@ -513,10 +558,14 @@ Idempotency-Key: <client-generated UUID>          (required)
 GET /transactions/{id}      → group status + per-leg statuses
 
 GET /operations/{id}        → status, current account/amount/effective_at, revision (edit rows:
-                              edit_of, expected_revision, proposed state); if INVALID: reason + detail
+                              edit_of, expected_revision, proposed state; delete rows: delete_of,
+                              expected_revision, the target's values at submission; DELETED rows:
+                              last values + deleted_at, deleted_by); if INVALID: reason + detail
 
 GET /operations/{id}/history → append-only revisions (oldest first, last = current) + pending and
-                              rejected edits (ADR-0010); 404 for an edit registration id
+                              rejected edits and deletes, each with kind (ADR-0010, ADR-0011);
+                              deleted_at/deleted_by once DELETED; 404 for an edit or delete
+                              registration id
 
 GET /accounts/{ext}/balance             → final balance
 
@@ -543,6 +592,18 @@ PATCH /operations/{id}      { "amount"?, "effective_at"?, "account"?, "expected_
 Registers one edit (`Idempotency-Key` required, same rules as §10.1); omitted fields are unchanged and at least one of the first three is required. Returns `{"edit": {id, status, operation_id, rejection?}, "replayed"}` — `202` immediately, or with `wait_ms > 0` the §10.1 wait on `op:<edit id>` → `200` with `APPLIED | INVALID`. Statement entries carry `revision`; edit registrations never appear in statements or balances. `403` when `config.allow_edits` is false; `404` for an unknown or another owner's target.
 
 **Grouped and mixed edits.** A `POST /transactions` item with `edit_of` (plus optional `expected_revision`) is an edit item; `account`, `amount` and `effective_at` are then optional (omitted = unchanged, at least one required) and `reversal_of` is not allowed. Items without `edit_of` are new operations exactly as before — the handler refuses one missing `account`, `amount` or `effective_at` with `400`. One request is one atomic unit with the §10.1 rules (one owner, `max_group_size`, all-or-nothing, net per account, §8.3); two items may not edit the same operation (`422`); an unknown or foreign target is `422` in this context; `403` when `config.allow_edits` is false. Outcomes carry `edit_of` on edit items; `GET /transactions/{id}` legs carry `edit_of` (edit legs) or `revision` (regular legs). A decided group is `COMMITTED` (edit items `APPLIED`, new items `CONFIRMED`) or `REJECTED` (every item `INVALID` with one shared rejection).
+
+### 10.4 Deleting (ADR-0011)
+
+```
+
+DELETE /operations/{id}?expected_revision=&wait_ms=      (no body)
+
+```
+
+Registers one delete (`Idempotency-Key` required, same rules as §10.1; the target and `expected_revision` are the payload, `wait_ms` is not). Returns `{"deletion": {id, status, operation_id, rejection?}, "replayed"}` — `202` immediately, or with `wait_ms > 0` the §10.1 wait on `op:<deletion id>` → `200` with `APPLIED | INVALID`. When applied the operation reads `DELETED` with its last values, `deleted_at` and `deleted_by` (`GET /operations/{id}`, `/history`, the group's legs) and leaves every statement, balance and point-in-time projection; the id never changes and nothing is physically removed. `expected_revision` (`>= 1`, schema-checked) makes the delete `STALE_REVISION` unless the operation is at that revision when decided; a target that ended `INVALID` or is already `DELETED` is `TARGET_NOT_EDITABLE` at decision time, never at submission. `403` when `config.allow_deletes` is false (independent of `allow_edits`); `404` for an unknown or another owner's target; `422` when the id is an edit or delete registration (`delete target 57 is an edit, not an operation`).
+
+**Grouped and mixed deletes.** A `POST /transactions` item with `delete_of` (plus optional `expected_revision`) is a delete item; any other field on it is `400` (`a delete item carries only delete_of and expected_revision`). It mixes freely with edit items and new operations under the §10.1/§10.3 rules: one owner, `max_group_size`, all-or-nothing, net per account (§8.3); two items may not target the same operation in any mix of kinds (`422 duplicate edit target 41`); an unknown or foreign target is `422 delete target 999 not found`; `403` when `config.allow_deletes` is false. Outcomes carry `delete_of` on delete items; `GET /transactions/{id}` legs carry `delete_of` (delete legs), `edit_of` (edit legs) or `revision` (regular legs), and a regular leg deleted after its group committed reads `DELETED` while the group stays `COMMITTED`. A decided group is `COMMITTED` (delete and edit items `APPLIED`, targets `DELETED` / at their next revision, new items `CONFIRMED`) or `REJECTED` (every item `INVALID` with one shared rejection, no target touched). A single `delete_of` item is the same registration as `DELETE /operations/{id}` (one idempotency key covers both forms).
 
 ## 11. Scaling Model
 
@@ -574,7 +635,9 @@ Registers one edit (`Idempotency-Key` required, same rules as §10.1); omitted f
 
 | Lost NOTIFY | A waiting API request | Covered by the polling fallback |
 
-| Edit reaches the leader before its target is decided (overlapping insertion transactions, ADR-0008/0009) | That unit is deferred, counted, left PENDING; work behind it proceeds | Decided in a later cycle in id order once the target is; nothing to operate |
+| Edit or delete reaches the leader before its target is decided (overlapping insertion transactions, ADR-0008/0010/0011) | That unit is deferred, counted, left PENDING; work behind it proceeds | Decided in a later cycle in id order once the target is; nothing to operate |
+
+| Stale leader applies a delete after a concurrent edit or delete of the same target (ADR-0011) | Delete CAS matches 0 rows (revision moved or status no longer CONFIRMED) | Batch rolled back; re-decided next cycle against the target's new state |
 
 ## 13. Observability (per cell, from day one)
 
@@ -594,9 +657,9 @@ Registers one edit (`Idempotency-Key` required, same rules as §10.1); omitted f
 
 | NOTIFY→outcome lag | API wait health |
 
-| Decisions by kind and outcome (`single`/`group`/`edit` × `confirmed`/`invalid`/`committed`/`rejected`/`applied`) | Edit adoption and rejection mix (ADR-0010) |
+| Decisions by kind and outcome (`single`/`group`/`edit`/`delete` × `confirmed`/`invalid`/`committed`/`rejected`/`applied`) | Edit and delete adoption and rejection mix (ADR-0010, ADR-0011) |
 
-| Edit deferrals (`balancedb_edit_deferrals_total`) | A sustained rate means overlapping insertion transactions (ADR-0008); zero is the norm |
+| Edit deferrals (`balancedb_edit_deferrals_total`; counts deferred deletes too) | A sustained rate means overlapping insertion transactions (ADR-0008); zero is the norm |
 
 ## 14. Key Rationale (why it is this way)
 

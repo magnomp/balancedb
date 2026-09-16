@@ -117,6 +117,47 @@ components:
         - operations
         - replayed
       type: object
+    DeleteOutputBody:
+      additionalProperties: false
+      properties:
+        $schema:
+          description: A URL to the JSON Schema for this object.
+          examples:
+            - https://example.com/schemas/DeleteOutputBody.json
+          format: uri
+          readOnly: true
+          type: string
+        deletion:
+          $ref: "#/components/schemas/DeletionOutcome"
+        replayed:
+          description: True when this request replayed an existing idempotency key and wrote no new rows (G6).
+          type: boolean
+      required:
+        - deletion
+        - replayed
+      type: object
+    DeletionOutcome:
+      additionalProperties: false
+      properties:
+        id:
+          description: Registration id of the delete; GET /operations/{id} reads it back.
+          format: int64
+          type: integer
+        operation_id:
+          description: The deleted operation (the id in the request path).
+          format: int64
+          type: integer
+        rejection:
+          $ref: "#/components/schemas/Rejection"
+          description: Machine-readable rejection detail; present only when the delete is INVALID.
+        status:
+          description: "Delete status: PENDING | APPLIED | INVALID."
+          type: string
+      required:
+        - id
+        - status
+        - operation_id
+      type: object
     EditOperationInputBody:
       additionalProperties: false
       properties:
@@ -284,10 +325,22 @@ components:
           readOnly: true
           type: string
         account:
-          description: Account external id (current value; for an edit, the proposed one).
+          description: Account external id (current value — the last one once DELETED; for an edit, the proposed one; for a delete, the target's at submission).
           type: string
         amount:
           description: Signed amount in minor units (e.g. cents); positive is a credit, negative a debit. Integer only — fractional or exponent values are rejected. Values are int64 and may exceed JavaScript's safe-integer range (2^53); clients that use JS numbers can lose precision and should treat the field as a string or bigint.
+          format: int64
+          type: integer
+        delete_of:
+          description: "Present only on a delete registration: the operation it deletes."
+          format: int64
+          type: integer
+        deleted_at:
+          description: "Present only on a DELETED operation: the instant the delete was applied."
+          format: date-time
+          type: string
+        deleted_by:
+          description: "Present only on a DELETED operation: the registration id of the APPLIED delete."
           format: int64
           type: integer
         edit_of:
@@ -295,11 +348,11 @@ components:
           format: int64
           type: integer
         effective_at:
-          description: Timeline instant (current value; for an edit, the proposed one).
+          description: Timeline instant (current value; for an edit, the proposed one; for a delete, the target's at submission).
           format: date-time
           type: string
         expected_revision:
-          description: Present only on an edit registration that carries an optimistic guard.
+          description: Present only on an edit or delete registration that carries an optimistic guard.
           format: int32
           type: integer
         id:
@@ -309,11 +362,11 @@ components:
           $ref: "#/components/schemas/Rejection"
           description: Machine-readable rejection detail; present only when the row is INVALID.
         revision:
-          description: Current revision of a regular operation (1 until its first applied edit); absent on an edit registration.
+          description: Current revision of a regular operation (1 until its first applied edit; frozen once DELETED); absent on an edit or delete registration.
           format: int32
           type: integer
         status:
-          description: "Operation status: PENDING | CONFIRMED | INVALID; an edit registration is PENDING | APPLIED | INVALID."
+          description: "Operation status: PENDING | CONFIRMED | INVALID | DELETED; an edit or delete registration is PENDING | APPLIED | INVALID."
           type: string
         transaction_id:
           description: Group transaction id if this operation is a group leg; absent for a single.
@@ -363,6 +416,10 @@ components:
     LegStatus:
       additionalProperties: false
       properties:
+        delete_of:
+          description: "Present only on a delete leg: the operation it deletes."
+          format: int64
+          type: integer
         edit_of:
           description: "Present only on an edit leg: the operation it edits."
           format: int64
@@ -374,11 +431,11 @@ components:
           $ref: "#/components/schemas/Rejection"
           description: Machine-readable rejection detail; present only when the group was REJECTED.
         revision:
-          description: Current revision of a regular leg (1 until its first applied edit); absent on an edit leg.
+          description: Current revision of a regular leg (1 until its first applied edit); absent on an edit or delete leg.
           format: int32
           type: integer
         status:
-          description: "Operation status: PENDING | CONFIRMED | INVALID; an edit leg is PENDING | APPLIED | INVALID."
+          description: "Operation status: PENDING | CONFIRMED | INVALID | DELETED; an edit or delete leg is PENDING | APPLIED | INVALID."
           type: string
       required:
         - id
@@ -397,32 +454,40 @@ components:
         current_revision:
           format: int32
           type: integer
+        deleted_at:
+          description: "Present only when DELETED: the instant the delete was applied."
+          format: date-time
+          type: string
+        deleted_by:
+          description: "Present only when DELETED: the registration id of the APPLIED delete."
+          format: int64
+          type: integer
         operation_id:
           format: int64
           type: integer
         pending_edits:
-          description: Undecided edits targeting this operation, in registration-id order.
+          description: Undecided edits and deletes targeting this operation, in registration-id order.
           items:
             $ref: "#/components/schemas/PendingEdit"
           type:
             - array
             - "null"
         rejected_edits:
-          description: Rejected (INVALID) edits targeting this operation, in registration-id order.
+          description: Rejected (INVALID) edits and deletes targeting this operation, in registration-id order.
           items:
             $ref: "#/components/schemas/RejectedEdit"
           type:
             - array
             - "null"
         revisions:
-          description: Ordered by revision; the last entry is the current state.
+          description: Ordered by revision; the last entry is the current state (the last values, once DELETED).
           items:
             $ref: "#/components/schemas/RevisionEntry"
           type:
             - array
             - "null"
         status:
-          description: "Operation status: PENDING | CONFIRMED | INVALID."
+          description: "Operation status: PENDING | CONFIRMED | INVALID | DELETED."
           type: string
       required:
         - operation_id
@@ -443,8 +508,12 @@ components:
           description: Signed amount in minor units (e.g. cents); positive is a credit, negative a debit. Integer only — fractional or exponent values are rejected. Values are int64 and may exceed JavaScript's safe-integer range (2^53); clients that use JS numbers can lose precision and should treat the field as a string or bigint.
           format: int64
           type: integer
+        delete_of:
+          description: "Makes this item a delete of the named operation (ADR-0011): the group applies it atomically with its other items, netting the removal per account. The target must be a regular operation of this owner; no field other than expected_revision may accompany it; two items may not edit or delete the same operation."
+          format: int64
+          type: integer
         edit_of:
-          description: "Makes this item an edit of the named operation (ADR-0010): the group applies it atomically with its other items, netting all changes per account. The target must be a regular operation of this owner; two items may not edit the same operation."
+          description: "Makes this item an edit of the named operation (ADR-0010): the group applies it atomically with its other items, netting all changes per account. The target must be a regular operation of this owner; two items may not edit or delete the same operation."
           format: int64
           type: integer
         effective_at:
@@ -452,7 +521,7 @@ components:
           format: date-time
           type: string
         expected_revision:
-          description: "Edit items only. Optional optimistic guard (>= 1): the group is rejected with STALE_REVISION unless the target is at exactly this revision when decided."
+          description: "Edit and delete items only. Optional optimistic guard (>= 1): the group is rejected with STALE_REVISION unless the target is at exactly this revision when decided."
           format: int32
           type: integer
         reversal_of:
@@ -463,6 +532,10 @@ components:
     OperationOutcome:
       additionalProperties: false
       properties:
+        delete_of:
+          description: "Present only on a delete item: the operation it deletes."
+          format: int64
+          type: integer
         edit_of:
           description: "Present only on an edit item: the operation it edits."
           format: int64
@@ -472,7 +545,7 @@ components:
           format: int64
           type: integer
         status:
-          description: "Operation status: PENDING | CONFIRMED | INVALID; an edit item is PENDING | APPLIED | INVALID."
+          description: "Operation status: PENDING | CONFIRMED | INVALID | DELETED; an edit or delete item is PENDING | APPLIED | INVALID."
           type: string
       required:
         - id
@@ -494,11 +567,18 @@ components:
           format: int32
           type: integer
         id:
-          description: Registration id of the edit.
+          description: Registration id of the edit or delete.
           format: int64
           type: integer
+        kind:
+          description: "Registration kind: edit | delete."
+          enum:
+            - edit
+            - delete
+          type: string
       required:
         - id
+        - kind
         - account
         - amount
         - effective_at
@@ -522,13 +602,20 @@ components:
           format: int32
           type: integer
         id:
-          description: Registration id of the edit.
+          description: Registration id of the edit or delete.
           format: int64
           type: integer
+        kind:
+          description: "Registration kind: edit | delete."
+          enum:
+            - edit
+            - delete
+          type: string
         rejection:
           $ref: "#/components/schemas/Rejection"
       required:
         - id
+        - kind
         - account
         - amount
         - effective_at
@@ -675,7 +762,7 @@ components:
 info:
   description: "BalanceDB — a Postgres-backed balance-maintenance engine (ledger). Clients insert money operations (singles or atomic groups); a single elected processor selects visible committed work in ID order and validates it so an account's final balance never breaks its configured limits. Insertion is asynchronous: POST /transactions returns 202 and outcomes are queried later."
   title: BalanceDB API
-  version: 1.1.0
+  version: 1.2.0
 openapi: 3.1.0
 paths:
   /accounts:
@@ -850,6 +937,66 @@ paths:
       tags:
         - Queries
   /operations/{id}:
+    delete:
+      description: "Registers one delete against the operation: a registration in the same id sequence as operations and edits, decided by the processor in registration order like any insert. When applied, the operation reads DELETED with its last values, deleted_at and deleted_by, leaves every balance, statement and point-in-time projection, and can no longer be edited or deleted; the operation id never changes and nothing is physically removed. There is no request body (one is ignored). expected_revision (>= 1) makes the delete STALE_REVISION unless the operation is at that revision when decided. By default returns 202 immediately; wait_ms > 0 waits like POST /transactions and returns 200 with the decided status (APPLIED or INVALID with the rejection) if it lands in time. 403 when config.allow_deletes is false for the cell; 404 for an unknown or another owner's operation; 422 when the id is an edit or delete registration."
+      operationId: deleteOperation
+      parameters:
+        - description: Owner scope for the request (§2). The target must belong to this owner.
+          in: header
+          name: X-Owner-Id
+          required: true
+          schema:
+            description: Owner scope for the request (§2). The target must belong to this owner.
+            type: string
+        - description: Client-generated UUID. Retrying with the same key never registers a second delete (G6); reusing it with a different payload is rejected with 422.
+          in: header
+          name: Idempotency-Key
+          required: true
+          schema:
+            description: Client-generated UUID. Retrying with the same key never registers a second delete (G6); reusing it with a different payload is rejected with 422.
+            type: string
+        - description: Registration id of the operation to delete.
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Registration id of the operation to delete.
+            format: int64
+            type: integer
+        - description: "Optional optimistic guard (>= 1): the delete is rejected with STALE_REVISION unless the operation is at exactly this revision when the delete is decided."
+          explode: false
+          in: query
+          name: expected_revision
+          schema:
+            description: "Optional optimistic guard (>= 1): the delete is rejected with STALE_REVISION unless the operation is at exactly this revision when the delete is decided."
+            format: int32
+            minimum: 1
+            type: integer
+        - description: "Optional synchronous wait budget in milliseconds, same semantics as POST /transactions: 0 or omitted returns 202 immediately; > 0 waits up to this many ms (capped by api_max_wait_ms) for the decision — 200 with the decided status if it lands in time, otherwise 202 with the current (still PENDING) state."
+          explode: false
+          in: query
+          name: wait_ms
+          schema:
+            description: "Optional synchronous wait budget in milliseconds, same semantics as POST /transactions: 0 or omitted returns 202 immediately; > 0 waits up to this many ms (capped by api_max_wait_ms) for the decision — 200 with the decided status if it lands in time, otherwise 202 with the current (still PENDING) state."
+            format: int64
+            minimum: 0
+            type: integer
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteOutputBody"
+          description: Accepted
+        default:
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ErrorModel"
+          description: Error
+      summary: Delete an operation in place, keeping its trail
+      tags:
+        - Deleting
     get:
       operationId: getOperation
       parameters:
@@ -881,7 +1028,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
-      summary: Get an operation's status, current values and revision (or an edit registration's proposed state) and, if INVALID, its rejection detail
+      summary: Get an operation's status, current values and revision (its last values plus deleted_at/deleted_by once DELETED; an edit or delete registration's state as submitted) and, if INVALID, its rejection detail
       tags:
         - Queries
     patch:
@@ -934,7 +1081,7 @@ paths:
         - Editing
   /operations/{id}/history:
     get:
-      description: Every state the operation has held, in revision order (the last entry is current); superseded entries name the APPLIED edit that replaced them. pending_edits and rejected_edits list undecided and INVALID edit registrations against the operation in registration-id order. 404 for an unknown id, another owner's id, or an edit registration id.
+      description: Every state the operation has held, in revision order (the last entry is current — the last values once DELETED, when deleted_at/deleted_by name the applied delete); superseded entries name the APPLIED edit that replaced them. pending_edits and rejected_edits list undecided and INVALID edit and delete registrations against the operation in registration-id order, each tagged with its kind. 404 for an unknown id, another owner's id, or an edit or delete registration id.
       operationId: getOperationHistory
       parameters:
         - description: Owner scope (§2).
@@ -944,12 +1091,12 @@ paths:
           schema:
             description: Owner scope (§2).
             type: string
-        - description: Operation (registration) id. Edit registration ids are not operations and yield 404.
+        - description: Operation (registration) id. Edit and delete registration ids are not operations and yield 404.
           in: path
           name: id
           required: true
           schema:
-            description: Operation (registration) id. Edit registration ids are not operations and yield 404.
+            description: Operation (registration) id. Edit and delete registration ids are not operations and yield 404.
             format: int64
             type: integer
       responses:
@@ -965,7 +1112,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorModel"
           description: Error
-      summary: Get an operation's append-only revision history with its pending and rejected edits
+      summary: Get an operation's append-only revision history with its pending and rejected edits and deletes
       tags:
         - Editing
   /transactions:

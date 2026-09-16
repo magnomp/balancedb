@@ -32,6 +32,25 @@ var (
 	ErrInvalidExpectedRevision = ledger.ErrInvalidExpectedRevision
 	ErrEditsDisabled           = ledger.ErrEditsDisabled
 	ErrEditWithReversal        = ledger.ErrEditWithReversal
+
+	// Delete items (ADR-0011). The target sentinels above are shared with edits;
+	// the ledger wraps them in a TargetError that carries the offending item's
+	// kind and id.
+	ErrDeleteWithFields = ledger.ErrDeleteWithFields
+	ErrDeletesDisabled  = ledger.ErrDeletesDisabled
+)
+
+// TargetError is the ledger's kind-carrying wrap of a shared target sentinel
+// (ErrEditTargetNotFound, ErrEditTargetNotOperation, ErrDuplicateEditTarget):
+// errors.As yields the item kind and target id the error message names.
+type (
+	TargetError = ledger.TargetError
+	TargetKind  = ledger.TargetKind
+)
+
+const (
+	TargetEdit   = ledger.TargetEdit
+	TargetDelete = ledger.TargetDelete
 )
 
 // Insert registers work using the shared core. The caller must roll back tx on

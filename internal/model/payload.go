@@ -40,10 +40,24 @@ type CanonicalEditOp struct {
 	ExpectedRevision *int32     `json:"expected_revision"`
 }
 
+// CanonicalDeleteOp is the business content of one delete item (ADR-0011) for
+// idempotency hashing. A delete carries nothing but its target and the optional
+// revision guard, so those are the whole payload: a DELETE /operations/{id} and a
+// {"delete_of": id} item in POST /transactions build the same canonical item.
+// Its encoding is distinct from CanonicalEditOp's (no account/amount/effective_at
+// keys, "delete_of" instead of "edit_of"), so a delete never collides with an
+// edit of the same target.
+type CanonicalDeleteOp struct {
+	OwnerID          int64  `json:"owner_id"`
+	DeleteOf         int64  `json:"delete_of"`
+	ExpectedRevision *int32 `json:"expected_revision"`
+}
+
 // HashPayload computes the canonical SHA-256 of a request's items, used to
 // detect same-key/different-payload retries (spec §10.1: same key + different
-// payload → 422). Each item is a CanonicalOp (a new operation) or a
-// CanonicalEditOp (an edit); any other type is a programming error.
+// payload → 422). Each item is a CanonicalOp (a new operation), a
+// CanonicalEditOp (an edit) or a CanonicalDeleteOp (a delete); any other type is
+// a programming error.
 //
 // Canonicalisation: item order is significant (it is part of the request), each
 // effective_at is normalised to UTC so the same instant hashes identically
@@ -63,6 +77,8 @@ func HashPayload(items []any) ([]byte, error) {
 				at := v.EffectiveAt.UTC()
 				v.EffectiveAt = &at
 			}
+			norm[i] = v
+		case CanonicalDeleteOp:
 			norm[i] = v
 		default:
 			return nil, fmt.Errorf("hash payload: item %d has unsupported type %T", i, item)
