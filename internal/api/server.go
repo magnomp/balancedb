@@ -35,7 +35,7 @@ type WaitObserver interface {
 // automatically would make the committed spec churn on every build (ADR-0003).
 const (
 	apiTitle   = "BalanceDB API"
-	apiVersion = "1.0.0"
+	apiVersion = "1.1.0"
 )
 
 // Server is the HTTP surface of a cell (spec §10), built on Huma v2 over a chi mux
@@ -136,9 +136,28 @@ func (s *Server) register() {
 		OperationID: "getOperation",
 		Method:      http.MethodGet,
 		Path:        "/operations/{id}",
-		Summary:     "Get an operation's status and, if INVALID, its rejection detail",
+		Summary:     "Get an operation's status, current values and revision (or an edit registration's proposed state) and, if INVALID, its rejection detail",
 		Tags:        []string{"Queries"},
 	}, s.getOperation)
+
+	huma.Register(s.api, huma.Operation{
+		OperationID:   "editOperation",
+		Method:        http.MethodPatch,
+		Path:          "/operations/{id}",
+		Summary:       "Edit an operation in place (amount, effective_at and/or account)",
+		Description:   "Registers one edit against the operation: a registration in the same id sequence as operations, decided by the processor in registration order like any insert. When applied, the operation's current values change under a new revision and the superseded state is kept in its append-only history (GET /operations/{id}/history); the operation id never changes. Omitted fields are unchanged; at least one of amount, effective_at, account is required. expected_revision (>= 1) makes the edit STALE_REVISION unless the operation is at that revision when decided. By default returns 202 immediately; wait_ms > 0 waits like POST /transactions and returns 200 with the decided status (APPLIED or INVALID with the rejection) if it lands in time. 403 when config.allow_edits is false for the cell; 404 for an unknown or another owner's operation.",
+		Tags:          []string{"Editing"},
+		DefaultStatus: http.StatusAccepted,
+	}, s.editOperation)
+
+	huma.Register(s.api, huma.Operation{
+		OperationID: "getOperationHistory",
+		Method:      http.MethodGet,
+		Path:        "/operations/{id}/history",
+		Summary:     "Get an operation's append-only revision history with its pending and rejected edits",
+		Description: "Every state the operation has held, in revision order (the last entry is current); superseded entries name the APPLIED edit that replaced them. pending_edits and rejected_edits list undecided and INVALID edit registrations against the operation in registration-id order. 404 for an unknown id, another owner's id, or an edit registration id.",
+		Tags:        []string{"Editing"},
+	}, s.getOperationHistory)
 
 	huma.Register(s.api, huma.Operation{
 		OperationID: "getBalance",

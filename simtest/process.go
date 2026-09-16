@@ -7,20 +7,23 @@ import (
 	"github.com/magnomp/balancedb/internal/model"
 )
 
-// This file extends the sequential reference model with the processor's single-op
-// decision semantics (spec §6 validation, §8.2 processing) and confirmed-balance
-// evolution. It mirrors internal/processor.processSingle in memory so later
-// milestones (and M5's own property tests) can assert the database against it and
-// check G1 (final balance within limits) after every decision.
+// This file extends the sequential reference model with the processor's decision
+// semantics — singles (spec §6 validation, §8.2 processing), groups (§8.3) and
+// edits, single or grouped (ADR-0010) — and confirmed-balance evolution. It
+// mirrors internal/processor in memory so the DB-backed tiers can assert the
+// database against it and check G1 (final balance within limits) after every
+// decision.
 
 // Decision is the outcome the reference model computes for one processing step —
 // either a single operation or a whole group, decided at its first leg by
 // registration order.
 //
-// For a single: OpID is the operation, TxID is nil, Status is CONFIRMED|INVALID.
-// For a group: TxID is the transaction, OpID is 0, LegIDs lists the legs in
-// registration order, Status is the terminal status shared by every leg
-// (CONFIRMED|INVALID), and TxStatus is the transaction status (COMMITTED|REJECTED).
+// For a single: OpID is the operation, TxID is nil, Status is CONFIRMED|INVALID
+// (APPLIED|INVALID for an edit registration). For a group: TxID is the
+// transaction, OpID is 0, LegIDs lists the legs in registration order, Status is
+// the terminal status of its regular legs (CONFIRMED|INVALID; edit legs of a
+// committed group read APPLIED), and TxStatus is the transaction status
+// (COMMITTED|REJECTED).
 type Decision struct {
 	OpID     int64
 	TxID     *int64
@@ -61,8 +64,11 @@ func (m *Model) AccountBalance(ownerID int64, externalID string) int64 {
 // ProcessNext decides the lowest-id visible PENDING operation (spec §8.1,
 // ADR-0008) and returns its decision. A single is decided on its own;
 // a group leg triggers the whole group's decision at that first leg, and the
-// group's remaining legs are then no longer PENDING (skipped by status). It reports
-// ok=false when no PENDING operation remains. Ids are dense (identity columns), so
+// group's remaining legs are then no longer PENDING (skipped by status). A unit
+// with an edit whose target is still PENDING — a single edit, or a group with
+// such an edit leg — is deferred as a whole: skipped, left PENDING, exactly as
+// the processor skips it and moves on (ADR-0010). It reports ok=false when no
+// decidable PENDING operation remains. Ids are dense (identity columns), so
 // scanning 1..nextOpID visits operations exactly in registration order.
 func (m *Model) ProcessNext() (Decision, bool) {
 	for id := int64(1); id <= m.nextOpID; id++ {
@@ -71,11 +77,30 @@ func (m *Model) ProcessNext() (Decision, bool) {
 			continue
 		}
 		if op.TransactionID == nil {
+			if m.targetPending(op) {
+				continue // deferred: the target has not been decided yet
+			}
 			return m.decide(op), true
 		}
-		return m.decideGroup(m.txs[*op.TransactionID]), true
+		tx := m.txs[*op.TransactionID]
+		deferred := false
+		for _, legID := range tx.LegIDs {
+			if m.targetPending(m.ops[legID]) {
+				deferred = true
+				break
+			}
+		}
+		if deferred {
+			continue // the whole group waits for the target
+		}
+		return m.decideGroup(tx), true
 	}
 	return Decision{}, false
+}
+
+// targetPending reports whether op is an edit whose target is still PENDING.
+func (m *Model) targetPending(op *refOp) bool {
+	return op.EditOf != nil && m.ops[*op.EditOf].Status == model.OpPending
 }
 
 // ProcessAll decides currently visible PENDING operations in ID order. Later
@@ -93,8 +118,11 @@ func (m *Model) ProcessAll() []Decision {
 
 // decide applies the binary validation (spec §6) to one operation, flips its
 // status (once — facts are never mutated afterwards), and evolves the account's
-// confirmed balance on accept.
+// confirmed balance on accept. An edit registration is decided by decideEdit.
 func (m *Model) decide(op *refOp) Decision {
+	if op.EditOf != nil {
+		return m.decideEdit(op)
+	}
 	a := m.accountsByID[op.AccountID]
 	newBal := a.Balance + op.Amount
 
@@ -120,69 +148,162 @@ func (m *Model) decide(op *refOp) Decision {
 	}
 }
 
-// decideGroup applies spec §8.3 to a whole group: it nets the legs per account,
-// validates every involved account in ascending id order, and commits all-or-
-// nothing. All pass → every account's net is applied, every leg flips to CONFIRMED
-// and the transaction to COMMITTED. Any fail → the whole group flips to INVALID /
-// REJECTED with the first offending account (ascending id, exactly as the
-// processor picks it) and its shortfall; no balance changes. Netting per account is
-// sound because the whole group applies atomically (spec §6/G2). Facts are flipped
-// once and never mutated afterwards.
-func (m *Model) decideGroup(tx *refTx) Decision {
-	net := make(map[int64]int64, len(tx.LegIDs))
-	ids := make([]int64, 0, len(tx.LegIDs))
-	for _, legID := range tx.LegIDs {
-		op := m.ops[legID]
-		if _, seen := net[op.AccountID]; !seen {
-			ids = append(ids, op.AccountID)
+// decideEdit mirrors internal/processor.processSingleEditTx (ADR-0010): the
+// target must be CONFIRMED (INVALID → TARGET_NOT_EDITABLE; a PENDING target is
+// deferred by ProcessNext and never reaches here) and match expected_revision
+// (STALE_REVISION); then the edit is two virtual legs — −current on the current
+// account, +proposed on the proposed account — netted per account and validated
+// in ascending account id, the first violation rejecting with LIMIT_VIOLATED. On
+// accept every net is applied, the superseded state is appended to the target's
+// history, the target's current columns are overwritten at revision + 1, and the
+// edit flips to APPLIED. On reject nothing but the edit's own status changes.
+func (m *Model) decideEdit(op *refOp) Decision {
+	if rej := m.checkTarget(op); rej != nil {
+		op.Status = model.OpInvalid
+		return Decision{OpID: op.ID, Status: model.OpInvalid, Reason: rej}
+	}
+
+	ids, net := m.netVirtualLegs([]*refOp{op})
+	if rej := m.firstViolation(ids, net); rej != nil {
+		op.Status = model.OpInvalid
+		return Decision{OpID: op.ID, Status: model.OpInvalid, Reason: rej}
+	}
+
+	for _, acctID := range ids {
+		m.accountsByID[acctID].Balance += net[acctID]
+	}
+	m.applyEdit(op)
+	return Decision{OpID: op.ID, Status: model.OpApplied}
+}
+
+// checkTarget mirrors internal/processor.checkTarget for one edit whose target
+// is not PENDING: an INVALID target rejects with TARGET_NOT_EDITABLE, a mismatched
+// expected_revision with STALE_REVISION; nil means decidable on its limits.
+func (m *Model) checkTarget(op *refOp) *model.Rejection {
+	target := m.ops[*op.EditOf]
+	targetID := target.ID
+	if target.Status != model.OpConfirmed {
+		return &model.Rejection{Code: model.ReasonTargetNotEditable, OperationID: &targetID}
+	}
+	if op.ExpectedRevision != nil && *op.ExpectedRevision != target.Revision {
+		want, got := *op.ExpectedRevision, target.Revision
+		return &model.Rejection{
+			Code: model.ReasonStaleRevision, OperationID: &targetID, ExpectedRevision: &want, ActualRevision: &got,
 		}
-		net[op.AccountID] += op.Amount
+	}
+	return nil
+}
+
+// netVirtualLegs nets a unit's virtual legs per account — one leg per regular
+// item, two per edit item (−current on the target's current account, +proposed
+// on the proposed one) — and returns the involved account ids ascending, the
+// processor's deterministic validation order (internal/processor.netLegs).
+func (m *Model) netVirtualLegs(items []*refOp) (ids []int64, net map[int64]int64) {
+	net = make(map[int64]int64, len(items))
+	add := func(acctID, amount int64) {
+		if _, seen := net[acctID]; !seen {
+			ids = append(ids, acctID)
+		}
+		net[acctID] += amount
+	}
+	for _, op := range items {
+		if op.EditOf != nil {
+			target := m.ops[*op.EditOf]
+			add(target.AccountID, -target.Amount)
+		}
+		add(op.AccountID, op.Amount)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids, net
+}
 
-	txID := tx.ID
-	legs := append([]int64(nil), tx.LegIDs...)
-
-	// Validate every involved account; the first violation rejects the group.
+// firstViolation validates every involved account's net in ascending id order
+// (spec §6) and returns the first LIMIT_VIOLATED rejection, or nil.
+func (m *Model) firstViolation(ids []int64, net map[int64]int64) *model.Rejection {
 	for _, acctID := range ids {
 		a := m.accountsByID[acctID]
 		newBal := a.Balance + net[acctID]
-		var (
-			side      model.LimitSide
-			shortfall int64
-		)
 		switch {
 		case a.Max != nil && newBal > *a.Max:
-			side, shortfall = model.LimitMax, newBal-*a.Max
+			return &model.Rejection{Code: model.ReasonLimitViolated, Account: a.ExternalID, LimitSide: model.LimitMax, Shortfall: newBal - *a.Max}
 		case a.Min != nil && newBal < *a.Min:
-			side, shortfall = model.LimitMin, *a.Min-newBal
-		default:
-			continue
+			return &model.Rejection{Code: model.ReasonLimitViolated, Account: a.ExternalID, LimitSide: model.LimitMin, Shortfall: *a.Min - newBal}
 		}
+	}
+	return nil
+}
+
+// applyEdit records an accepted edit: the target's superseded state is appended
+// to its history, its current columns are overwritten at revision + 1, and the
+// edit flips to APPLIED (the balances were already moved by the caller).
+func (m *Model) applyEdit(op *refOp) {
+	target := m.ops[*op.EditOf]
+	m.revisions[target.ID] = append(m.revisions[target.ID], refRevision{
+		Revision: target.Revision, AccountID: target.AccountID, Amount: target.Amount,
+		EffectiveAt: target.EffectiveAt, SupersededBy: op.ID,
+	})
+	target.AccountID, target.Amount, target.EffectiveAt = op.AccountID, op.Amount, op.EffectiveAt
+	target.Revision++
+	op.Status = model.OpApplied
+}
+
+// decideGroup applies spec §8.3 to a whole group, edit legs included (ADR-0010):
+// every edit leg's target must be CONFIRMED and at the expected revision — the
+// first failing leg, in leg order, rejects the whole group with
+// TARGET_NOT_EDITABLE / STALE_REVISION (a PENDING target defers the group in
+// ProcessNext and never reaches here); then the legs' virtual legs are netted per
+// account and every involved account is validated in ascending id order, all-or-
+// nothing. All pass → every account's net is applied, every edit leg applies to
+// its target (history appended, current columns overwritten, APPLIED), every
+// regular leg flips to CONFIRMED and the transaction to COMMITTED. Any fail → the
+// whole group flips to INVALID / REJECTED with the one shared reason (the first
+// offending account, ascending id, exactly as the processor picks it) and no
+// balance or target changes. Netting per account is sound because the whole
+// group applies atomically (spec §6/G2). Facts are flipped once and never
+// mutated afterwards. The decision's Status is that of the regular legs
+// (CONFIRMED on commit; edit legs read APPLIED).
+func (m *Model) decideGroup(tx *refTx) Decision {
+	txID := tx.ID
+	legs := append([]int64(nil), tx.LegIDs...)
+	items := make([]*refOp, len(legs))
+	for i, legID := range legs {
+		items[i] = m.ops[legID]
+	}
+
+	reject := func(rej *model.Rejection) Decision {
 		for _, legID := range legs {
 			m.ops[legID].Status = model.OpInvalid
 		}
 		tx.Status = model.TxRejected
-		return Decision{
-			TxID:     &txID,
-			Status:   model.OpInvalid,
-			TxStatus: model.TxRejected,
-			Reason: &model.Rejection{
-				Code:      model.ReasonLimitViolated,
-				Account:   a.ExternalID,
-				LimitSide: side,
-				Shortfall: shortfall,
-			},
-			LegIDs: legs,
+		return Decision{TxID: &txID, Status: model.OpInvalid, TxStatus: model.TxRejected, Reason: rej, LegIDs: legs}
+	}
+
+	// Target-state rules first, in leg order.
+	for _, op := range items {
+		if op.EditOf == nil {
+			continue
+		}
+		if rej := m.checkTarget(op); rej != nil {
+			return reject(rej)
 		}
 	}
 
-	// All accounts pass: apply each net and confirm the group.
+	// Validate every involved account; the first violation rejects the group.
+	ids, net := m.netVirtualLegs(items)
+	if rej := m.firstViolation(ids, net); rej != nil {
+		return reject(rej)
+	}
+
+	// All accounts pass: apply each net, apply each edit, confirm the group.
 	for _, acctID := range ids {
 		m.accountsByID[acctID].Balance += net[acctID]
 	}
-	for _, legID := range legs {
-		m.ops[legID].Status = model.OpConfirmed
+	for _, op := range items {
+		if op.EditOf != nil {
+			m.applyEdit(op)
+			continue
+		}
+		op.Status = model.OpConfirmed
 	}
 	tx.Status = model.TxCommitted
 	return Decision{
@@ -194,40 +315,35 @@ func (m *Model) decideGroup(tx *refTx) Decision {
 }
 
 // CheckG2 verifies the group-atomicity guarantee (spec §4.1): no group is ever
-// partially applied — every transaction's legs share a single status, and that
-// status agrees with the transaction's own status. It returns an error naming the
-// first violation, or nil.
+// partially applied — every leg of a transaction holds exactly the status its
+// transaction's status implies (PENDING ↔ PENDING; COMMITTED ↔ CONFIRMED for a
+// regular leg, APPLIED for an edit leg; REJECTED ↔ INVALID). It returns an error
+// naming the first violation, or nil.
 func (m *Model) CheckG2() error {
 	for txID, tx := range m.txs {
-		var legStatus model.OpStatus
-		for i, legID := range tx.LegIDs {
-			s := m.ops[legID].Status
-			if i == 0 {
-				legStatus = s
-				continue
+		for _, legID := range tx.LegIDs {
+			op := m.ops[legID]
+			if want := legStatusFor(tx.Status, op.EditOf != nil); op.Status != want {
+				return fmt.Errorf("G2 violated: transaction %d (%s) has leg %d in status %s, want %s", txID, tx.Status, legID, op.Status, want)
 			}
-			if s != legStatus {
-				return fmt.Errorf("G2 violated: transaction %d has mixed leg statuses (%s and %s)", txID, legStatus, s)
-			}
-		}
-		if !legStatusAgrees(legStatus, tx.Status) {
-			return fmt.Errorf("G2 violated: transaction %d status %s disagrees with leg status %s", txID, tx.Status, legStatus)
 		}
 	}
 	return nil
 }
 
-// legStatusAgrees maps a transaction status to the leg status it implies.
-func legStatusAgrees(legStatus model.OpStatus, txStatus model.TxStatus) bool {
+// legStatusFor maps a transaction status to the status it implies for one leg:
+// a regular leg of a COMMITTED group is CONFIRMED, an edit leg APPLIED.
+func legStatusFor(txStatus model.TxStatus, isEdit bool) model.OpStatus {
 	switch txStatus {
-	case model.TxPending:
-		return legStatus == model.OpPending
 	case model.TxCommitted:
-		return legStatus == model.OpConfirmed
+		if isEdit {
+			return model.OpApplied
+		}
+		return model.OpConfirmed
 	case model.TxRejected:
-		return legStatus == model.OpInvalid
+		return model.OpInvalid
 	default:
-		return false
+		return model.OpPending
 	}
 }
 

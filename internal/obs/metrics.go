@@ -9,16 +9,18 @@ import (
 const namespace = "balancedb"
 
 // Decision label values (spec §13 "decision counters by outcome"). kind
-// distinguishes a single operation from a group transaction; outcome is the
-// terminal fact the processor wrote.
+// distinguishes a single operation, a group transaction and a single edit
+// registration (ADR-0010); outcome is the terminal fact the processor wrote.
 const (
 	KindSingle = "single"
 	KindGroup  = "group"
+	KindEdit   = "edit"
 
 	OutcomeConfirmed = "confirmed" // single accepted
-	OutcomeInvalid   = "invalid"   // single rejected
+	OutcomeInvalid   = "invalid"   // single or edit rejected
 	OutcomeCommitted = "committed" // group accepted
 	OutcomeRejected  = "rejected"  // group rejected
+	OutcomeApplied   = "applied"   // edit accepted: target overwritten, history appended
 )
 
 // Wait-path label values (spec §13 "NOTIFY→outcome lag", API wait health). source
@@ -59,6 +61,7 @@ type Metrics struct {
 	leadershipChanges prometheus.Counter
 	leader            prometheus.Gauge
 	decisions         *prometheus.CounterVec
+	editDeferrals     prometheus.Counter
 	snapshotRows      prometheus.Histogram
 	doorbellLag       prometheus.Histogram
 
@@ -102,8 +105,12 @@ func NewMetrics(pool *pgxpool.Pool) *Metrics {
 		}),
 		decisions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: namespace, Name: "decisions_total",
-			Help: "Terminal decisions the processor committed, by kind (single|group) and outcome (confirmed|invalid|committed|rejected).",
+			Help: "Terminal decisions the processor committed, by kind (single|group|edit) and outcome (confirmed|invalid|committed|rejected|applied).",
 		}, []string{"kind", "outcome"}),
+		editDeferrals: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace, Name: "edit_deferrals_total",
+			Help: "Edit units skipped because their target was still PENDING at decision time (ADR-0010); a sustained rate indicates overlapping insertion transactions (ADR-0008).",
+		}),
 		snapshotRows: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Namespace: namespace, Name: "snapshot_rows_touched",
 			Help:    "Balance-snapshot rows written per confirmed operation (1 = newest day; more = backdating cascade). Measures the backdating workload (§13).",
@@ -127,7 +134,7 @@ func NewMetrics(pool *pgxpool.Pool) *Metrics {
 
 	reg.MustRegister(
 		m.queueDepth, m.oldestPendingAge, m.loopBusySeconds, m.loopWallSeconds,
-		m.leadershipChanges, m.leader, m.decisions, m.snapshotRows, m.doorbellLag,
+		m.leadershipChanges, m.leader, m.decisions, m.editDeferrals, m.snapshotRows, m.doorbellLag,
 		m.waitSeconds, m.slowQueries,
 	)
 	// Go runtime + process collectors give GC, goroutine, and FD visibility for free.
@@ -201,6 +208,15 @@ func (m *Metrics) RecordDecision(kind, outcome string) {
 		return
 	}
 	m.decisions.WithLabelValues(kind, outcome).Inc()
+}
+
+// IncEditDeferral counts one edit unit deferred because its target was still
+// PENDING (ADR-0010). Deferral is normal control flow, never an error.
+func (m *Metrics) IncEditDeferral() {
+	if m == nil {
+		return
+	}
+	m.editDeferrals.Inc()
 }
 
 // ObserveSnapshotRows records the rows touched by one confirmation (§13).

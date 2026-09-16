@@ -39,6 +39,13 @@ type Transaction struct {
 // global insertion order and the tiebreaker in the timeline key (effective_at,
 // id). transaction_id is NULL for singles; idempotency_key/payload_hash are set
 // on singles only.
+//
+// A row with EditOf set is an edit registration (ADR-0010): AccountID, Amount and
+// EffectiveAt hold the full proposed state for the target; ExpectedRevision is
+// its optional optimistic guard. On a regular operation Revision is the current
+// revision (1 until the first applied edit) and RevisedAt is when that revision
+// became current (nil = never edited); both are unused (1, nil) on edit rows.
+// ConfirmedAt is the decision instant for CONFIRMED and APPLIED rows alike.
 type Operation struct {
 	ID                 int64
 	AccountID          int64
@@ -52,6 +59,26 @@ type Operation struct {
 	PayloadHash        []byte
 	RegisteredAt       time.Time
 	ConfirmedAt        *time.Time
+	EditOf             *int64
+	ExpectedRevision   *int32
+	Revision           int32
+	RevisedAt          *time.Time
+}
+
+// OperationRevision is a row of the operation_revisions table (ADR-0010): the
+// superseded state of one operation at one revision, appended by the leader when
+// it applies an edit. Append-only; the current state lives on the operations row.
+// SupersededBy is the APPLIED edit row; RecordedAt is when this revision became
+// current; SupersededAt is when it stopped being current.
+type OperationRevision struct {
+	OperationID  int64
+	Revision     int32
+	AccountID    int64
+	Amount       int64
+	EffectiveAt  time.Time
+	RecordedAt   time.Time
+	SupersededBy int64
+	SupersededAt time.Time
 }
 
 // BalanceSnapshot is a row of the balance_snapshots table: the cumulative balance
@@ -70,4 +97,5 @@ type Config struct {
 	BatchSize      int
 	MaxGroupSize   int
 	APIMaxWaitMs   int
+	AllowEdits     bool // FALSE keeps the cell on the reversal-only contract (ADR-0010)
 }

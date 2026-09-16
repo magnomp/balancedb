@@ -89,6 +89,65 @@ processor container and asserts the standby acquires leadership within the lease
 TTL and resumes draining work. It is self-contained (builds, runs, tears down); set
 `KEEP_UP=1` to leave the stack up for inspection. **M13 (CI) reuses this target.**
 
+### Editing operations (ADR-0010)
+
+A confirmed operation can be corrected **in place** — same id, new `amount`,
+`effective_at` and/or `account` (same owner) — with an append-only history. An edit
+is a *registration* like an insert: it enters the same PENDING queue, is decided by
+the leader (validated against the final-balance limits as `−old` + `+new`, netted per
+account), and is idempotent under the same `Idempotency-Key` rules. `revision`
+starts at 1 and increments with every applied edit; registration id, owner,
+`transaction_id`, `reversal_of` and `registered_at` are never editable
+(`docs/decisions/0009-operation-editing.md`, spec §10.3).
+
+```sh
+# One edit: fix -15.00 to -12.00 and wait for the decision (200 = decided).
+curl -s -X PATCH localhost:8080/operations/41 \
+  -H 'X-Owner-Id: 1' -H "Idempotency-Key: $(cat /proc/sys/kernel/random/uuid)" \
+  -H 'Content-Type: application/json' \
+  -d '{"amount": -1200, "expected_revision": 1, "wait_ms": 10000}'
+# {"edit":{"id":57,"status":"APPLIED","operation_id":41},"replayed":false}
+
+# Grouped / mixed: edits are POST /transactions items with edit_of — one atomic
+# unit, one owner, max_group_size items, all applied or all rejected.
+curl -s localhost:8080/transactions \
+  -H 'X-Owner-Id: 1' -H "Idempotency-Key: $(cat /proc/sys/kernel/random/uuid)" \
+  -H 'Content-Type: application/json' -d '{
+    "operations": [
+      {"edit_of": 41, "amount": -1200},
+      {"edit_of": 42, "effective_at": "2026-02-10T09:30:00Z"},
+      {"account":"cash","amount":300,"effective_at":"2026-03-01T10:00:00Z"}
+    ], "wait_ms": 10000 }'
+
+# History: every superseded revision (oldest first, last = current) plus the
+# pending and rejected edits — nothing is ever updated or deleted.
+curl -s localhost:8080/operations/41/history -H 'X-Owner-Id: 1'
+```
+
+- **Statuses.** An edit registration goes `PENDING → APPLIED | INVALID` (terminal);
+  the target stays `CONFIRMED` and only its current columns, `revision` and
+  `revised_at` change. Rejections are `LIMIT_VIOLATED` (as for inserts),
+  `TARGET_NOT_EDITABLE` (the target ended INVALID) or `STALE_REVISION`
+  (`expected_revision` did not match at decision time). A group with any failing
+  item is `REJECTED` as a whole; `COMMITTED` means every new item CONFIRMED and every
+  edit item APPLIED.
+- **Reads.** `GET /operations/{id}` returns the current state and `revision` (an edit
+  registration id returns `edit_of` and the proposed state); statement entries carry
+  `revision`, `GET /transactions/{id}` legs carry `revision` (regular legs) or
+  `edit_of` (edit legs); `GET /operations/{id}/history` is the audit trail (`404`
+  for an edit registration id). Edit registrations never
+  appear in statements, balances or point-in-time sums.
+- **Turning it off.** `UPDATE config SET allow_edits = false;` — hot-reloaded, so the
+  next edit registration is refused with `403` (embedded: `ErrEditsDisabled`);
+  edits already registered are still decided.
+- **Non-guarantee N7.** Edits and reversals do not track each other: editing an
+  operation never adjusts a reversal that points at it, and editing a reversal never
+  adjusts its original — the client owns the follow-up. There is no delete: reverse
+  to cancel, edit to correct.
+- **Embedded hosts** register edits through the same `InsertOp.EditOf` /
+  `ExpectedRevision` fields inside their own transaction
+  ([embedding guide](docs/embedding.md#edit-an-operation-in-a-business-transaction)).
+
 ### Configuration contract
 
 Deployment config is `BALANCEDB_*` environment, parsed once at boot; the process
@@ -107,6 +166,18 @@ first migration).
 | `BALANCEDB_LOG_FORMAT` | no | `json` | `json` \| `text`. |
 | `BALANCEDB_MIGRATE_ON_START` | no | `true` | Set `false` when using the explicit `migrate` role as a deploy gate. |
 | `BALANCEDB_POOL_MAX_CONNS` | no | `10` | pgxpool size. |
+
+Behavioral knobs — the single `config` row, changed with plain SQL (`UPDATE config
+SET …;`) and picked up on the next cycle/request without a restart:
+
+| Column | Default | Meaning |
+|---|---|---|
+| `lease_ttl_ms` | `15000` | Leader lease TTL; failover bound (spec §7.1). |
+| `loop_interval_ms` | `1000` | Processor polling interval (the doorbell wakes it earlier, ADR-0002). |
+| `batch_size` | `200` | Decisions per DB commit (spec §8.5). |
+| `max_group_size` | `10` | Maximum items per `POST /transactions` unit — new operations and edits together. |
+| `api_max_wait_ms` | `30000` | Cap on `wait_ms` for synchronous waits (spec §10.1). |
+| `allow_edits` | `true` | `false` refuses **new** edit registrations (`403` / `ErrEditsDisabled`) and keeps the cell on the reversal-only contract; already registered edits are still decided (ADR-0010). Read per request by the insertion core; the processor never checks it. |
 
 ### Roles
 
@@ -180,7 +251,8 @@ authority.
 | `snapshot_rows_touched` | histogram | Balance-snapshot rows written per confirmed operation (1 = newest day; more = a backdating cascade). | §13 — measures the backdating workload in production (spec §8.4 makes backdating O(days spanned)). |
 | `leadership_changes_total` | counter | Lease ownership transitions (gained or lost) this instance observed. | §13 — `rate()*3600` = changes/hour; a high rate is lease flapping (tuning or infrastructure). |
 | `leader` | gauge | `1` if this instance currently holds the lease, else `0`. | Companion to leadership changes: which instance is the leader right now. |
-| `decisions_total{kind,outcome}` | counter | Committed terminal decisions: `kind` ∈ single\|group, `outcome` ∈ confirmed\|invalid\|committed\|rejected. | §13 decision counters by outcome. Counted **only on a committed batch**, so a guard-miss rollback never inflates them. |
+| `decisions_total{kind,outcome}` | counter | Committed terminal decisions: `kind` ∈ single\|group\|edit, `outcome` ∈ confirmed\|invalid\|committed\|rejected\|applied (`edit` × applied\|invalid). | §13 decision counters by outcome; the `edit` kind is the edit adoption/rejection mix (ADR-0010). Counted **only on a committed batch**, so a guard-miss rollback never inflates them. |
+| `edit_deferrals_total` | counter | Units (a single edit or a whole group) skipped because an edit target was still PENDING; decided on a later cycle once the target is. | §13 / ADR-0010 — zero is the norm; a sustained rate means overlapping insertion transactions (ADR-0008). Never blocks the work behind it. |
 | `doorbell_wakeup_lag_seconds` | histogram | Insert-commit → leader-pickup lag per operation, on the **DB clock** (`now() - registered_at` at fetch). | **ADR-0002** — the measured doorbell latency win: tens of ms on an idle system, degrading gracefully into queue latency under load. |
 | `api_wait_seconds{source,result}` | histogram | Synchronous-insert wait latency (register → return). `source` ∈ immediate\|notify\|poll\|timeout, `result` ∈ decided\|pending. | **ADR-0002** / §13 NOTIFY→outcome lag — API wait health. The `notify` source is the low-latency fast path; `poll` is the durability fallback firing. |
 | `slow_queries_total` | counter | SQL queries over the slow-query threshold (also logged). | §13 DB-write health — surfaces queries approaching the cell's DB ceiling. |
@@ -221,11 +293,11 @@ The `Makefile` is the interface:
 
 | Target | What it does |
 |---|---|
-| `make lint` | gofumpt check + `go vet` + CLAUDE.md/AGENTS.md sync. |
+| `make lint` | gofumpt check + `golangci-lint run` (go vet across all build tags) + CLAUDE.md/AGENTS.md sync. |
 | `make test` | unit tests (no external dependencies). |
 | `make itest` | integration tests against `TEST_DATABASE_URL` (each test in a throwaway schema). |
 | `make simtest` | deterministic simulation harness against `TEST_DATABASE_URL` (spec §15). |
-| `make openapi` | regenerate `api/openapi.yaml` from the code, fail on drift. |
+| `make openapi` | regenerate `api/openapi.yaml` from the code, fail on drift, then `oasdiff breaking` vs `HEAD` (informational — no `--fail-on`; skipped when `oasdiff` is absent). |
 | `make loadgen` | run the local load generator (see above). |
 
 This box has no toolchain on the default PATH; see `docs/handoff.md` for the
@@ -242,11 +314,16 @@ two tiers (ADR-0006):
   the full scenario space — tight/loose/one-sided/unbounded limits, singles, groups
   (mixed sizes, same-account multi-leg, non-zero-sum), aggressive back/future-dating
   with day crossings and exact-timestamp ties, reversals (double-reversals and
-  reversal-after-reject retries), state-aware limit changes, and idempotent
-  replays/conflicts — through the sequential reference model across **1,000+ seeds**
-  (default 1,200), asserting G1 (final balance within limits), G2 (no partially
-  applied group), G4 (timeline order total and unique), G6 (no duplicate rows), and G3
-  reproducibility (the same seed replays to an identical decision sequence).
+  reversal-after-reject retries), state-aware limit changes, idempotent
+  replays/conflicts, and edits (ADR-0010: single `PATCH`-shaped edits, grouped edits
+  and mixed groups, with `expected_revision` guards, account moves and
+  `effective_at` moves across days) — through the sequential reference model across
+  **1,000+ seeds** (default 1,200), asserting G1 (final balance within limits), G2 (no
+  partially applied group), G4 (timeline order total and unique), G6 (no duplicate
+  rows), G3 reproducibility (the same seed replays to an identical decision
+  sequence), and dense append-only revision histories. Every tier prints its action
+  mix (`insert/replay/conflict/reversal/set_limits/edit/edit_group/edit_group_mixed`)
+  and fails if any edit class is absent from the run.
 - **Fidelity (DB-backed, `make simtest`, build tag `simtest`).** The real processor
   runs over throwaway schemas and the database is asserted equal to the reference
   model — interleaved with fault injection: batch-boundary crashes, competing-leader
@@ -254,7 +331,9 @@ two tiers (ADR-0006):
   running processors; the guards must catch every stale write), and a Guard-3
   version-race stressor. Identity ids do not line up between the two (idempotent
   replays consume Postgres IDENTITY values the reference does not), so the harness
-  compares through an explicit reference→database id map.
+  compares through an explicit reference→database id map — statuses (APPLIED
+  included), balances, latest snapshots, each operation's current columns and `revision`,
+  `edit_of`, and every `operation_revisions` row.
 
 Additional transaction-visibility schedules hold an embedded credit open while a
 later HTTP-core debit commits, then vary processing time and credit commit/rollback.

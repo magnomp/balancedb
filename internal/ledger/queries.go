@@ -31,6 +31,7 @@ type StatementEntry struct {
 	RunningBalance int64
 	TransactionID  *int64
 	ReversalOf     *int64
+	Revision       int32 // 1 for a never-edited operation (ADR-0010).
 }
 
 type Statement struct {
@@ -60,13 +61,13 @@ func GetBalance(ctx context.Context, q Queryer, owner int64, externalID string, 
 }
 
 const (
-	statementFirstPage = `SELECT id, amount, effective_at, transaction_id, reversal_of
+	statementFirstPage = `SELECT id, amount, effective_at, transaction_id, reversal_of, revision
 FROM operations
 WHERE account_id = $1 AND status = 'CONFIRMED'
 ORDER BY effective_at, id
 LIMIT $2`
 
-	statementAfterCursor = `SELECT id, amount, effective_at, transaction_id, reversal_of
+	statementAfterCursor = `SELECT id, amount, effective_at, transaction_id, reversal_of, revision
 FROM operations
 WHERE account_id = $1 AND status = 'CONFIRMED' AND (effective_at, id) > ($3, $4)
 ORDER BY effective_at, id
@@ -108,7 +109,7 @@ func GetStatement(ctx context.Context, q Queryer, owner int64, externalID string
 	entries := make([]StatementEntry, 0, opts.Limit+1)
 	for rows.Next() {
 		var entry StatementEntry
-		if err := rows.Scan(&entry.ID, &entry.Amount, &entry.EffectiveAt, &entry.TransactionID, &entry.ReversalOf); err != nil {
+		if err := rows.Scan(&entry.ID, &entry.Amount, &entry.EffectiveAt, &entry.TransactionID, &entry.ReversalOf, &entry.Revision); err != nil {
 			return nil, fmt.Errorf("scan statement: %w", err)
 		}
 		entry.EffectiveAt = entry.EffectiveAt.UTC()

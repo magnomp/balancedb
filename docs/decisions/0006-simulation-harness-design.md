@@ -38,8 +38,12 @@ Several design forces had to be resolved:
 - **Explicit reference→database id map.** The harness records the map from each fresh
   insert's returned ids (registration order) and compares operations, transactions,
   and timelines through it; balances compare by the stable `(owner_id, external_id)`.
-  The map also translates a reversal's `reversal_of`. This is the alternative the M6
-  handoff flagged to id alignment.
+  The map also translates a reversal's `reversal_of` and an edit's `edit_of`, and —
+  with operation editing (ADR-0009) — the comparison covers each operation's current
+  columns (`account_id`, `amount`, `effective_at`, `revision`), its edit linkage and
+  its `operation_revisions` rows (`superseded_by` mapped through the same table), so
+  a lost or doubled edit application shows up as a mismatch. This is the alternative
+  the M6 handoff flagged to id alignment.
 - **Zombie-leader = lease tampering under real processors.** Rather than a synthetic
   stale write, the harness runs real processors while directly expiring/stealing the
   lease row (short horizons so it stays reclaimable); the proof that Guard 1/Guard 3

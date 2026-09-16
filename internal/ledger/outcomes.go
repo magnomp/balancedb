@@ -4,16 +4,29 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/magnomp/balancedb/internal/model"
 )
 
+// OperationOutcome is one operation's current state as both HTTP and embedded
+// callers read it. For a regular operation Account/Amount/EffectiveAt are the
+// current (possibly edited) values and Revision counts applied edits from 1. For
+// an edit registration (EditOf set, ADR-0010) they are the proposed state as
+// resolved at submission, ExpectedRevision is its optional guard, and Revision
+// is the meaningless column default.
 type OperationOutcome struct {
-	ID            int64
-	Status        model.OpStatus
-	TransactionID *int64
-	Rejection     *model.Rejection
+	ID               int64
+	Status           model.OpStatus
+	TransactionID    *int64
+	Rejection        *model.Rejection
+	Account          string
+	Amount           int64
+	EffectiveAt      time.Time
+	Revision         int32
+	EditOf           *int64
+	ExpectedRevision *int32
 }
 
 type TransactionOutcome struct {
@@ -28,11 +41,13 @@ func GetOperation(ctx context.Context, q Queryer, owner, id int64) (*OperationOu
 	if owner <= 0 || id <= 0 {
 		return nil, fmt.Errorf("%w: positive owner and operation ID required", ErrInvalidArgument)
 	}
-	const stmt = `SELECT o.id, o.status, o.transaction_id, o.invalidation_reason
+	const stmt = `SELECT o.id, o.status, o.transaction_id, o.invalidation_reason,
+       a.external_id, o.amount, o.effective_at, o.revision, o.edit_of, o.expected_revision
 FROM operations o JOIN accounts a ON a.id=o.account_id WHERE o.id=$1 AND a.owner_id=$2`
 	var result OperationOutcome
 	var reason *string
-	err := q.QueryRow(ctx, stmt, id, owner).Scan(&result.ID, &result.Status, &result.TransactionID, &reason)
+	err := q.QueryRow(ctx, stmt, id, owner).Scan(&result.ID, &result.Status, &result.TransactionID, &reason,
+		&result.Account, &result.Amount, &result.EffectiveAt, &result.Revision, &result.EditOf, &result.ExpectedRevision)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -62,7 +77,8 @@ WHERE o.transaction_id=t.id AND a.owner_id=$2)`
 		return nil, fmt.Errorf("read transaction: %w", err)
 	}
 	result.Rejection = parseRejection(reason)
-	const legs = `SELECT o.id, o.status, o.transaction_id, o.invalidation_reason
+	const legs = `SELECT o.id, o.status, o.transaction_id, o.invalidation_reason,
+       a.external_id, o.amount, o.effective_at, o.revision, o.edit_of, o.expected_revision
 FROM operations o JOIN accounts a ON a.id=o.account_id
 WHERE o.transaction_id=$1 AND a.owner_id=$2 ORDER BY o.id`
 	rows, err := q.Query(ctx, legs, id, owner)
@@ -74,7 +90,8 @@ WHERE o.transaction_id=$1 AND a.owner_id=$2 ORDER BY o.id`
 	for rows.Next() {
 		var op OperationOutcome
 		var reason *string
-		if err := rows.Scan(&op.ID, &op.Status, &op.TransactionID, &reason); err != nil {
+		if err := rows.Scan(&op.ID, &op.Status, &op.TransactionID, &reason,
+			&op.Account, &op.Amount, &op.EffectiveAt, &op.Revision, &op.EditOf, &op.ExpectedRevision); err != nil {
 			return nil, fmt.Errorf("scan transaction leg: %w", err)
 		}
 		op.Rejection = parseRejection(reason)

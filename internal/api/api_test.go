@@ -58,6 +58,7 @@ func TestOpenAPIYAMLContract(t *testing.T) {
 	for _, id := range []string{
 		"createTransaction", "getTransaction", "getOperation",
 		"getBalance", "getStatement", "createAccount", "updateAccountLimits",
+		"editOperation", "getOperationHistory",
 	} {
 		if !strings.Contains(s, "operationId: "+id) {
 			t.Errorf("openapi missing operationId %q", id)
@@ -71,6 +72,9 @@ func TestOpenAPIYAMLContract(t *testing.T) {
 	}
 	if !strings.Contains(s, "openapi: 3.1.0") {
 		t.Error("openapi document is not 3.1.0")
+	}
+	if !strings.Contains(s, "version: "+apiVersion) || apiVersion != "1.1.0" {
+		t.Errorf("openapi version = %q, want 1.1.0 (operation editing is an additive bump)", apiVersion)
 	}
 }
 

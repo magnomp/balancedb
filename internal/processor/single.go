@@ -61,7 +61,8 @@ func (p *Processor) processSingle(ctx context.Context, op pendingOp) error {
 // daily snapshots, and notifies the outcome. On reject it flips the operation to
 // INVALID with the machine-readable reason (Guard 2) and notifies — no balance
 // change. Any guard miss returns errGuardMiss, which rolls the (possibly batched)
-// transaction back.
+// transaction back. An edit registration (EditOf set, ADR-0010) is decided by
+// processSingleEditTx after the shared lease fence.
 func (p *Processor) processSingleTx(ctx context.Context, tx pgx.Tx, op pendingOp) error {
 	// Guard 1: lease fence.
 	var fenced int
@@ -71,6 +72,10 @@ func (p *Processor) processSingleTx(ctx context.Context, tx pgx.Tx, op pendingOp
 	}
 	if err != nil {
 		return fmt.Errorf("guard 1 (lease fence): %w", err)
+	}
+
+	if op.EditOf != nil {
+		return p.processSingleEditTx(ctx, tx, op)
 	}
 
 	// Read the account for validation and the version to CAS on.

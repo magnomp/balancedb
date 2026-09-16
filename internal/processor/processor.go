@@ -27,19 +27,31 @@ const configRetryBackoff = 2 * time.Second
 // continues. It never escapes Run.
 var errGuardMiss = errors.New("processor: guard miss")
 
+// errDeferred is the sentinel the edit path returns when an edit's target is still
+// PENDING at decision time (ADR-0010): the unit is skipped, stays PENDING, and is
+// re-selected once its target is decided. Like a guard miss it is normal control
+// flow, but unlike one it does not roll the batch back — the batch simply moves
+// on to the next unit. Only reachable under overlapping insertion transactions
+// (ADR-0008). It never escapes processBatch.
+var errDeferred = errors.New("processor: edit deferred, target still pending")
+
 // SQL kept as consts beside their single call site (plan §0), written unqualified
 // (search_path owns the schema).
 const (
 	selectConfig = `SELECT lease_ttl_ms, loop_interval_ms, batch_size, max_group_size, api_max_wait_ms FROM config`
 
-	// The full spec §8.1 work select: every PENDING operation — singles and group
-	// legs alike — ordered by id (the work index idx_ops_work is on (id) WHERE
-	// status='PENDING'). transaction_id NULL marks a single; otherwise the row is a
-	// group leg and the group is decided at its FIRST leg by id, later legs skipped
-	// by status. Ordering is taken only from here (G3), never from doorbell arrival.
-	fetchPendingWork = `SELECT id, account_id, amount, effective_at, transaction_id, registered_at, now()
+	// The full spec §8.1 work select: every PENDING operation — singles, group
+	// legs and edit registrations alike — ordered by id (the work index idx_ops_work
+	// is on (id) WHERE status='PENDING'). transaction_id NULL marks a single;
+	// otherwise the row is a group leg and the group is decided at its FIRST leg by
+	// id, later legs skipped by status. edit_of set marks an edit registration
+	// (ADR-0010). $2 is the drain cursor: a deferred edit (target still PENDING)
+	// stays PENDING, so the next select of one drain starts past it — otherwise a
+	// deferred head-of-queue would be re-selected forever and starve later work.
+	// Ordering is taken only from here (G3), never from doorbell arrival.
+	fetchPendingWork = `SELECT id, account_id, amount, effective_at, transaction_id, edit_of, expected_revision, registered_at, now()
   FROM operations
- WHERE status = 'PENDING'
+ WHERE status = 'PENDING' AND id > $2
  ORDER BY id
  LIMIT $1`
 
@@ -58,22 +70,30 @@ const (
 	listenDoorbell = `LISTEN work_available`
 )
 
-// pendingOp is the slice of an operations row the single-op path needs.
+// pendingOp is the slice of an operations row the single-op path needs. EditOf
+// set marks an edit registration (ADR-0010): AccountID, Amount and EffectiveAt
+// are then the full proposed state for the target, and ExpectedRevision its
+// optional optimistic guard.
 type pendingOp struct {
-	ID          int64
-	AccountID   int64
-	Amount      int64
-	EffectiveAt time.Time
+	ID               int64
+	AccountID        int64
+	Amount           int64
+	EffectiveAt      time.Time
+	EditOf           *int64
+	ExpectedRevision *int32
 }
 
 // workRow is one PENDING operation as the §8.1 dispatcher sees it. TransactionID
-// is nil for a single and set for a group leg.
+// is nil for a single and set for a group leg; EditOf/ExpectedRevision are the
+// edit-registration columns (nil on a regular operation).
 type workRow struct {
-	ID            int64
-	AccountID     int64
-	Amount        int64
-	EffectiveAt   time.Time
-	TransactionID *int64
+	ID               int64
+	AccountID        int64
+	Amount           int64
+	EffectiveAt      time.Time
+	TransactionID    *int64
+	EditOf           *int64
+	ExpectedRevision *int32
 }
 
 // Processor is one cell's decision engine. It owns a pgx pool, the leader lease,
@@ -110,6 +130,10 @@ type Processor struct {
 	// single and the group path, letting a test commit a concurrent account mutation
 	// to exercise the version-CAS miss path deterministically.
 	afterAccountRead func()
+	// afterTargetRead runs between an edit's target read and its revision CAS,
+	// letting a test bump the target's revision from another connection to
+	// exercise the revision-CAS miss path deterministically (ADR-0010).
+	afterTargetRead func()
 	// enteredIdleWait fires once the leader has armed its listener and is about to
 	// block on the doorbell, so a timing test can insert without racing the listen
 	// registration.
@@ -137,6 +161,7 @@ type decision struct{ kind, outcome string }
 type batchAccum struct {
 	decisions    []decision
 	snapshotRows []int64
+	deferrals    int
 }
 
 // recordDecision buffers one decision for post-commit flush. No-op outside a batch.
@@ -150,6 +175,14 @@ func (p *Processor) recordDecision(kind, outcome string) {
 func (p *Processor) recordSnapshotRows(n int64) {
 	if p.acc != nil {
 		p.acc.snapshotRows = append(p.acc.snapshotRows, n)
+	}
+}
+
+// recordDeferral buffers one edit deferral (ADR-0010) for post-commit flush, so a
+// batch that later rolls back and re-defers the same unit counts it once.
+func (p *Processor) recordDeferral() {
+	if p.acc != nil {
+		p.acc.deferrals++
 	}
 }
 
@@ -170,6 +203,9 @@ func (p *Processor) withBatchTx(ctx context.Context, fn func(pgx.Tx) error) erro
 	}
 	for _, n := range acc.snapshotRows {
 		p.metrics.ObserveSnapshotRows(n)
+	}
+	for i := 0; i < acc.deferrals; i++ {
+		p.metrics.IncEditDeferral()
 	}
 	return nil
 }
@@ -303,45 +339,72 @@ func (p *Processor) sampleQueue(ctx context.Context) {
 // lease; the undecided work is simply re-selected next cycle — idempotent by
 // construction (the Guard 2 conditional flips make reprocessing a no-op on already
 // decided rows).
+//
+// A deferred edit (ADR-0010: its target is still PENDING, so the unit is skipped
+// and stays PENDING) advances the drain cursor past it: the next select of this
+// drain starts after the highest deferred id, so a deferred head-of-queue never
+// starves the work behind it. The next cycle starts from the beginning again —
+// the target's commit rings the doorbell — and decides both in id order.
 func (p *Processor) drain(ctx context.Context, batchSize int) error {
 	if batchSize <= 0 {
 		batchSize = 1
 	}
+	var afterID int64
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		work, err := p.fetchPending(ctx, batchSize)
+		work, err := p.fetchPending(ctx, batchSize, afterID)
 		if err != nil {
 			return err
 		}
 		if len(work) == 0 {
 			return nil
 		}
-		if err := p.processBatch(ctx, work); err != nil {
+		deferredUpTo, err := p.processBatch(ctx, work)
+		if err != nil {
 			return err
+		}
+		if deferredUpTo > afterID {
+			afterID = deferredUpTo
 		}
 	}
 }
 
 // processBatch decides one batch of work in a single transaction (spec §8.5). It
-// dispatches per spec §8.1: a single is decided by processSingleTx; a group leg
-// triggers processGroupTx for the whole group at its first leg by id, and later
-// legs of that group are skipped (both in-batch, via the decided set, and across
-// batches, because a decided group's legs are no longer PENDING). Guards are
-// evaluated per decision; any guard miss returns errGuardMiss, which db.WithTx
-// turns into a whole-batch rollback. Decision/snapshot metrics buffered during the
-// batch are flushed only on a clean commit (withBatchTx).
-func (p *Processor) processBatch(ctx context.Context, work []workRow) error {
-	return p.withBatchTx(ctx, func(tx pgx.Tx) error {
+// dispatches per spec §8.1: a single (regular or edit) is decided by
+// processSingleTx; a group leg triggers processGroupTx for the whole group at its
+// first leg by id, and later legs of that group are skipped (both in-batch, via
+// the decided set, and across batches, because a decided group's legs are no
+// longer PENDING). Guards are evaluated per decision; any guard miss returns
+// errGuardMiss, which db.WithTx turns into a whole-batch rollback. A deferred unit
+// (errDeferred, ADR-0010: an edit, or a group with an edit leg, whose target is
+// still PENDING) is skipped — logged at debug, counted, left PENDING — and the
+// batch continues; the highest id of a deferred unit seen in the batch (every leg
+// of a deferred group) is returned so drain can select past it. Decision/snapshot
+// metrics buffered during the batch are flushed only on a clean commit
+// (withBatchTx).
+func (p *Processor) processBatch(ctx context.Context, work []workRow) (deferredUpTo int64, err error) {
+	err = p.withBatchTx(ctx, func(tx pgx.Tx) error {
 		decided := make(map[int64]bool)
+		deferred := make(map[int64]bool)
 		for _, w := range work {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			if w.TransactionID == nil {
-				op := pendingOp{ID: w.ID, AccountID: w.AccountID, Amount: w.Amount, EffectiveAt: w.EffectiveAt}
-				if err := p.processSingleTx(ctx, tx, op); err != nil {
+				op := pendingOp{
+					ID: w.ID, AccountID: w.AccountID, Amount: w.Amount, EffectiveAt: w.EffectiveAt,
+					EditOf: w.EditOf, ExpectedRevision: w.ExpectedRevision,
+				}
+				err := p.processSingleTx(ctx, tx, op)
+				if errors.Is(err, errDeferred) {
+					p.log.Debug("edit deferred: target still pending", "edit", w.ID, "target", *w.EditOf)
+					p.recordDeferral()
+					deferredUpTo = w.ID
+					continue
+				}
+				if err != nil {
 					return err
 				}
 				continue
@@ -350,17 +413,35 @@ func (p *Processor) processBatch(ctx context.Context, work []workRow) error {
 			if decided[txID] {
 				continue // a later leg of a group already decided in this batch
 			}
-			if err := p.processGroupTx(ctx, tx, txID); err != nil {
+			if deferred[txID] {
+				deferredUpTo = w.ID // a later leg of a group deferred in this batch
+				continue
+			}
+			err := p.processGroupTx(ctx, tx, txID)
+			if errors.Is(err, errDeferred) {
+				p.log.Debug("group deferred: an edit target still pending", "transaction", txID, "leg", w.ID)
+				p.recordDeferral()
+				deferred[txID] = true
+				deferredUpTo = w.ID
+				continue
+			}
+			if err != nil {
 				return err
 			}
 			decided[txID] = true
 		}
 		return nil
 	})
+	if err != nil {
+		return 0, err
+	}
+	return deferredUpTo, nil
 }
 
-func (p *Processor) fetchPending(ctx context.Context, batchSize int) ([]workRow, error) {
-	rows, err := p.pool.Query(ctx, fetchPendingWork, batchSize)
+// fetchPending selects up to batchSize PENDING rows with id > afterID (spec §8.1;
+// afterID is drain's deferral cursor, 0 at the start of every drain).
+func (p *Processor) fetchPending(ctx context.Context, batchSize int, afterID int64) ([]workRow, error) {
+	rows, err := p.pool.Query(ctx, fetchPendingWork, batchSize, afterID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch pending work: %w", err)
 	}
@@ -373,7 +454,7 @@ func (p *Processor) fetchPending(ctx context.Context, batchSize int) ([]workRow,
 			registeredAt time.Time
 			dbNow        time.Time
 		)
-		if err := rows.Scan(&w.ID, &w.AccountID, &w.Amount, &w.EffectiveAt, &w.TransactionID, &registeredAt, &dbNow); err != nil {
+		if err := rows.Scan(&w.ID, &w.AccountID, &w.Amount, &w.EffectiveAt, &w.TransactionID, &w.EditOf, &w.ExpectedRevision, &registeredAt, &dbNow); err != nil {
 			return nil, fmt.Errorf("scan pending work: %w", err)
 		}
 		// Doorbell wakeup lag (ADR-0002): insert-commit to leader-pickup, both ends

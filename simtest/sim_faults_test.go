@@ -19,7 +19,9 @@ import (
 )
 
 // This file is the M10 fault-injection tier: competing-leader failover and
-// zombie-leader stale-lease writes, both across the full scenario space. In each,
+// zombie-leader stale-lease writes, both across the full scenario space — edits
+// (single, grouped, mixed; ADR-0010) included, so the revision CAS and the
+// append-only history are under the same churn (SIM-004). In each,
 // several processors and/or direct lease tampering create windows where a node acts
 // on a lease view that has moved under it; the three guards (spec §7.2) must catch
 // every such stale attempt. The proof is correctness: after all the churn the
@@ -55,11 +57,14 @@ func spawn(t *testing.T, pool *pgxpool.Pool) *proc {
 // reference model. G2 is checked at every failover boundary.
 func TestSimCompetingLeaders(t *testing.T) {
 	seeds := envInt("SIMTEST_FAULT_SEEDS", 5)
+	mix := actionMix{}
+	defer func() { reportMix(t, seeds, mix) }()
 	for i := 0; i < seeds; i++ {
 		seed := int64(5_000_000 + i)
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			pool := dbtest.NewSchema(t)
 			h := newHarness(t, pool, NewGenerator(seed))
+			h.mix = mix
 			// Short TTL + tight loop → frequent leadership handoffs.
 			setSimConfig(t, pool, 5, 150, 8)
 
@@ -118,11 +123,14 @@ const phantomOwner = "ffffffff-ffff-4fff-8fff-ffffffffffff"
 // equals the sequential reference model exactly. G2 is checked throughout.
 func TestSimZombieLeader(t *testing.T) {
 	seeds := envInt("SIMTEST_FAULT_SEEDS", 5)
+	mix := actionMix{}
+	defer func() { reportMix(t, seeds, mix) }()
 	for i := 0; i < seeds; i++ {
 		seed := int64(6_000_000 + i)
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			pool := dbtest.NewSchema(t)
 			h := newHarness(t, pool, NewGenerator(seed))
+			h.mix = mix
 			// Short TTL so a stolen lease is reclaimable quickly; small batches so a
 			// steal can land mid-decision.
 			setSimConfig(t, pool, 5, 200, 4)
@@ -203,11 +211,14 @@ func TestSimVersionRaceGuard3(t *testing.T) {
 	// rounds reliably opens the read-to-CAS window. CI can scale it via SIMTEST_GUARD_SEEDS.
 	seeds := envInt("SIMTEST_GUARD_SEEDS", 3)
 	const guardRaceRounds = 2
+	mix := actionMix{}
+	defer func() { reportMix(t, seeds, mix) }()
 	for i := 0; i < seeds; i++ {
 		seed := int64(7_000_000 + i)
 		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
 			pool := dbtest.NewSchema(t)
 			h := newHarness(t, pool, NewGenerator(seed))
+			h.mix = mix
 			// batch_size 1 → one account read + CAS per transaction, the tightest
 			// read-to-CAS window for the churner to slip a version bump into.
 			setSimConfig(t, pool, 5, 5000, 1)
@@ -302,6 +313,17 @@ func TestSimReversalConstraints(t *testing.T) {
 	// With a live (CONFIRMED) reversal on X, a further reversal of X is blocked again.
 	if err := tryInsertSingle(t, pool, "acct", -100, &xID, 7); !isUniqueViolation(err) {
 		t.Fatalf("reversal of op %d with a live confirmed reversal: want unique violation, got %v", xID, err)
+	}
+}
+
+// reportMix prints a fault tier's action mix and fails the test if the churned
+// schedules never carried single, grouped and mixed edits (SIM-004 runs with
+// edits enabled by construction, not by accident).
+func reportMix(t *testing.T, seeds int, mix actionMix) {
+	t.Helper()
+	t.Logf("action mix over %d seeds: %s", seeds, mix)
+	if missing := mix.missingEdits(); missing != nil && !t.Failed() {
+		t.Errorf("the schedule never emitted %v (mix %s)", missing, mix)
 	}
 }
 
