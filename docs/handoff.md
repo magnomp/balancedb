@@ -1381,3 +1381,23 @@ Notes for next agents:
   used throwaway `postgres:17-alpine` containers on 55441–55446, all removed. The
   whole feature is uncommitted on `feat/operation-editing` (branched from the
   editing commit `beb07c7`); commit and PR belong to the next surface.
+
+## README rewrite — 2026-09-18
+
+The root `README.md` is now a short overview only: the problem, the G1–G6
+guarantees and headline non-guarantees, the algorithm in six steps, install, and
+minimal service and embedded usage. Nothing was dropped; the deep material moved
+verbatim into three new pages under `docs/`:
+
+- `docs/operations.md` — running locally, Docker/compose reference deployment and
+  ports, the full `BALANCEDB_*` env contract and behavioral `config` columns, role
+  semantics, multi-cell schemas, upgrade procedure, observability and the metrics
+  table, loadgen. (Plan §M9/§M11 say "README documents…"; that content now lives
+  here — a pure relocation, no ADR.)
+- `docs/operations-editing.md` — the HTTP contract and examples for edits
+  (ADR-0010) and deletes (ADR-0011).
+- `docs/testing.md` — Makefile targets, the simulation harness description and the
+  one-time Guard-3 mutation smoke test.
+
+`make check-docs` passes (it only checks the AGENTS.md symlink). Keep the README
+at overview depth; add detail to the `docs/` pages instead.
