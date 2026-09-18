@@ -1,22 +1,25 @@
 # BalanceDB
 
-BalanceDB keeps account balances correct over time. You give it a stream of money
-operations, including backdated and future-dated ones, and it decides which ones
-are accepted, keeps every account inside its configured limits, and answers
-balance and statement queries. It runs on plain PostgreSQL and ships as one Go
-binary, or as a Go library you embed in your own application.
+BalanceDB keeps running balances correct over time. A balance can be anything
+that goes up and down as events arrive: money in an account, units of a product in
+stock, points, credits, hours. You give it a stream of operations, including
+backdated and future-dated ones, and it decides which ones are accepted, keeps
+every account inside its configured limits, and answers balance and statement
+queries. It runs on plain PostgreSQL and ships as one Go binary, or as a Go library
+you embed in your own application.
 
-Typical uses: ledgers, banking cores, budgeting and envelope systems, ERP
-inventory. Anything where "the balance must never go below X" is a hard rule.
+Typical uses: ledgers, banking cores, budgeting and envelope systems, product
+inventory, loyalty points. Anything where "the balance must never go below X" (or
+above Y) is a hard rule.
 
 ## The problem it solves
 
 Keeping a balance correct sounds trivial until several things are true at once:
 
 - Operations arrive concurrently from many clients and must not race each other
-  into an overdraft.
-- Some operations are **atomic groups** (a transfer is two legs) that must apply
-  together or not at all.
+  past a limit: an overdraft, or selling stock you no longer have.
+- Some operations are **atomic groups** (a transfer is two legs, a stock move is a
+  pick and a put-away) that must apply together or not at all.
 - Operations can be **backdated or future-dated**, so "the balance at time T" and
   "the final balance" are different questions with different answers.
 - Confirmed operations sometimes need to be **corrected or removed**, but the audit
@@ -117,7 +120,7 @@ balancedb api          # HTTP API on :8080, interactive docs at /docs
 gate, one API node and two processors. Then talk to it over HTTP:
 
 ```sh
-# Transfer 1.00 from alice to bob and wait up to 10 s for the decision.
+# Move 100 units from alice to bob and wait up to 10 s for the decision.
 curl -s localhost:8080/transactions \
   -H 'X-Owner-Id: 1' -H "Idempotency-Key: $(uuidgen)" \
   -H 'Content-Type: application/json' -d '{
@@ -130,10 +133,10 @@ curl -s localhost:8080/accounts/alice/balance -H 'X-Owner-Id: 1'
 curl -s 'localhost:8080/accounts/alice/balance?at=2025-12-31T00:00:00Z' -H 'X-Owner-Id: 1'
 ```
 
-Amounts are integers in minor units. Accounts are created on first use, or
-explicitly with limits via `POST /accounts`. Corrections use `PATCH` and
-`DELETE /operations/{id}`. The full API is served at `/docs` and checked into
-`api/openapi.yaml`.
+Amounts are 64-bit integers in whatever unit you choose (cents, pieces, points).
+Accounts are created on first use, or explicitly with limits via `POST /accounts`.
+Corrections use `PATCH` and `DELETE /operations/{id}`. The full API is served at
+`/docs` and checked into `api/openapi.yaml`.
 
 ### As a Go library
 
