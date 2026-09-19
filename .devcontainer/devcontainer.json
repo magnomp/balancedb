@@ -25,9 +25,16 @@
   },
 
   "features": {
-    // docker-in-docker: build/test the production image (`make image`) from inside the
-    // devcontainer without reaching for the host daemon.
-    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    // docker-in-docker: build/test the production image (`make image`) and run the
+    // failover smoke test (`make smoke`) from inside the devcontainer. A nested daemon
+    // (rather than docker-outside-of-docker) keeps the smoke stack's published ports on
+    // the container's own loopback, which is what smoke.sh curls. moby:false ⇒ upstream
+    // Docker CE instead of Microsoft's Moby fork, whose apt packages aren't published
+    // for the Debian trixie base of devcontainers/go:1.25 (feature install aborts
+    // otherwise).
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "moby": false
+    },
     // postgres-client: psql (+ pg_dump etc.) for poking at state (`make psql`). Only
     // the client — the server is the `postgres` compose service. A v15 client talks to
     // the v18 server fine for interactive inspection.
@@ -43,7 +50,8 @@
   "customizations": {
     "vscode": {
       "extensions": [
-        "golang.go"
+        "golang.go",
+        "Anthropic.claude-code"
       ],
       "settings": {
         "go.useLanguageServer": true,

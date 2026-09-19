@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/magnomp/balancedb/internal/model"
 	"github.com/magnomp/balancedb/internal/obs"
@@ -65,34 +66,22 @@ func (p *Processor) processSingle(ctx context.Context, op pendingOp) error {
 // processSingleEditTx and a delete registration (EditOf set with IsDelete,
 // ADR-0011) by processSingleDeleteTx, both after the shared lease fence.
 func (p *Processor) processSingleTx(ctx context.Context, tx pgx.Tx, op pendingOp) error {
-	// Guard 1: lease fence.
-	var fenced int
-	err := tx.QueryRow(ctx, guardLeaseFence, p.lease.Owner()).Scan(&fenced)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return errGuardMiss
-	}
-	if err != nil {
-		return fmt.Errorf("guard 1 (lease fence): %w", err)
-	}
-
 	if op.isDelete() {
+		if err := p.leaseFence(ctx, tx); err != nil {
+			return err
+		}
 		return p.processSingleDeleteTx(ctx, tx, op)
 	}
 	if op.EditOf != nil {
+		if err := p.leaseFence(ctx, tx); err != nil {
+			return err
+		}
 		return p.processSingleEditTx(ctx, tx, op)
 	}
 
-	// Read the account for validation and the version to CAS on.
-	var (
-		balance    int64
-		version    int64
-		minBalance *int64
-		maxBalance *int64
-		externalID string
-	)
-	if err := tx.QueryRow(ctx, selectAccount, op.AccountID).
-		Scan(&balance, &version, &minBalance, &maxBalance, &externalID); err != nil {
-		return fmt.Errorf("read account %d: %w", op.AccountID, err)
+	balance, version, minBalance, maxBalance, externalID, err := p.fenceAndReadAccount(ctx, tx, op.AccountID)
+	if err != nil {
+		return err
 	}
 
 	// Test seam: inject a concurrent account mutation to exercise Guard 3.
@@ -108,9 +97,75 @@ func (p *Processor) processSingleTx(ctx context.Context, tx pgx.Tx, op pendingOp
 	return p.accept(ctx, tx, op, version)
 }
 
-func (p *Processor) accept(ctx context.Context, tx pgx.Tx, op pendingOp, version int64) error {
+// leaseFence runs Guard 1 alone, for the edit/delete dispatch paths which go on
+// to read their own target rows rather than the plain account read below.
+func (p *Processor) leaseFence(ctx context.Context, tx pgx.Tx) error {
+	var fenced int
+	err := tx.QueryRow(ctx, guardLeaseFence, p.lease.Owner()).Scan(&fenced)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return errGuardMiss
+	}
+	if err != nil {
+		return fmt.Errorf("guard 1 (lease fence): %w", err)
+	}
+	return nil
+}
+
+// fenceAndReadAccount pipelines Guard 1 (lease fence) with the account read in
+// one round trip via pgx.Batch: neither statement's parameters depend on the
+// other's result — which op this is and which account it targets are already
+// known in Go — so both go out together instead of as two sequential queries.
+func (p *Processor) fenceAndReadAccount(ctx context.Context, tx pgx.Tx, accountID int64) (
+	balance, version int64, minBalance, maxBalance *int64, externalID string, err error,
+) {
+	batch := &pgx.Batch{}
+	batch.Queue(guardLeaseFence, p.lease.Owner())
+	batch.Queue(selectAccount, accountID)
+	br := tx.SendBatch(ctx, batch)
+	defer func() {
+		if cerr := br.Close(); err == nil {
+			err = cerr
+		}
+	}()
+
+	var fenced int
+	if err = br.QueryRow().Scan(&fenced); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			err = errGuardMiss
+		} else {
+			err = fmt.Errorf("guard 1 (lease fence): %w", err)
+		}
+		return
+	}
+
+	if err = br.QueryRow().Scan(&balance, &version, &minBalance, &maxBalance, &externalID); err != nil {
+		err = fmt.Errorf("read account %d: %w", accountID, err)
+	}
+	return
+}
+
+// accept pipelines Guard 2, Guard 3, the snapshot writes and the outcome notify
+// into one round trip via pgx.Batch. None of these statements' parameters
+// depend on another's return value in this batch — only their rowcounts are
+// checked afterward — and a miss on any guard rolls back the whole (possibly
+// batched) transaction regardless of which statement is read first, so running
+// all of them before checking is safe.
+func (p *Processor) accept(ctx context.Context, tx pgx.Tx, op pendingOp, version int64) (err error) {
+	batch := &pgx.Batch{}
+	batch.Queue(guardFlipConfirmed, op.ID)
+	batch.Queue(guardAccountCAS, op.AccountID, op.Amount, version)
+	snapshot.QueueApply(batch, op.AccountID, op.EffectiveAt, op.Amount)
+	batch.Queue(notifyOutcome, fmt.Sprintf("op:%d", op.ID))
+	br := tx.SendBatch(ctx, batch)
+	defer func() {
+		if cerr := br.Close(); err == nil {
+			err = cerr
+		}
+	}()
+
 	// Guard 2: conditional flip to CONFIRMED.
-	tag, err := tx.Exec(ctx, guardFlipConfirmed, op.ID)
+	var tag pgconn.CommandTag
+	tag, err = br.Exec()
 	if err != nil {
 		return fmt.Errorf("guard 2 (confirm flip): %w", err)
 	}
@@ -119,7 +174,7 @@ func (p *Processor) accept(ctx context.Context, tx pgx.Tx, op pendingOp, version
 	}
 
 	// Guard 3: versioned account balance update.
-	tag, err = tx.Exec(ctx, guardAccountCAS, op.AccountID, op.Amount, version)
+	tag, err = br.Exec()
 	if err != nil {
 		return fmt.Errorf("guard 3 (account version CAS): %w", err)
 	}
@@ -128,31 +183,49 @@ func (p *Processor) accept(ctx context.Context, tx pgx.Tx, op pendingOp, version
 	}
 
 	// Snapshots (spec §8.4), in the same commit as the balance change.
-	rows, err := snapshot.Apply(ctx, tx, op.AccountID, op.EffectiveAt, op.Amount)
+	rows, err := snapshot.ScanApply(br)
 	if err != nil {
 		return err
 	}
 	p.recordSnapshotRows(rows)
 	p.recordDecision(obs.KindSingle, obs.OutcomeConfirmed)
 
-	return notifyOp(ctx, tx, op.ID)
+	if _, err = br.Exec(); err != nil {
+		return fmt.Errorf("notify outcome op:%d: %w", op.ID, err)
+	}
+	return nil
 }
 
-func (p *Processor) reject(ctx context.Context, tx pgx.Tx, op pendingOp, externalID string, side model.LimitSide, shortfall int64) error {
+// reject pipelines Guard 2's invalidate flip with the outcome notify into one
+// round trip. No account write, so no Guard 3 — the reject path leaves the
+// balance untouched.
+func (p *Processor) reject(
+	ctx context.Context, tx pgx.Tx, op pendingOp, externalID string, side model.LimitSide, shortfall int64,
+) (err error) {
 	reason := model.Rejection{
 		Code:      model.ReasonLimitViolated,
 		Account:   externalID,
 		LimitSide: side,
 		Shortfall: shortfall,
 	}
-	detail, err := reason.Marshal()
+	var detail string
+	detail, err = reason.Marshal()
 	if err != nil {
 		return err
 	}
 
-	// Guard 2: conditional flip to INVALID (terminal). No account write, so no
-	// Guard 3 — the reject path leaves the balance untouched.
-	tag, err := tx.Exec(ctx, guardFlipInvalid, op.ID, detail)
+	batch := &pgx.Batch{}
+	batch.Queue(guardFlipInvalid, op.ID, detail)
+	batch.Queue(notifyOutcome, fmt.Sprintf("op:%d", op.ID))
+	br := tx.SendBatch(ctx, batch)
+	defer func() {
+		if cerr := br.Close(); err == nil {
+			err = cerr
+		}
+	}()
+
+	var tag pgconn.CommandTag
+	tag, err = br.Exec()
 	if err != nil {
 		return fmt.Errorf("guard 2 (invalidate flip): %w", err)
 	}
@@ -161,7 +234,10 @@ func (p *Processor) reject(ctx context.Context, tx pgx.Tx, op pendingOp, externa
 	}
 	p.recordDecision(obs.KindSingle, obs.OutcomeInvalid)
 
-	return notifyOp(ctx, tx, op.ID)
+	if _, err = br.Exec(); err != nil {
+		return fmt.Errorf("notify outcome op:%d: %w", op.ID, err)
+	}
+	return nil
 }
 
 // violates applies the binary limit check (spec §6): min <= newBalance <= max,

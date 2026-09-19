@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -57,6 +58,29 @@ func Apply(ctx context.Context, db execer, accountID int64, effectiveAt time.Tim
 	tag, err := db.Exec(ctx, cascadeLater, accountID, day, amount)
 	if err != nil {
 		return 0, fmt.Errorf("snapshot cascade (account %d, day %s): %w", accountID, day, err)
+	}
+	return 1 + tag.RowsAffected(), nil
+}
+
+// QueueApply queues the same two statements Apply issues onto batch instead of
+// executing them immediately, so a caller can pipeline them with its own guard
+// statements in one round trip via pgx.Batch. Call ScanApply on the resulting
+// pgx.BatchResults, in order, once this pair's turn comes up.
+func QueueApply(batch *pgx.Batch, accountID int64, effectiveAt time.Time, amount int64) {
+	day := effectiveAt.UTC().Format(dayFormat)
+	batch.Queue(upsertDay, accountID, day, amount)
+	batch.Queue(cascadeLater, accountID, day, amount)
+}
+
+// ScanApply reads the two results queued by a prior QueueApply call, in order,
+// and returns the same row count Apply does.
+func ScanApply(br pgx.BatchResults) (int64, error) {
+	if _, err := br.Exec(); err != nil {
+		return 0, fmt.Errorf("snapshot upsert: %w", err)
+	}
+	tag, err := br.Exec()
+	if err != nil {
+		return 0, fmt.Errorf("snapshot cascade: %w", err)
 	}
 	return 1 + tag.RowsAffected(), nil
 }

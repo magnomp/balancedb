@@ -12,7 +12,7 @@ GOLANGCI_LINT_VERSION ?= v2.5.0
 # Package list, computed once.
 PKGS := ./...
 
-.PHONY: all lint test itest simtest tools fmt check-docs openapi openapi-gen loadgen smoke image run-api run-processor psql
+.PHONY: all lint test itest simtest tools fmt check-docs openapi openapi-gen loadgen bench smoke image run-api run-processor psql
 
 all: lint test
 
@@ -125,6 +125,19 @@ openapi: openapi-gen
 ## Pass flags via ARGS, e.g. make loadgen ARGS="-rate 200 -duration 1m".
 loadgen:
 	$(GO) run ./cmd/loadgen $(ARGS)
+
+## bench: throughput benchmark — how many operations per second one cell sustains
+## end to end (inserted AND decided by the leader), straight against Postgres with
+## no HTTP in the way. Sweeps concurrent-inserter levels in a throwaway schema on
+## TEST_DATABASE_URL (BALANCEDB_DATABASE_URL also accepted) and prints one row per
+## level; see docs/benchmarking.md for reading the numbers. Pass flags via ARGS,
+## e.g. make bench ARGS="-workers 1,8,32 -group-size 5 -json bench.json".
+bench:
+	@if [ -z "$(TEST_DATABASE_URL)$(BALANCEDB_DATABASE_URL)" ]; then \
+		echo "bench: TEST_DATABASE_URL (or BALANCEDB_DATABASE_URL) is required (e.g. postgres://user:pass@host:5432/db?sslmode=disable)"; \
+		exit 1; \
+	fi
+	$(GO) run ./cmd/bench $(ARGS)
 
 ## image: build the production Docker image (multi-stage, distroless, plan §M11).
 image:
