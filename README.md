@@ -167,6 +167,7 @@ See `docs/embedding.md` for the complete guide.
 - `docs/operations-editing.md` – editing and deleting confirmed operations.
 - `docs/embedding.md` – using BalanceDB as a library.
 - `docs/testing.md` – Makefile targets and the simulation harness.
+- `docs/benchmarking.md` – measuring how many operations per second a cell holds.
 - `docs/architecture-spec.md` – what the system does, in full.
 - `docs/plan.md` and `docs/decisions/` – how it is built and every deviation.
 - `CLAUDE.md` – orientation and inviolable rules for contributors.
