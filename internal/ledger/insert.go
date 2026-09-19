@@ -219,12 +219,18 @@ const (
 FROM operations o JOIN accounts a ON a.id = o.account_id
 WHERE o.id = $1 AND a.owner_id = $2`
 
-	// Upsert-on-demand: create the account only if absent. DO NOTHING (not DO
-	// UPDATE) so an existing account's row is never rewritten — that would create
-	// needless MVCC churn and row-lock contention with the processor's version CAS
-	// (spec §7.2). The empty-return path falls back to a plain SELECT.
-	upsertAccount   = `INSERT INTO accounts (owner_id, external_id) VALUES ($1, $2) ON CONFLICT (owner_id, external_id) DO NOTHING RETURNING id`
+	// Select-then-upsert-on-demand: the steady-state case (account already
+	// exists) is a plain SELECT with no write lock. INSERT ... ON CONFLICT DO
+	// NOTHING runs only on a SELECT miss (new account) — DO NOTHING, not DO
+	// UPDATE, so an existing account's row is never rewritten — and still needs
+	// ON CONFLICT there because two inserters can race to create the same new
+	// account. Trying INSERT ... ON CONFLICT first (the naive upsert order) would
+	// make every insert for an existing account block on the processor's Guard-3
+	// version CAS (spec §7.2), which holds a row lock on accounts for the life of
+	// its batch transaction; SELECT under READ COMMITTED does not wait on that
+	// lock.
 	selectAccountID = `SELECT id FROM accounts WHERE owner_id = $1 AND external_id = $2`
+	upsertAccount   = `INSERT INTO accounts (owner_id, external_id) VALUES ($1, $2) ON CONFLICT (owner_id, external_id) DO NOTHING RETURNING id`
 
 	// Single: key + hash live on the operation. Probe-and-insert via ON CONFLICT
 	// DO NOTHING so a concurrent-retry conflict returns no row instead of raising
@@ -671,8 +677,25 @@ func replayGroup(ctx context.Context, tx pgx.Tx, key string, hash []byte) (*Inse
 }
 
 // upsertAccountID resolves (owner, external_id) to an account id, creating the
-// account with unbounded (NULL) limits if absent. It writes only when creating.
+// account with unbounded (NULL) limits if absent. The common path is a
+// non-blocking SELECT; it writes only when the account does not exist yet.
 func upsertAccountID(ctx context.Context, tx pgx.Tx, ownerID int64, externalID string) (int64, error) {
+	var id int64
+	err := tx.QueryRow(ctx, selectAccountID, ownerID, externalID).Scan(&id)
+	switch {
+	case err == nil:
+		return id, nil
+	case errors.Is(err, pgx.ErrNoRows):
+		return insertAccountID(ctx, tx, ownerID, externalID)
+	default:
+		return 0, fmt.Errorf("select account (%d,%q): %w", ownerID, externalID, err)
+	}
+}
+
+// insertAccountID creates a new account, or resolves the id of a concurrent
+// inserter's account when both race to create the same (owner, external_id)
+// for the first time.
+func insertAccountID(ctx context.Context, tx pgx.Tx, ownerID int64, externalID string) (int64, error) {
 	var id int64
 	err := tx.QueryRow(ctx, upsertAccount, ownerID, externalID).Scan(&id)
 	switch {
@@ -684,7 +707,7 @@ func upsertAccountID(ctx context.Context, tx pgx.Tx, ownerID int64, externalID s
 		}
 		return id, nil
 	default:
-		return 0, fmt.Errorf("upsert account (%d,%q): %w", ownerID, externalID, err)
+		return 0, fmt.Errorf("insert account (%d,%q): %w", ownerID, externalID, err)
 	}
 }
 

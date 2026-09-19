@@ -1401,3 +1401,86 @@ verbatim into three new pages under `docs/`:
 
 `make check-docs` passes (it only checks the AGENTS.md symlink). Keep the README
 at overview depth; add detail to the `docs/` pages instead.
+
+## Throughput benchmark — 2026-09-19
+
+Added `cmd/bench` + `make bench` + `docs/benchmarking.md`: a developer tool that
+answers "how many operations per second does one cell hold". It migrates a
+throwaway `bench_<hex>` schema, runs the leader in-process (wired like the
+`processor` role, metrics registry attached so ρ can be read), and for each
+`-workers` level runs warmup → drain → a measured closed-loop insertion window
+(`BEGIN`, `ledger.Insert`, `COMMIT` per worker) → drain. Per level it reports insert
+ops/s and commit latency, leader ops/s while inserting, backlog, drain time,
+**sustained ops/s = ops / (window + drain)** (the headline), end-to-end
+`registered_at → confirmed_at` percentiles (DB clock), and ρ. `-json` writes the
+same rows with the run's config for tracking. Knobs: `-group-size`,
+`-backdate-days` (snapshot cascade), `-batch-size`/`-loop-interval-ms` (written to
+the `config` row of the throwaway schema), `-external-processor -schema` to measure
+a processor running elsewhere. Baseline for this box is recorded in the doc.
+
+Finding (not fixed, documented in `docs/benchmarking.md`): `ledger.upsertAccountID`
+runs `INSERT … ON CONFLICT DO NOTHING` before the `SELECT`, and Postgres makes that
+statement wait for any open transaction that updated the conflicting `accounts`
+row — i.e. the leader's batch (Guard-3 CAS). Under load every insert on an account
+the current batch has touched stalls until the batch commits; insert p99 tracks
+batch duration (hundreds of ms here) while p50 stays single-digit. Correctness is
+unaffected. The fix is select-first with the upsert only on a miss, in the ledger
+with an itest — a small, separate change.
+
+Gates: `make lint`, `make test` green. Environment as before (Go via
+`export PATH="$HOME/sdk/go/bin:$HOME/go/bin:$HOME/bin:$PATH"`); the `balancedb-pg`
+Docker container (Postgres 18, `127.0.0.1:5432`, db/user/pass `balancedb`) was
+stopped and was restarted with `docker start balancedb-pg` for this work.
+
+## Round-trip reduction — 2026-09-19
+
+Fixed both issues left open by the throughput benchmark entry above.
+
+1. `internal/ledger.upsertAccountID` (`insert.go`): reordered to `SELECT` first,
+   `INSERT ... ON CONFLICT DO NOTHING` only on a miss (still `ON CONFLICT`, since
+   two inserters can race to create the same new account). Removes the wait on
+   the leader's open Guard-3 transaction for the steady-state case.
+2. `internal/processor/single.go`: `processSingleTx` now dispatches to
+   edit/delete via a standalone `leaseFence` check (unchanged behavior); the
+   plain single-op path pipelines Guard 1 + the account read via a new
+   `fenceAndReadAccount` helper (`pgx.Batch`, one round trip). `accept` pipelines
+   Guard 2 + Guard 3 + the two snapshot statements + the outcome notify into one
+   round trip; `reject` pipelines Guard 2 + notify into one. `internal/snapshot`
+   gained `QueueApply`/`ScanApply` so its two statements can be queued onto the
+   processor's batch instead of executed immediately, alongside the unchanged
+   `Apply` (still used by group/edit/delete). Accept: 7 → 2 round trips. Reject:
+   4 → 2. Edit, delete, and group decision paths are untouched — same
+   opportunity exists there, out of scope here.
+
+Neither change touches guard or validation semantics — a rowcount miss on any
+guard still rolls back the whole (possibly batched) transaction, whichever
+statement in the batch is read first.
+
+Evidence:
+- `go build`/`go vet` on `./internal/...` and `./cmd/...` clean (`simtest`'s
+  pre-existing `go build ./...` failure, noted in the editing entry, is
+  unrelated and untouched).
+- `make lint` → `0 issues`.
+- `go test ./internal/...` → all green.
+- `go test -tags itest ./...` against `TEST_DATABASE_URL` → all green, incl.
+  `internal/processor` (7.4s), `internal/ledger` (3.0s), `internal/snapshot`
+  (0.3s).
+- `go test -tags simtest ./simtest/...` → all green, incl.
+  `TestSimVersionRaceGuard3` (exercises the Guard-3 miss path this change
+  touches) and `TestSimBatchCrashEqualsSequential`. No changes to the
+  simulation reference model were needed — this only changes how the same
+  guarded statements are transported, not decision semantics.
+- `make bench -workers 1,4,16,64 -duration 15s`: peak sustained ops/s ~300 →
+  ~840; insert p99 at 4/16/64 workers dropped from 399/548/736 ms to
+  7.6/18.9/61.1 ms. Full before/after tables in `docs/benchmarking.md`. Groups
+  of 5 were not re-measured — the last known groups numbers in the doc predate
+  this fix and are labeled as such.
+
+Deferred: the same round-trip pipelining for edit, delete, and group decision
+paths (`internal/processor/edit.go`, `delete.go`, `group.go`) — same mechanism,
+not done here. Whether real-hardware or non-co-located (e.g. separate
+Postgres/processor pods on a cluster) deployments see the same improvement is
+unverified; only this WSL2/Docker box was measured.
+
+Gates: `make lint test` green; `make itest`/`make simtest` green against
+`TEST_DATABASE_URL`. Environment unchanged from the entry above.

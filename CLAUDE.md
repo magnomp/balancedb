@@ -90,6 +90,10 @@ you do.
   authority, ADR-0003), fail on drift, and run the `oasdiff` breaking-change check
   (informational, no `--fail-on`; skipped when `oasdiff` is absent). Run it after
   any `internal/api` change and commit the regenerated spec.
+- `make bench` — throughput benchmark (`cmd/bench`, `docs/benchmarking.md`): sweeps
+  inserter counts against **`TEST_DATABASE_URL`** in a throwaway schema and reports
+  the leader's sustained decisions/s, backlog, latency and ρ. Run it before and
+  after any processor or ledger change that could move the ceiling.
 
 Definition of done for any change: `make lint test` green, plus `make itest` if it
 touches the DB and `make simtest` once that exists. **Changes to processor or

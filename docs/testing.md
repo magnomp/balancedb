@@ -15,6 +15,7 @@ The `Makefile` is the interface:
 | `make simtest` | deterministic simulation harness against `TEST_DATABASE_URL` (spec §15). |
 | `make openapi` | regenerate `api/openapi.yaml` from the code, fail on drift, then `oasdiff breaking` vs `HEAD` (informational — no `--fail-on`; skipped when `oasdiff` is absent). |
 | `make loadgen` | run the local load generator (see [operations.md](operations.md#watching-it-locally)). |
+| `make bench` | throughput benchmark against `TEST_DATABASE_URL`: sustained decisions/s, insert latency, backlog and ρ per inserter level (see [benchmarking.md](benchmarking.md)). |
 
 This box has no toolchain on the default PATH; see `handoff.md` for the
 bootstrap (`export PATH="$HOME/sdk/go/bin:$HOME/go/bin:$HOME/bin:$PATH"`).
